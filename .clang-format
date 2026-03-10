@@ -1,0 +1,6 @@
+BasedOnStyle: Google  # Or other base style you prefer
+IndentWidth: 4
+AccessModifierOffset: -4
+DisableFormat: false
+# Note: .clang-format does not support file exclusions directly
+# SWIG .i files should not be formatted with clang-format

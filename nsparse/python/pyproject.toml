@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nsparse"
+version = "0.1.0"
+description = "Python bindings for NSPARSE sparse vector search library"
+requires-python = ">=3.8"
+dependencies = ["numpy>=1.20.0,<2.0", "packaging"]
+license = "MIT"
+
+[tool.setuptools]
+packages = ["nsparse"]
+
+[tool.setuptools.package-data]
+nsparse = ["*.so", "*.dylib", "*.pyd"]
