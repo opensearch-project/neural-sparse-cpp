@@ -46,7 +46,7 @@ git clone https://github.com/[your username]/neural-sparse-cpp.git
 
 neural-sparse-cpp requires C++20 and uses CMake as its build system. You will need:
 
-- A C++20 compatible compiler (GCC 11+, Clang 14+, or MSVC 2022+)
+- A C++20 compatible compiler (with OpenMP support version 2 or higher), such as GCC 11+, Clang 14+, or MSVC 2022+
 - CMake 3.15 or higher
 - OpenMP
 - SWIG (only if building Python bindings)
