@@ -9,3 +9,4 @@ This document contains a list of maintainers in this repo. See [opensearch-proje
 | Liyun Xiu             | [chishui](https://github.com/chishui)                         | Amazon      |
 | Yuye Zhu              | [yuye-aws](https://yuye-aws)                                  | Amazon      |
 | Charlie Yang          | [model-collapse](https://github.com/model-collapse)           | Amazon      |
+| Zirui Song          | [zirui-song-18](https://github.com/zirui-song-18)           | Amazon      |
