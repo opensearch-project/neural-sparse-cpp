@@ -44,16 +44,58 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure
+      # Generic build
+      - name: Configure (generic)
         run: |
           cmake -B build \
             -DNSPARSE_ENABLE_TESTS=ON \
+            -DNSPARSE_OPT_LEVEL=generic \
             -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build
+      - name: Build (generic)
         run: cmake --build build -j$(nproc)
 
-      - name: Test
+      - name: Test (generic)
+        run: ctest --test-dir build --output-on-failure
+
+      # Detect SIMD and build+test the best available level
+      - name: Detect SIMD capability
+        id: detect-simd
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+            if cat /proc/cpuinfo 2>/dev/null | grep -qi sve; then
+              echo "opt_level=sve" >> $GITHUB_OUTPUT
+            else
+              echo "opt_level=neon" >> $GITHUB_OUTPUT
+            fi
+          elif [ "$ARCH" = "x86_64" ]; then
+            if lscpu | grep -qi avx512f && lscpu | grep -qi avx512cd && lscpu | grep -qi avx512vl && lscpu | grep -qi avx512dq && lscpu | grep -qi avx512bw; then
+              echo "opt_level=avx512" >> $GITHUB_OUTPUT
+            elif lscpu | grep -qi avx2; then
+              echo "opt_level=avx2" >> $GITHUB_OUTPUT
+            else
+              echo "opt_level=" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "opt_level=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure (SIMD)
+        if: steps.detect-simd.outputs.opt_level != ''
+        run: |
+          rm -rf build
+          cmake -B build \
+            -DNSPARSE_ENABLE_TESTS=ON \
+            -DNSPARSE_OPT_LEVEL=${{ steps.detect-simd.outputs.opt_level }} \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (SIMD)
+        if: steps.detect-simd.outputs.opt_level != ''
+        run: cmake --build build -j$(nproc)
+
+      - name: Test (SIMD)
+        if: steps.detect-simd.outputs.opt_level != ''
         run: ctest --test-dir build --output-on-failure
 
   Build-nsparse-MacOS:
@@ -68,10 +110,23 @@ jobs:
       - name: Install dependencies
         run: brew install libomp
 
-      - name: Configure
+      - name: Detect SIMD capability
+        id: detect-simd
+        run: |
+          if sysctl -n machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null | grep -qi AVX2; then
+            echo "opt_level=avx2" >> $GITHUB_OUTPUT
+          elif uname -m | grep -q arm64; then
+            echo "opt_level=neon" >> $GITHUB_OUTPUT
+          else
+            echo "opt_level=generic" >> $GITHUB_OUTPUT
+          fi
+
+      # Generic build
+      - name: Configure (generic)
         run: |
           cmake -B build \
             -DNSPARSE_ENABLE_TESTS=ON \
+            -DNSPARSE_OPT_LEVEL=generic \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=/usr/bin/clang \
             -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
@@ -79,14 +134,59 @@ jobs:
             -DOpenMP_CXX_LIB_NAMES="omp" \
             -DOpenMP_omp_LIBRARY=$(brew --prefix libomp)/lib/libomp.dylib
 
-      - name: Build
+      - name: Build (generic)
         run: cmake --build build -j$(sysctl -n hw.ncpu)
 
-      - name: Test
+      - name: Test (generic)
         run: ctest --test-dir build --output-on-failure
 
+      # SIMD build if different from generic
+      - name: Configure (SIMD)
+        if: steps.detect-simd.outputs.opt_level != 'generic'
+        run: |
+          rm -rf build
+          cmake -B build \
+            -DNSPARSE_ENABLE_TESTS=ON \
+            -DNSPARSE_OPT_LEVEL=${{ steps.detect-simd.outputs.opt_level }} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=/usr/bin/clang \
+            -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DOpenMP_CXX_FLAGS="-Xpreprocessor -fopenmp -I$(brew --prefix libomp)/include" \
+            -DOpenMP_CXX_LIB_NAMES="omp" \
+            -DOpenMP_omp_LIBRARY=$(brew --prefix libomp)/lib/libomp.dylib
+
+      - name: Build (SIMD)
+        if: steps.detect-simd.outputs.opt_level != 'generic'
+        run: cmake --build build -j$(sysctl -n hw.ncpu)
+
+      - name: Test (SIMD)
+        if: steps.detect-simd.outputs.opt_level != 'generic'
+        run: ctest --test-dir build --output-on-failure
+
+  Build-nsparse-Windows:
+    name: Build and Test nsparse on Windows
+    needs: check-files
+    if: needs.check-files.outputs.RUN_BUILD_AND_TEST == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (generic)
+        run: |
+          cmake -B build `
+            -DNSPARSE_ENABLE_TESTS=ON `
+            -DNSPARSE_OPT_LEVEL=generic `
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (generic)
+        run: cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Test (generic)
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
   check-results:
-    needs: [check-files, Build-nsparse-Linux, Build-nsparse-MacOS]
+    needs: [check-files, Build-nsparse-Linux, Build-nsparse-MacOS, Build-nsparse-Windows]
     if: always()
     name: Check results
     runs-on: ubuntu-latest
@@ -94,5 +194,5 @@ jobs:
       - name: Fail if build or test failed
         if: |
           needs.check-files.outputs.RUN_BUILD_AND_TEST == 'true' &&
-          (needs.Build-nsparse-Linux.result == 'failure' || needs.Build-nsparse-MacOS.result == 'failure')
+          (needs.Build-nsparse-Linux.result == 'failure' || needs.Build-nsparse-MacOS.result == 'failure' || needs.Build-nsparse-Windows.result == 'failure')
         run: exit 1
