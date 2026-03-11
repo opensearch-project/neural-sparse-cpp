@@ -14,8 +14,14 @@
 #include "nsparse/types.h"
 
 #ifndef NSPARSE_PREFETCH
+#ifdef _MSC_VER
+#include <intrin.h>
+#define NSPARSE_PREFETCH(addr, rw, locality) \
+    _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0)
+#else
 #define NSPARSE_PREFETCH(addr, rw, locality) \
     __builtin_prefetch(addr, rw, locality)
+#endif
 #endif
 
 namespace nsparse::detail {

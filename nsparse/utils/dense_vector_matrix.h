@@ -12,6 +12,9 @@
 
 #include <cstddef>
 #include <cstdlib>
+#ifdef _MSC_VER
+#include <malloc.h>
+#endif
 
 namespace nsparse::detail {
 
@@ -30,11 +33,22 @@ public:
 
     DenseVectorMatrixT(size_t row, size_t dimension)
         : rows_(row), dimension_(dimension) {
+#ifdef _MSC_VER
+        data_ = static_cast<T*>(
+            _aligned_malloc(row * dimension * sizeof(T), MATRIX_ALIGNMENT));
+#else
         data_ = static_cast<T*>(
             std::aligned_alloc(MATRIX_ALIGNMENT, row * dimension * sizeof(T)));
+#endif
     }
 
-    ~DenseVectorMatrixT() { std::free(data_); }
+    ~DenseVectorMatrixT() {
+#ifdef _MSC_VER
+        _aligned_free(data_);
+#else
+        std::free(data_);
+#endif
+    }
 
     T get(size_t row, size_t col) const {
         return data_[row * dimension_ + col];
