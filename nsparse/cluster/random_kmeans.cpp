@@ -59,7 +59,7 @@ inline static size_t boundary_check_n_clusters(size_t n_docs,
 
     // Ensure at least one cluster
     n_clusters = n_clusters > n_docs ? n_docs : n_clusters;
-    n_clusters = std::max(1UL, n_clusters);
+    n_clusters = std::max(static_cast<size_t>(1), n_clusters);
     return n_clusters;
 }
 

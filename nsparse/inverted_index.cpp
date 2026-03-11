@@ -9,6 +9,11 @@
 
 #include "nsparse/inverted_index.h"
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#pragma intrinsic(_BitScanForward64)
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cstring>
@@ -146,7 +151,7 @@ void evaluate_window_candidates(std::vector<DirectTermScorer>& scorers,
                                 const uint64_t* bitmap,
                                 detail::TopKHolder<idx_t>& heap) {
     // Iterate only set bits in the bitmap.
-    // Each word covers 64 slots; __builtin_ctzll finds the next set bit.
+    // Each word covers 64 slots; ctzll finds the next set bit.
     static constexpr int kBitmapWords = kScoreWindowSize / 64;
     float threshold = heap.full() ? heap.peek_score() : 0.0F;
     float non_essential_sum = max_score_prefix[first_essential];
@@ -154,7 +159,13 @@ void evaluate_window_candidates(std::vector<DirectTermScorer>& scorers,
     for (int word_idx = 0; word_idx < kBitmapWords; ++word_idx) {
         uint64_t word = bitmap[word_idx];
         while (word != 0) {
+#ifdef _MSC_VER
+            unsigned long bit_pos;
+            _BitScanForward64(&bit_pos, word);
+            int bit = static_cast<int>(bit_pos);
+#else
             int bit = __builtin_ctzll(word);
+#endif
             word &= word - 1;  // clear lowest set bit
             int slot = (word_idx << 6) | bit;
 
