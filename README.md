@@ -1,19 +1,19 @@
-![OpenSearch logo](OpenSearch.svg)
+<img src="https://opensearch.org/assets/img/opensearch-logo-themed.svg" height="64px">
 
-- [Introduction](#introduction)
+- [Introduction](#neural-sparse-cpp)
 - [Project Resources](#project-resources)
 - [Project Style Guidelines](#project-style-guidelines)
 - [Code of Conduct](#code-of-conduct)
 - [License](#license)
 - [Copyright](#copyright)
 
-## Introduction
+## neural-sparse-cpp
 
-**neural-sparse-cpp** is a C++ library for high-performance sparse vector similarity search, developed as part of the [OpenSearch Project](https://opensearch.org/). It implements the SEISMIC (Sparse Embeddings In Search via Inverted Multi-Index Clustering) algorithm for approximate nearest neighbor search over sparse vectors.
+**neural-sparse-cpp** is a C++ library for high-performance sparse vector similarity search, developed as part of the [OpenSearch Project](https://opensearch.org/). It provides multiple index types for nearest neighbor search over sparse vectors.
 
 Key features include:
 
-- SEISMIC-based inverted index with clustering for fast approximate search
+- Multiple index types: inverted index, SEISMIC, and SEISMIC with scalar quantization
 - Scalar quantization support for reduced memory usage
 - SIMD-optimized distance computations (AVX2, AVX512, NEON, SVE)
 - ID mapping and ID selector filtering

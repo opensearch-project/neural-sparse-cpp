@@ -1,0 +1,98 @@
+name: Build and Test nsparse
+on:
+  push:
+    branches:
+      - "*"
+      - "feature/**"
+  pull_request:
+    branches:
+      - "*"
+      - "feature/**"
+
+jobs:
+  check-files:
+    name: Check files for Build and Test
+    runs-on: ubuntu-latest
+    outputs:
+      RUN_BUILD_AND_TEST: ${{ steps.check.outputs.files_changed }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check files
+        id: check
+        uses: ./.github/actions/check-files
+        with:
+          files: .github/workflows/CI.yml
+
+  Get-CI-Image-Tag:
+    needs: check-files
+    if: needs.check-files.outputs.RUN_BUILD_AND_TEST == 'true'
+    uses: opensearch-project/opensearch-build/.github/workflows/get-ci-image-tag.yml@main
+    with:
+      product: opensearch
+
+  Build-nsparse-Linux:
+    name: Build and Test nsparse on Linux
+    runs-on: ubuntu-latest
+    needs: Get-CI-Image-Tag
+    container:
+      image: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-version-linux }}
+      options: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-options }}
+    steps:
+      - name: Run start commands
+        run: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-command }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DNSPARSE_ENABLE_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  Build-nsparse-MacOS:
+    name: Build and Test nsparse on MacOS
+    needs: check-files
+    if: needs.check-files.outputs.RUN_BUILD_AND_TEST == 'true'
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: brew install libomp
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DNSPARSE_ENABLE_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=/usr/bin/clang \
+            -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DOpenMP_CXX_FLAGS="-Xpreprocessor -fopenmp -I$(brew --prefix libomp)/include" \
+            -DOpenMP_CXX_LIB_NAMES="omp" \
+            -DOpenMP_omp_LIBRARY=$(brew --prefix libomp)/lib/libomp.dylib
+
+      - name: Build
+        run: cmake --build build -j$(sysctl -n hw.ncpu)
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  check-results:
+    needs: [check-files, Build-nsparse-Linux, Build-nsparse-MacOS]
+    if: always()
+    name: Check results
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if build or test failed
+        if: |
+          needs.check-files.outputs.RUN_BUILD_AND_TEST == 'true' &&
+          (needs.Build-nsparse-Linux.result == 'failure' || needs.Build-nsparse-MacOS.result == 'failure')
+        run: exit 1

@@ -1,0 +1,30 @@
+name: 'NSparse Check Files Changed'
+description: 'Check if specific files have changed for nsparse repo'
+inputs:
+  files:
+    description: 'Additional files to check for changes'
+    default: ''
+outputs:
+  files_changed:
+    description: 'Whether any files changed'
+    value: ${{ steps.changed-files.outputs.any_changed }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Combine files
+      id: combine-files
+      shell: bash
+      run: |
+        DEFAULT_FILES="CMakeLists.txt,nsparse/**,tests/**,cmake/**,benchmarks/**"
+        if [ -n "${{ inputs.files }}" ]; then
+          COMBINED_FILES="$DEFAULT_FILES,${{ inputs.files }}"
+        else
+          COMBINED_FILES="$DEFAULT_FILES"
+        fi
+        echo "combined_files=$COMBINED_FILES" >> $GITHUB_OUTPUT
+    - name: Get changed files
+      id: changed-files
+      uses: tj-actions/changed-files@v47.0.0
+      with:
+        files: ${{ steps.combine-files.outputs.combined_files }}
+        files_separator: ","
