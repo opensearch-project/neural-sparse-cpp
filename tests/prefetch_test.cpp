@@ -47,7 +47,12 @@ namespace {
 using nsparse::term_t;
 
 template <class T>
-__attribute__((noinline)) void test_prefetch_vector(const term_t* indices,
+#ifdef _MSC_VER
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+void test_prefetch_vector(const term_t* indices,
                                                     const T* values,
                                                     size_t len) {
     static constexpr size_t kCacheLineSize = 64;

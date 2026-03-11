@@ -11,8 +11,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <vector>
-
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
 
