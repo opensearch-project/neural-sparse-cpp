@@ -81,15 +81,15 @@ def main():
     params = nsparse.SeismicSearchParameters(k, 1.2)
 
     # Perform search
-    labels = index.search(
+    distances, labels = index.search(
         n_queries, query_indptr, query_indices, query_values, k, params
     )
 
     print(f"\nTop {k} nearest neighbors:")
     print(f"Labels shape: {labels.shape}")
+    print(f"Distances shape: {distances.shape}")
     for i in range(n_queries):
-        neighbors = labels[i]
-        print(f"Query {i}: {neighbors}")
+        print(f"Query {i}: labels={labels[i]}, distances={distances[i]}")
 
 
 if __name__ == "__main__":

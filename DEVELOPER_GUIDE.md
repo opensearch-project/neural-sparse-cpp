@@ -11,7 +11,8 @@
   - [Run Benchmarks](#run-benchmarks)
   - [Python Bindings](#python-bindings)
     - [Build Python Bindings](#build-python-bindings)
-    - [Python Environment Setup](#python-environment-setup)
+      - [Using venv](#using-venv)
+      - [Using Conda](#using-conda)
     - [Python Usage](#python-usage)
   - [Debugging](#debugging)
     - [Major Dependencies](#major-dependencies)
@@ -148,28 +149,28 @@ On Linux, the benchmarks support hardware performance counters via [libpfm](http
 
 ### Build Python Bindings
 
+#### Using venv
+
 ```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r nsparse/python/requirements.txt
 cmake -S . -B build -DNSPARSE_ENABLE_PYTHON=ON -DNSPARSE_OPT_LEVEL=avx2
 cmake --build build -j
 cd build/nsparse/python
 pip install .
 ```
 
-### Python Environment Setup
+#### Using Conda
 
-**Using venv**
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-
-**Using Conda**
-```bash
-conda create -n nsparse python=3.12
+conda create -n nsparse python=3.12 numpy
 conda activate nsparse
+cmake -S . -B build -DNSPARSE_ENABLE_PYTHON=ON -DNSPARSE_OPT_LEVEL=avx2
+cmake --build build -j
+cd build/nsparse/python
+pip install .
 ```
-
-Then build and install the Python bindings as described above.
 
 ### Python Usage
 
@@ -200,7 +201,7 @@ gdb ./build/tests/nsparse_test
 lldb ./build/tests/nsparse_test
 ```
 
-In CLion or VS Code, you can set breakpoints and debug directly from the IDE using the test or benchmark targets.
+In VS Code, you can set breakpoints and debug directly from the IDE using the test or benchmark targets.
 
 ### Major Dependencies
 

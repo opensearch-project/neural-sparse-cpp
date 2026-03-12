@@ -112,7 +112,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        run: brew install libomp
+        run: brew install libomp abseil
 
       - name: Detect SIMD capability
         id: detect-simd
@@ -176,12 +176,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Abseil
+        run: vcpkg install abseil[core]:x64-windows
+
       - name: Configure (generic)
         run: |
           cmake -B build `
             -DNSPARSE_ENABLE_TESTS=ON `
             -DNSPARSE_OPT_LEVEL=generic `
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
       - name: Build (generic)
         run: cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
