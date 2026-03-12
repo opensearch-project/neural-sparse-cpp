@@ -44,10 +44,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Abseil
-        run: |
-          apt-get update && apt-get install -y libabsl-dev
-
       # Generic build
       - name: Configure (generic)
         run: |
