@@ -75,7 +75,7 @@ void IDMapIndex::add_with_ids(idx_t n, const idx_t* indptr,
     }
 }
 void IDMapIndex::write_index(IOWriter* io_writer) {
-    nsparse::write_index(delegate_, io_writer);
+    nsparse::detail::write_index(delegate_, io_writer, true);
 
     // Write internal_to_external_ vector
     size_t map_size = internal_to_external_.size();
@@ -86,7 +86,7 @@ void IDMapIndex::write_index(IOWriter* io_writer) {
 }
 
 void IDMapIndex::read_index(IOReader* io_reader) {
-    delegate_ = nsparse::read_index(io_reader);
+    delegate_ = nsparse::detail::read_index(io_reader, true);
 
     // Read internal_to_external_ vector
     size_t map_size = 0;

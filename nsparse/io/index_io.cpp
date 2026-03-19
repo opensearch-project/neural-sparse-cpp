@@ -57,7 +57,9 @@ Index* read_header(IOReader* io_reader) {
     }
 }
 }  // namespace
-void write_index(Index* index, IOWriter* io_writer) {
+
+namespace detail {
+void write_index(Index* index, IOWriter* io_writer, bool keep_open) {
     auto* index_io = dynamic_cast<IndexIO*>(index);
     if (index_io == nullptr) {
         throw std::runtime_error("Index does not support serialization");
@@ -66,7 +68,27 @@ void write_index(Index* index, IOWriter* io_writer) {
     write_header(index, io_writer);
     // write index customized payload
     index_io->write_index(io_writer);
-    io_writer->close();
+    if (!keep_open) {
+        io_writer->close();
+    }
+}
+
+Index* read_index(IOReader* io_reader, bool keep_open) {
+    Index* index = read_header(io_reader);
+    auto* index_io = dynamic_cast<IndexIO*>(index);
+    if (index_io == nullptr) {
+        throw std::runtime_error("Index does not support serialization");
+    }
+    index_io->read_index(io_reader);
+    if (!keep_open) {
+        io_reader->close();
+    }
+    return index;
+}
+}  // namespace detail
+
+void write_index(Index* index, IOWriter* io_writer) {
+    detail::write_index(index, io_writer, false);
 }
 
 void write_index(Index* index, char* filename) {
@@ -75,14 +97,7 @@ void write_index(Index* index, char* filename) {
 }
 
 Index* read_index(IOReader* io_reader) {
-    Index* index = read_header(io_reader);
-    auto* index_io = dynamic_cast<IndexIO*>(index);
-    if (index_io == nullptr) {
-        throw std::runtime_error("Index does not support serialization");
-    }
-    index_io->read_index(io_reader);
-    io_reader->close();
-    return index;
+    return detail::read_index(io_reader, false);
 }
 
 Index* read_index(char* filename) {

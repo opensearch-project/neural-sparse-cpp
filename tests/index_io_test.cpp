@@ -19,6 +19,7 @@
 #include "nsparse/brutal_index.h"
 #include "nsparse/id_map_index.h"
 #include "nsparse/index.h"
+#include "nsparse/inverted_index.h"
 #include "nsparse/io/buffered_io.h"
 #include "nsparse/io/io.h"
 #include "nsparse/seismic_index.h"
@@ -27,6 +28,49 @@
 #include "nsparse/types.h"
 
 namespace {
+
+// IOWriter that throws if write() is called after close().
+// Simulates real file I/O where writing to a closed stream is invalid.
+class StrictBufferedIOWriter : public nsparse::IOWriter {
+public:
+    void write(void* ptr, size_t size, size_t nitems) override {
+        if (closed_) {
+            throw std::runtime_error(
+                "Write after close: stream already closed");
+        }
+        delegate_.write(ptr, size, nitems);
+    }
+
+    void close() override { closed_ = true; }
+
+    const std::vector<uint8_t>& data() const { return delegate_.data(); }
+    size_t size() const { return delegate_.size(); }
+
+private:
+    nsparse::BufferedIOWriter delegate_;
+    bool closed_ = false;
+};
+
+// IOReader that throws if read() is called after close().
+// Simulates real file I/O where reading from a closed stream is invalid.
+class StrictBufferedIOReader : public nsparse::IOReader {
+public:
+    explicit StrictBufferedIOReader(const std::vector<uint8_t>& data)
+        : delegate_(data) {}
+
+    size_t read(void* ptr, size_t size, size_t nitems) override {
+        if (closed_) {
+            throw std::runtime_error("Read after close: stream already closed");
+        }
+        return delegate_.read(ptr, size, nitems);
+    }
+
+    void close() override { closed_ = true; }
+
+private:
+    nsparse::BufferedIOReader delegate_;
+    bool closed_ = false;
+};
 
 // Mock Index that implements both Index and IndexIO for testing
 class MockIndex : public nsparse::Index, public nsparse::IndexIO {
@@ -294,6 +338,114 @@ TEST(IndexIO, RoundtripIDMapIndexWithData) {
 
     nsparse::BufferedIOReader reader(writer.data());
     nsparse::Index* loaded = nsparse::read_index(&reader);
+
+    ASSERT_NE(loaded, nullptr);
+    ASSERT_EQ(loaded->id(), original->id());
+    ASSERT_EQ(loaded->num_vectors(), 2);
+
+    delete original;
+    delete loaded;
+}
+
+// Verify StrictBufferedIOWriter throws on write after close
+TEST(IndexIO, StrictWriterThrowsAfterClose) {
+    StrictBufferedIOWriter writer;
+    int val = 42;
+    writer.write(&val, sizeof(int), 1);
+    writer.close();
+    ASSERT_THROW(writer.write(&val, sizeof(int), 1), std::runtime_error);
+}
+
+// Verify StrictBufferedIOReader throws on read after close
+TEST(IndexIO, StrictReaderThrowsAfterClose) {
+    std::vector<uint8_t> buf(sizeof(int), 0);
+    StrictBufferedIOReader reader(buf);
+    int val = 0;
+    reader.read(&val, sizeof(int), 1);
+    reader.close();
+    ASSERT_THROW(reader.read(&val, sizeof(int), 1), std::runtime_error);
+}
+
+// IDMapIndex wrapping SeismicIndex: write then read with strict IO.
+// Before the keep_open fix, write_index closed the stream before
+// IDMapIndex could write its id map, causing a write-after-close crash.
+TEST(IndexIO, StrictIO_RoundtripIDMapSeismicIndex) {
+    auto* seismic = new nsparse::SeismicIndex(128);
+    auto* original = new nsparse::IDMapIndex(seismic);
+
+    std::vector<nsparse::idx_t> indptr = {0, 2, 4};
+    std::vector<nsparse::term_t> indices = {0, 1, 2, 3};
+    std::vector<float> values = {1.0F, 0.5F, 0.8F, 0.3F};
+    std::vector<nsparse::idx_t> ids = {100, 200};
+    original->add_with_ids(2, indptr.data(), indices.data(), values.data(),
+                           ids.data());
+
+    StrictBufferedIOWriter writer;
+    ASSERT_NO_THROW(nsparse::write_index(original, &writer));
+
+    StrictBufferedIOReader reader(writer.data());
+    nsparse::Index* loaded = nullptr;
+    ASSERT_NO_THROW(loaded = nsparse::read_index(&reader));
+
+    ASSERT_NE(loaded, nullptr);
+    ASSERT_EQ(loaded->id(), original->id());
+    ASSERT_EQ(loaded->num_vectors(), 2);
+
+    delete original;
+    delete loaded;
+}
+
+// IDMapIndex wrapping InvertedIndex: the original segfault scenario.
+// InvertedIndex has a non-trivial write_index/read_index, so the
+// stream must stay open for IDMapIndex to write/read its id map after
+// the delegate is serialized.
+// Note: InvertedIndex::get_vectors() returns nullptr after build()
+// (vectors_ is consumed to create inverted_lists_), so num_vectors()
+// returns 0. We verify the roundtrip by checking the index type instead.
+TEST(IndexIO, StrictIO_RoundtripIDMapInvertedIndex) {
+    auto* inverted = new nsparse::InvertedIndex(128);
+    auto* original = new nsparse::IDMapIndex(inverted);
+
+    std::vector<nsparse::idx_t> indptr = {0, 2, 4};
+    std::vector<nsparse::term_t> indices = {0, 1, 2, 3};
+    std::vector<float> values = {1.0F, 0.5F, 0.8F, 0.3F};
+    std::vector<nsparse::idx_t> ids = {100, 200};
+    original->add_with_ids(2, indptr.data(), indices.data(), values.data(),
+                           ids.data());
+    original->build();
+
+    StrictBufferedIOWriter writer;
+    ASSERT_NO_THROW(nsparse::write_index(original, &writer));
+
+    StrictBufferedIOReader reader(writer.data());
+    nsparse::Index* loaded = nullptr;
+    ASSERT_NO_THROW(loaded = nsparse::read_index(&reader));
+
+    ASSERT_NE(loaded, nullptr);
+    ASSERT_EQ(loaded->id(), original->id());
+
+    delete original;
+    delete loaded;
+}
+
+// IDMapIndex wrapping SeismicScalarQuantizedIndex with strict IO
+TEST(IndexIO, StrictIO_RoundtripIDMapSeismicSQIndex) {
+    auto* sq_index = new nsparse::SeismicScalarQuantizedIndex(128);
+    auto* original = new nsparse::IDMapIndex(sq_index);
+
+    std::vector<nsparse::idx_t> indptr = {0, 2, 4};
+    std::vector<nsparse::term_t> indices = {0, 1, 2, 3};
+    std::vector<float> values = {1.0F, 0.5F, 0.8F, 0.3F};
+    std::vector<nsparse::idx_t> ids = {100, 200};
+    original->add_with_ids(2, indptr.data(), indices.data(), values.data(),
+                           ids.data());
+
+    StrictBufferedIOWriter writer;
+    ASSERT_NO_THROW(nsparse::write_index(original, &writer));
+
+    StrictBufferedIOReader reader(writer.data());
+    nsparse::Index* loaded = nullptr;
+    ASSERT_NO_THROW(loaded = nsparse::read_index(&reader));
 
     ASSERT_NE(loaded, nullptr);
     ASSERT_EQ(loaded->id(), original->id());

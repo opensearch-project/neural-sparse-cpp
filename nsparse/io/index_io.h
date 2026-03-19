@@ -14,9 +14,14 @@
 #include "nsparse/io/io.h"
 namespace nsparse {
 
+namespace detail {
+void write_index(Index* index, IOWriter* io_writer, bool keep_open);
+Index* read_index(IOReader* io_reader, bool keep_open);
+}  // namespace detail
+
 void write_index(Index* index, char* filename);
-Index* read_index(char* filename);
 void write_index(Index* index, IOWriter* io_writer);
+Index* read_index(char* filename);
 Index* read_index(IOReader* io_reader);
 
 }  // namespace nsparse

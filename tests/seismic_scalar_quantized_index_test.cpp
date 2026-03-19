@@ -727,6 +727,64 @@ TEST(SeismicSQIndexSearch, search_exact_match_with_small_selector) {
     EXPECT_GT(distances[0], distances[1]);
 }
 
+TEST(SeismicSQIndexSearch, search_exact_match_scores_match_normal_path_scores) {
+    TestableSeismicSQIndex index(QuantizerType::QT_8bit, 0.0F, 1.0F, 10, 3,
+                                 0.5F, 3);
+    Index* idx = &index;
+
+    // doc0: term0=1.0, doc1: term0=0.5, doc2: term0=0.8
+    index.add_docs({{{0, 1.0F}}, {{0, 0.5F}}, {{0, 0.8F}}});
+    index.build();
+
+    std::vector<idx_t> query_indptr = {0, 1};
+    std::vector<term_t> query_indices = {0};
+    std::vector<float> query_values = {1.0F};
+
+    // Normal path (no selector): k=3, all 3 docs returned
+    std::vector<idx_t> labels_normal(3, -1);
+    std::vector<float> distances_normal(3, -1.0F);
+    SeismicSearchParameters params_normal(5, 1000.0F);
+    idx->search(1, query_indptr.data(), query_indices.data(),
+                query_values.data(), 3, distances_normal.data(),
+                labels_normal.data(), &params_normal);
+
+    // Exact match path: selector size (2) <= k (2)
+    std::vector<idx_t> allowed_ids = {0, 2};
+    ArrayIDSelector selector(allowed_ids.size(), allowed_ids.data());
+    SeismicSearchParameters params_filtered(5, 1000.0F);
+    params_filtered.set_id_selector(&selector);
+
+    std::vector<idx_t> labels_filtered(2, -1);
+    std::vector<float> distances_filtered(2, -1.0F);
+    idx->search(1, query_indptr.data(), query_indices.data(),
+                query_values.data(), 2, distances_filtered.data(),
+                labels_filtered.data(), &params_filtered);
+
+    // Find doc0's score from the normal path
+    float doc0_score_normal = -1.0F;
+    for (int i = 0; i < 3; ++i) {
+        if (labels_normal[i] == 0) {
+            doc0_score_normal = distances_normal[i];
+            break;
+        }
+    }
+    // Find doc0's score from the exact match path
+    float doc0_score_filtered = -1.0F;
+    for (int i = 0; i < 2; ++i) {
+        if (labels_filtered[i] == 0) {
+            doc0_score_filtered = distances_filtered[i];
+            break;
+        }
+    }
+
+    ASSERT_GE(doc0_score_normal, 0.0F);
+    ASSERT_GE(doc0_score_filtered, 0.0F);
+    // Scores must match — both paths should decode quantized dot products
+    EXPECT_FLOAT_EQ(doc0_score_normal, doc0_score_filtered);
+    // Sanity: decoded score should be in a reasonable range (not raw quantized)
+    EXPECT_LT(doc0_score_filtered, 10.0F);
+}
+
 TEST(SeismicSQIndexSearch, search_with_id_selector_filters_results) {
     TestableSeismicSQIndex index(QuantizerType::QT_8bit, 0.0F, 1.0F, 10, 3,
                                  0.5F, 3);

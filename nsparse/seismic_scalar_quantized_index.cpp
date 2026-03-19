@@ -208,11 +208,18 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
     // if filter ids size is <= k, just run exact match
     if (detail::should_run_exact_match(search_parameters->get_id_selector(), k,
                                        &query_vectors)) {
-        return detail::ExactMatcher::search(
+        auto [distances, labels] = detail::ExactMatcher::search(
             vectors_.get(),
             dynamic_cast<const IDSelectorEnumerable*>(
                 search_parameters->get_id_selector()),
             &query_vectors, element_size, k);
+        // Decode quantized dot product scores
+        for (auto& query_distances : distances) {
+            for (auto& dist : query_distances) {
+                dist = sq_.decode_dot_product(dist, query_sq);
+            }
+        }
+        return {distances, labels};
     }
 
     std::vector<std::vector<float>> result_distances(n);
