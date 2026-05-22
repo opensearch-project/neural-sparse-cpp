@@ -16,7 +16,7 @@ jobs:
     outputs:
       RUN_BUILD_AND_TEST: ${{ steps.check.outputs.files_changed }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Check files
         id: check
         uses: ./.github/actions/check-files
@@ -26,7 +26,7 @@ jobs:
   Get-CI-Image-Tag:
     needs: check-files
     if: needs.check-files.outputs.RUN_BUILD_AND_TEST == 'true'
-    uses: opensearch-project/opensearch-build/.github/workflows/get-ci-image-tag.yml@main
+    uses: opensearch-project/opensearch-build/.github/workflows/get-ci-image-tag.yml@c2498b758c08fb7bc48476509a5fc1b8dd5f7493 # main
     with:
       product: opensearch
 
@@ -42,7 +42,7 @@ jobs:
         run: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-command }}
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # Generic build
       - name: Configure (generic)
@@ -109,7 +109,7 @@ jobs:
     runs-on: macos-15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install dependencies
         run: brew install libomp abseil
@@ -174,7 +174,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Abseil
         run: vcpkg install abseil[core]:x64-windows
