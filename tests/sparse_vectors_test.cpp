@@ -284,7 +284,7 @@ TEST(SparseVectors, indptr_data) {
                        reinterpret_cast<const uint8_t*>(values.data()),
                        values.size() * sizeof(float));
 
-    const nsparse::idx_t* indptr = vectors.indptr_data();
+    const nsparse::offset_t* indptr = vectors.indptr_data();
     ASSERT_EQ(indptr[0], 0);
     ASSERT_EQ(indptr[1], 2);
 }

@@ -18,6 +18,8 @@
 
 namespace nsparse {
 
+class IOWriter;
+
 struct SearchParameters {
     virtual ~SearchParameters() = default;
     const IDSelector* get_id_selector() const { return id_selector; }
@@ -34,7 +36,11 @@ public:
     virtual std::array<char, 4> id() const = 0;
     virtual void add(idx_t n, const idx_t* indptr, const term_t* indices,
                      const float* values) = 0;
+    virtual void reserve(size_t num_vectors, size_t total_nnz) {}
     virtual void build();
+    virtual void build_and_save(const char* path);
+    virtual void build_and_save(IOWriter* writer);
+    virtual void release_build_memory() {}
     virtual void search(
         idx_t n, const idx_t* indptr, const term_t* indices,
         const float* values, int k, float* distances, idx_t* labels,

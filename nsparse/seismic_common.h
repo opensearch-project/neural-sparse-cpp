@@ -10,9 +10,13 @@
 #ifndef SEISMIC_COMMON_H
 #define SEISMIC_COMMON_H
 
+#include <atomic>
+#include <cstdio>
 #include <memory>
 #include <numeric>
 #include <vector>
+
+#include <omp.h>
 
 #include "nsparse/cluster/inverted_list_clusters.h"
 #include "nsparse/cluster/random_kmeans.h"
@@ -58,10 +62,10 @@ inline std::vector<float> calculate_summary_scores(
     return summary_scores;
 }
 
-inline float compute_similarity(idx_t doc_id, const idx_t* indptr,
+inline float compute_similarity(idx_t doc_id, const offset_t* indptr,
                                 const term_t* indices, const uint8_t* values,
                                 const uint8_t* dense, size_t element_size) {
-    const idx_t start = indptr[doc_id];
+    const offset_t start = indptr[doc_id];
     const size_t len = indptr[doc_id + 1] - start;
     float score = 0.0F;
     if (element_size == U32) {
@@ -129,28 +133,234 @@ inline int calculate_beta(int beta, int lambda) {
 inline std::vector<InvertedListClusters> build_inverted_lists_clusters(
     const SparseVectors* vectors, const SparseVectorsConfig& config,
     const SeismicClusterParameters& seismic_cluster_params) {
-    // build inverted index
-    std::unique_ptr<ArrayInvertedLists> inverted_lists =
-        ArrayInvertedLists::build_inverted_lists(config.dimension,
-                                                 config.element_size, vectors);
     int lambda =
         calculate_lambda(seismic_cluster_params.lambda, vectors->num_vectors());
     int beta = calculate_beta(seismic_cluster_params.beta, lambda);
-    size_t inverted_lists_size = inverted_lists->size();
-    std::vector<InvertedListClusters> clustered_inverted_lists(
-        inverted_lists_size);
-#pragma omp parallel for schedule(dynamic, 64)
-    for (int64_t idx = 0; idx < static_cast<int64_t>(inverted_lists_size);
-         ++idx) {
-        auto& invlist = (*inverted_lists)[idx];
-        const auto& doc_ids = invlist.prune_and_keep_doc_ids(lambda);
-        InvertedListClusters inverted_list_clusters(
-            detail::RandomKMeans::train(vectors, doc_ids, beta));
-        inverted_list_clusters.summarize(vectors, seismic_cluster_params.alpha);
-        clustered_inverted_lists[idx] = std::move(inverted_list_clusters);
-        invlist.clear();
+    size_t dimension = config.dimension;
+    size_t element_size = config.element_size;
+    std::vector<InvertedListClusters> clustered_inverted_lists(dimension);
+
+    const size_t n_docs = vectors->num_vectors();
+    const auto* indptr_data = vectors->indptr_data();
+    const auto* indices_data = vectors->indices_data();
+    const auto* values_data = vectors->values_data();
+
+    // Estimate inverted list memory: NNZ * (sizeof(idx_t) + element_size)
+    const size_t total_nnz = indptr_data[n_docs] - indptr_data[0];
+    const size_t invlist_bytes_full =
+        total_nnz * (sizeof(idx_t) + element_size);
+
+    // Choose batch count to fit inverted lists within available memory.
+    // Reserve 4 GB for clustering overhead and OS.
+    constexpr size_t kReserve = 4ULL * 1024 * 1024 * 1024;
+    size_t mem_budget = 0;
+#ifdef __linux__
+    // Use MemAvailable from /proc/meminfo
+    FILE* meminfo = fopen("/proc/meminfo", "r");
+    if (meminfo) {
+        char line[256];
+        while (fgets(line, sizeof(line), meminfo)) {
+            size_t kb = 0;
+            if (sscanf(line, "MemAvailable: %zu kB", &kb) == 1) {
+                mem_budget = kb * 1024;
+                break;
+            }
+        }
+        fclose(meminfo);
     }
+#endif
+    if (mem_budget > kReserve) {
+        mem_budget -= kReserve;
+    } else {
+        mem_budget = 16ULL * 1024 * 1024 * 1024;  // fallback: 16 GB
+    }
+
+    size_t n_batches = (invlist_bytes_full + mem_budget - 1) / mem_budget;
+    if (n_batches < 1) n_batches = 1;
+    size_t batch_size = (dimension + n_batches - 1) / n_batches;
+
+    fprintf(stderr, "[nsparse] build_inverted_lists: n_docs=%zu, dimension=%zu, "
+            "element_size=%zu, lambda=%d, beta=%d, n_batches=%zu, batch_size=%zu\n",
+            n_docs, dimension, element_size, lambda, beta, n_batches, batch_size);
+
+    for (size_t batch_start = 0; batch_start < dimension;
+         batch_start += batch_size) {
+        size_t batch_end = std::min(batch_start + batch_size, dimension);
+        size_t this_batch = batch_end - batch_start;
+
+        // Parallel CSR → inverted list construction
+        // Uses existing per-list spinlock in InvertedList for thread safety.
+        // With 30K+ lists and 32 threads, lock contention is negligible.
+        auto batch_invlists =
+            std::make_unique<ArrayInvertedLists>(this_batch, element_size);
+#pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < static_cast<int64_t>(n_docs); ++i) {
+            offset_t start = indptr_data[i];
+            offset_t end = indptr_data[i + 1];
+            for (offset_t j = start; j < end; ++j) {
+                size_t term_id = indices_data[j];
+                if (term_id >= batch_start && term_id < batch_end) {
+                    batch_invlists->add_entry(
+                        static_cast<term_t>(term_id - batch_start),
+                        static_cast<idx_t>(i),
+                        values_data + j * element_size);
+                }
+            }
+        }
+
+        // Count non-empty lists for diagnostics
+        size_t non_empty = 0;
+        size_t total_entries = 0;
+        for (size_t i = 0; i < this_batch; ++i) {
+            size_t sz = (*batch_invlists)[i].size();
+            if (sz > 0) {
+                non_empty++;
+                total_entries += sz;
+            }
+        }
+        fprintf(stderr, "[nsparse] batch [%zu, %zu): %zu/%zu non-empty lists, "
+                "%zu total entries\n",
+                batch_start, batch_end, non_empty, this_batch, total_entries);
+
+        // Prune and cluster in parallel
+        std::atomic<size_t> clustered_count{0};
+#pragma omp parallel for schedule(dynamic, 1)
+        for (int64_t i = 0; i < static_cast<int64_t>(this_batch); ++i) {
+            auto& invlist = (*batch_invlists)[i];
+            if (invlist.size() == 0) {
+                continue;
+            }
+            const auto& doc_ids = invlist.prune_and_keep_doc_ids(lambda);
+            InvertedListClusters inverted_list_clusters(
+                detail::RandomKMeans::train(vectors, doc_ids, beta));
+            inverted_list_clusters.summarize(vectors,
+                                             seismic_cluster_params.alpha);
+            clustered_inverted_lists[batch_start + i] =
+                std::move(inverted_list_clusters);
+            invlist.clear();
+            clustered_count.fetch_add(1, std::memory_order_relaxed);
+        }
+        fprintf(stderr, "[nsparse] batch done: %zu lists clustered\n",
+                clustered_count.load());
+    }
+
     return clustered_inverted_lists;
+}
+
+// Streaming variant: builds inverted list clusters batch-by-batch and serializes
+// each batch's clusters immediately to the IOWriter, freeing memory after each
+// batch. This avoids accumulating all 65K InvertedListClusters in RAM.
+inline void build_and_save_inverted_lists_clusters(
+    const SparseVectors* vectors, const SparseVectorsConfig& config,
+    const SeismicClusterParameters& seismic_cluster_params,
+    IOWriter* io_writer) {
+    int lambda =
+        calculate_lambda(seismic_cluster_params.lambda, vectors->num_vectors());
+    int beta = calculate_beta(seismic_cluster_params.beta, lambda);
+    size_t dimension = config.dimension;
+    size_t element_size = config.element_size;
+
+    const size_t n_docs = vectors->num_vectors();
+    const auto* indptr_data = vectors->indptr_data();
+    const auto* indices_data = vectors->indices_data();
+    const auto* values_data = vectors->values_data();
+
+    const size_t total_nnz = indptr_data[n_docs] - indptr_data[0];
+    const size_t invlist_bytes_full =
+        total_nnz * (sizeof(idx_t) + element_size);
+
+    // Cap per-batch inverted list memory to keep peak RSS under physical RAM.
+    // The CSR (~46 GB for float32 at 46M docs) remains throughout; each batch
+    // adds inverted lists + k-means temporaries (~2x the raw invlist allocation).
+    constexpr size_t kMaxBatchBytes = 8ULL * 1024 * 1024 * 1024;  // 8 GB
+    size_t mem_budget = std::min(kMaxBatchBytes, invlist_bytes_full / 3);
+    if (mem_budget == 0) mem_budget = invlist_bytes_full;
+
+    size_t n_batches = (invlist_bytes_full + mem_budget - 1) / mem_budget;
+    if (n_batches < 1) n_batches = 1;
+    size_t batch_size = (dimension + n_batches - 1) / n_batches;
+
+    fprintf(stderr,
+            "[nsparse] build_and_save_inverted_lists: n_docs=%zu, "
+            "dimension=%zu, element_size=%zu, lambda=%d, beta=%d, "
+            "n_batches=%zu, batch_size=%zu\n",
+            n_docs, dimension, element_size, lambda, beta, n_batches,
+            batch_size);
+
+    // Write the total dimension count (number of InvertedListClusters)
+    io_writer->write(&dimension, sizeof(dimension), 1);
+
+    for (size_t batch_start = 0; batch_start < dimension;
+         batch_start += batch_size) {
+        size_t batch_end = std::min(batch_start + batch_size, dimension);
+        size_t this_batch = batch_end - batch_start;
+
+        auto batch_invlists =
+            std::make_unique<ArrayInvertedLists>(this_batch, element_size);
+#pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < static_cast<int64_t>(n_docs); ++i) {
+            offset_t start = indptr_data[i];
+            offset_t end = indptr_data[i + 1];
+            for (offset_t j = start; j < end; ++j) {
+                size_t term_id = indices_data[j];
+                if (term_id >= batch_start && term_id < batch_end) {
+                    batch_invlists->add_entry(
+                        static_cast<term_t>(term_id - batch_start),
+                        static_cast<idx_t>(i),
+                        values_data + j * element_size);
+                }
+            }
+        }
+
+        size_t non_empty = 0;
+        size_t total_entries = 0;
+        for (size_t i = 0; i < this_batch; ++i) {
+            size_t sz = (*batch_invlists)[i].size();
+            if (sz > 0) {
+                non_empty++;
+                total_entries += sz;
+            }
+        }
+        fprintf(stderr,
+                "[nsparse] batch [%zu, %zu): %zu/%zu non-empty lists, "
+                "%zu total entries\n",
+                batch_start, batch_end, non_empty, this_batch, total_entries);
+
+        // Prune, cluster, serialize, and immediately free each list
+        std::vector<InvertedListClusters> batch_clusters(this_batch);
+        std::atomic<size_t> clustered_count{0};
+#pragma omp parallel for schedule(dynamic, 1)
+        for (int64_t i = 0; i < static_cast<int64_t>(this_batch); ++i) {
+            auto& invlist = (*batch_invlists)[i];
+            if (invlist.size() == 0) {
+                continue;
+            }
+            const auto& doc_ids = invlist.prune_and_keep_doc_ids(lambda);
+            InvertedListClusters inverted_list_clusters(
+                detail::RandomKMeans::train(vectors, doc_ids, beta));
+            inverted_list_clusters.summarize(vectors,
+                                             seismic_cluster_params.alpha);
+            batch_clusters[i] = std::move(inverted_list_clusters);
+            invlist.clear();
+            clustered_count.fetch_add(1, std::memory_order_relaxed);
+        }
+        fprintf(stderr, "[nsparse] batch done: %zu lists clustered\n",
+                clustered_count.load());
+
+        // Free inverted lists immediately
+        batch_invlists.reset();
+
+        // Serialize this batch's clusters to disk and free
+        for (size_t i = 0; i < this_batch; ++i) {
+            batch_clusters[i].serialize(io_writer);
+        }
+        batch_clusters.clear();
+        batch_clusters.shrink_to_fit();
+
+        fprintf(stderr,
+                "[nsparse] batch [%zu, %zu): serialized and freed\n",
+                batch_start, batch_end);
+    }
 }
 
 }  // namespace detail

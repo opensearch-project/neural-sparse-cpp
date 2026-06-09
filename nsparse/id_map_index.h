@@ -86,7 +86,11 @@ public:
 
     void add(idx_t n, const idx_t* indptr, const term_t* indices,
              const float* values) override;
+    void reserve(size_t num_vectors, size_t total_nnz) override;
     void build() override;
+    void build_and_save(const char* path) override;
+    void build_and_save(IOWriter* writer) override;
+    void release_build_memory() override;
     void search(idx_t n, const idx_t* indptr, const term_t* indices,
                 const float* values, int k, float* distances, idx_t* labels,
                 SearchParameters* search_parameters = nullptr) override;

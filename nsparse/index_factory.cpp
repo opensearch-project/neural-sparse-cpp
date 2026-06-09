@@ -101,12 +101,12 @@ Index* index_factory(int dimension, const char* description) {
     }
 
     if (index_type == "seismic") {
-        int lambda = std::stoi(get_param("lambda", "10"));
-        int beta = std::stoi(get_param("beta", "5"));
-        float alpha = std::stof(get_param("alpha", "0.5"));
-        return new SeismicIndex(dimension, {.lambda = lambda = lambda,
-                                            .beta = beta = beta,
-                                            .alpha = alpha = alpha});
+        int lambda = std::stoi(get_param("lambda", "-1"));
+        int beta = std::stoi(get_param("beta", "-1"));
+        float alpha = std::stof(get_param("alpha", "0.4"));
+        return new SeismicIndex(dimension, {.lambda = lambda,
+                                            .beta = beta,
+                                            .alpha = alpha});
     }
 
     if (index_type == "seismic_sq") {
@@ -117,13 +117,13 @@ Index* index_factory(int dimension, const char* description) {
         }
         float vmin = std::stof(get_param("vmin", "0.0"));
         float vmax = std::stof(get_param("vmax", "1.0"));
-        int lambda = std::stoi(get_param("lambda", "10"));
-        int beta = std::stoi(get_param("beta", "5"));
-        float alpha = std::stof(get_param("alpha", "0.5"));
+        int lambda = std::stoi(get_param("lambda", "-1"));
+        int beta = std::stoi(get_param("beta", "-1"));
+        float alpha = std::stof(get_param("alpha", "0.4"));
         return new SeismicScalarQuantizedIndex(quantizer_type, vmin, vmax,
-                                               {.lambda = lambda = lambda,
-                                                .beta = beta = beta,
-                                                .alpha = alpha = alpha},
+                                               {.lambda = lambda,
+                                                .beta = beta,
+                                                .alpha = alpha},
                                                dimension);
     }
 

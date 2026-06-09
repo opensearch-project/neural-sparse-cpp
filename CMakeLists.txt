@@ -21,12 +21,18 @@ include(cmake/third_party.cmake)
 # Valid values are "generic", "avx2", "avx512", "sve".
 option(NSPARSE_OPT_LEVEL "" "generic")
 option(NSPARSE_ENABLE_PYTHON "Build Python bindings" OFF)
+option(NSPARSE_BUILD_JNI "Build JNI shared library for Java integration" OFF)
 
 add_subdirectory(nsparse)
 
 # Python bindings
 if(NSPARSE_ENABLE_PYTHON)
     add_subdirectory(nsparse/python)
+endif()
+
+# JNI bindings
+if(NSPARSE_BUILD_JNI)
+    add_subdirectory(jni)
 endif()
 
 # CTest must be included in the top level to enable `make test` target.

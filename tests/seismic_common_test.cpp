@@ -117,7 +117,7 @@ TEST(CalculateSummaryScores, multiple_vectors) {
 TEST(ComputeSimilarity, float_element_size) {
     // 2 docs: doc0 has indices {1}, values {2.0f}; doc1 has indices {0,2},
     // values {1.0f, 3.0f}
-    std::vector<idx_t> indptr = {0, 1, 3};
+    std::vector<offset_t> indptr = {0, 1, 3};
     std::vector<term_t> indices = {1, 0, 2};
 
     // Values stored as raw bytes
@@ -142,7 +142,7 @@ TEST(ComputeSimilarity, float_element_size) {
 }
 
 TEST(ComputeSimilarity, uint16_element_size) {
-    std::vector<idx_t> indptr = {0, 2};
+    std::vector<offset_t> indptr = {0, 2};
     std::vector<term_t> indices = {0, 1};
 
     std::vector<uint8_t> values(2 * sizeof(uint16_t));
@@ -160,7 +160,7 @@ TEST(ComputeSimilarity, uint16_element_size) {
 }
 
 TEST(ComputeSimilarity, uint8_element_size) {
-    std::vector<idx_t> indptr = {0, 3};
+    std::vector<offset_t> indptr = {0, 3};
     std::vector<term_t> indices = {0, 1, 2};
     std::vector<uint8_t> values = {2, 3, 4};
     std::vector<uint8_t> dense = {10, 20, 30};
@@ -172,7 +172,7 @@ TEST(ComputeSimilarity, uint8_element_size) {
 }
 
 TEST(ComputeSimilarity, empty_doc) {
-    std::vector<idx_t> indptr = {0, 0};
+    std::vector<offset_t> indptr = {0, 0};
     std::vector<term_t> indices = {};
     std::vector<uint8_t> values = {};
     std::vector<uint8_t> dense = {1, 2, 3};
@@ -274,6 +274,43 @@ TEST(ShouldRunExactMatch, array_selector_also_enumerable) {
     ArrayIDSelector selector(ids.size(), ids.data());
     // ArrayIDSelector is IDSelectorEnumerable, size=2 <= k=5
     EXPECT_TRUE(should_run_exact_match(&selector, 5, nullptr));
+}
+
+// ---- build_inverted_lists_clusters dimension boundary test ----
+
+TEST(BuildInvertedListsClusters, dimension_65536_no_overflow) {
+    // Regression test: when dimension=65536, batch_end=65536 must not be
+    // cast to term_t (uint16_t) which would overflow to 0.
+    SparseVectorsConfig cfg{.element_size = U8, .dimension = 65536};
+    SparseVectors vectors(cfg);
+
+    // 10 vectors, each with 5 entries at high term IDs (near 65535)
+    std::vector<idx_t> indptr = {0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50};
+    std::vector<term_t> indices;
+    std::vector<uint8_t> values;
+    for (int doc = 0; doc < 10; ++doc) {
+        for (int j = 0; j < 5; ++j) {
+            indices.push_back(static_cast<term_t>(65530 + j));
+            values.push_back(static_cast<uint8_t>(100 + j));
+        }
+    }
+    vectors.add_vectors(indptr.data(), indptr.size(), indices.data(),
+                        indices.size(), values.data(), values.size());
+    ASSERT_EQ(vectors.num_vectors(), 10);
+
+    SeismicClusterParameters params = {.lambda = 10, .beta = 2, .alpha = 0.4F};
+    auto result = build_inverted_lists_clusters(&vectors, cfg, params);
+    ASSERT_EQ(result.size(), 65536);
+
+    // Terms 65530..65534 should have non-empty clusters
+    size_t non_empty = 0;
+    for (size_t i = 65530; i < 65535; ++i) {
+        if (result[i].cluster_size() > 0) {
+            non_empty++;
+        }
+    }
+    EXPECT_GT(non_empty, 0)
+        << "Expected non-empty inverted lists for high term IDs";
 }
 
 }  // namespace detail

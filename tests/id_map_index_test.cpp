@@ -19,6 +19,7 @@
 #include "nsparse/io/buffered_io.h"
 #include "nsparse/io/index_io.h"
 #include "nsparse/seismic_index.h"
+#include "nsparse/seismic_scalar_quantized_index.h"
 #include "nsparse/types.h"
 
 namespace {
@@ -369,4 +370,51 @@ TEST_F(IDMapIndexTest, search_with_not_id_selector) {
         EXPECT_NE(label, 200);
         EXPECT_TRUE(label == 100 || label == 300 || label == -1);
     }
+}
+
+TEST(IDMapBuildAndSave, produces_loadable_index_with_sq_delegate) {
+    auto* sq = new nsparse::SeismicScalarQuantizedIndex(
+        nsparse::QuantizerType::QT_8bit, 0.0F, 1.0F,
+        {.lambda = 10, .beta = 2, .alpha = 0.5F}, 5);
+    auto* idmap = new nsparse::IDMapIndex(sq);
+
+    std::vector<nsparse::idx_t> indptr = {0, 2, 4, 6};
+    std::vector<nsparse::term_t> indices = {0, 1, 2, 3, 0, 4};
+    std::vector<float> values = {1.0F, 0.5F, 0.8F, 0.6F, 0.9F, 0.7F};
+    std::vector<nsparse::idx_t> ids = {100, 200, 300};
+
+    idmap->add_with_ids(3, indptr.data(), indices.data(), values.data(),
+                        ids.data());
+
+    // Streaming build_and_save (prepend IDMapIndex header)
+    nsparse::BufferedIOWriter writer;
+    auto id_val = nsparse::fourcc(nsparse::IDMapIndex::name);
+    int dim = 5;
+    writer.write(&id_val, sizeof(uint32_t), 1);
+    writer.write(&dim, sizeof(int), 1);
+    idmap->build_and_save(&writer);
+
+    nsparse::BufferedIOReader reader(writer.data());
+    nsparse::Index* loaded = nsparse::read_index(&reader);
+
+    ASSERT_NE(loaded, nullptr);
+    EXPECT_EQ(loaded->get_vectors()->num_vectors(), 3);
+
+    // Search should return external IDs
+    std::vector<nsparse::idx_t> query_indptr = {0, 2};
+    std::vector<nsparse::term_t> query_indices = {0, 1};
+    std::vector<float> query_values = {1.0F, 0.8F};
+    std::vector<nsparse::idx_t> labels(3, -1);
+    std::vector<float> distances(3, -1.0F);
+
+    nsparse::SeismicSearchParameters params(5, 1000.0F);
+    loaded->search(1, query_indptr.data(), query_indices.data(),
+                   query_values.data(), 3, distances.data(), labels.data(),
+                   &params);
+
+    // Should get external IDs back
+    EXPECT_TRUE(labels[0] == 100 || labels[0] == 200 || labels[0] == 300);
+
+    delete loaded;
+    delete idmap;
 }

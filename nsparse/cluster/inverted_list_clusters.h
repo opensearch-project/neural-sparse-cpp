@@ -43,6 +43,8 @@ public:
         return summaries_ == nullptr ? 0 : summaries_->num_vectors();
     }
 
+    size_t total_docs() const { return docs_.size(); }
+
     void serialize(IOWriter* writer) const override;
     void deserialize(IOReader* reader) override;
 

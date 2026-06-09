@@ -23,6 +23,8 @@
 #include "nsparse/id_selector.h"
 #include "nsparse/index.h"
 #include "nsparse/invlists/inverted_lists.h"
+#include "nsparse/io/file_io.h"
+#include "nsparse/io/index_io.h"
 #include "nsparse/io/io.h"
 #include "nsparse/io/seismic_invlists_writer.h"
 #include "nsparse/seismic_common.h"
@@ -68,7 +70,8 @@ void query_single_inverted_list(const SparseVectors* vectors,
 
     for (const size_t& cluster_id : cluster_order) {
         const auto& cluster_score = summary_scores[cluster_id];
-        if (heap.full() && (cluster_score * heap_factor < heap.peek_score())) {
+        if (heap.full() &&
+            (cluster_score * heap_factor < heap.peek_score())) {
             if (first_list) {
                 break;
             }
@@ -76,25 +79,16 @@ void query_single_inverted_list(const SparseVectors* vectors,
         }
         const auto& docs = cluster_invlist.get_docs(cluster_id);
         const size_t n_docs = docs.size();
-        // Two-stage prefetch pipeline:
-        // Stage 1 (distance 2): prefetch indptr[docs[i+2]] so the indptr
-        //   lookup is cached by the time we need it next iteration.
-        // Stage 2 (distance 1): read indptr[docs[i+1]] (now cached from
-        //   stage 1 issued last iteration), prefetch the actual vector data.
         static constexpr size_t kPrefetchDist1 = 2;  // vector data prefetch
         static constexpr size_t kPrefetchDist2 = 4;  // indptr prefetch
         for (size_t i = 0; i < n_docs; ++i) {
             const auto& doc_id = docs[i];
-            // Stage 1: prefetch indptr entry for doc at distance 2
             if (i + kPrefetchDist2 < n_docs) {
                 detail::prefetch_indptr(indptr, docs[i + kPrefetchDist2]);
             }
-            // Stage 2: prefetch vector data for next doc (indptr should
-            // already be cached from stage 1 issued kPrefetchDist2 -
-            // kPrefetchDist1 iterations ago)
             if (i + kPrefetchDist1 < n_docs) {
                 const idx_t next_doc = docs[i + kPrefetchDist1];
-                const idx_t next_start = indptr[next_doc];
+                const offset_t next_start = indptr[next_doc];
                 const size_t next_len = indptr[next_doc + 1] - next_start;
                 detail::prefetch_vector(indices + next_start,
                                         values + next_start, next_len);
@@ -123,6 +117,17 @@ SeismicScalarQuantizedIndex::SeismicScalarQuantizedIndex(
     : Index(dim),
       sq_(quantizer_type, vmin, vmax),
       cluster_parameter_(parameter) {}
+
+void SeismicScalarQuantizedIndex::reserve(size_t num_vectors,
+                                          size_t total_nnz) {
+    const size_t element_size = sq_.bytes_per_value();
+    if (vectors_ == nullptr) {
+        vectors_ = std::unique_ptr<SparseVectors>(
+            new SparseVectors({.element_size = element_size,
+                               .dimension = static_cast<size_t>(dimension_)}));
+    }
+    vectors_->reserve(num_vectors, total_nnz);
+}
 
 void SeismicScalarQuantizedIndex::add(idx_t n, const idx_t* indptr,
                                       const term_t* indices,
@@ -173,6 +178,45 @@ void SeismicScalarQuantizedIndex::build() {
         {.element_size = sq_.bytes_per_value(),
          .dimension = static_cast<size_t>(get_dimension())},
         cluster_parameter_));
+}
+
+void SeismicScalarQuantizedIndex::build_and_save(const char* path) {
+    FileIOWriter writer(const_cast<char*>(path));
+
+    // Write index header (fourcc + dimension)
+    auto id_val = fourcc(name);
+    writer.write(&id_val, sizeof(uint32_t), 1);
+    writer.write(&dimension_, sizeof(int), 1);
+
+    // Write body via IOWriter overload
+    build_and_save(&writer);
+
+    writer.close();
+}
+
+void SeismicScalarQuantizedIndex::build_and_save(IOWriter* writer) {
+    // Write SQ header
+    write_header(writer);
+
+    // Write vectors
+    if (vectors_ == nullptr) {
+        empty_sparse_vectors.serialize(writer);
+    } else {
+        vectors_->serialize(writer);
+    }
+
+    // Stream clusters: build batch-by-batch, serialize each batch immediately
+    detail::build_and_save_inverted_lists_clusters(
+        vectors_.get(),
+        {.element_size = sq_.bytes_per_value(),
+         .dimension = static_cast<size_t>(get_dimension())},
+        cluster_parameter_, writer);
+}
+
+void SeismicScalarQuantizedIndex::release_build_memory() {
+    vectors_.reset();
+    clustered_inverted_lists.clear();
+    clustered_inverted_lists.shrink_to_fit();
 }
 
 auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
@@ -235,7 +279,7 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
 #pragma omp parallel for
     for (idx_t query_idx = 0; query_idx < n; ++query_idx) {
         const auto& dense = query_vectors.get_dense_vector(query_idx);
-        const idx_t start = query_indptr[query_idx];
+        const offset_t start = query_indptr[query_idx];
         const size_t len = query_indptr[query_idx + 1] - start;
         std::vector<term_t> cuts;
         if (element_size == U16) {

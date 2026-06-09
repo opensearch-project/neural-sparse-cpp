@@ -11,6 +11,7 @@
 
 #include <algorithm>
 
+#include "nsparse/io/index_io.h"
 #include "nsparse/types.h"
 #include "nsparse/utils/checks.h"
 
@@ -19,6 +20,16 @@ namespace nsparse {
 Index::Index(int dim) : dimension_(dim) {}
 
 void Index::build() { throw_not_implemented(); }
+
+void Index::build_and_save(const char* path) {
+    build();
+    write_index(this, const_cast<char*>(path));
+}
+
+void Index::build_and_save(IOWriter* writer) {
+    build();
+    nsparse::detail::write_index(this, writer, true);
+}
 
 void Index::search(idx_t n, const idx_t* indptr, const term_t* indices,
                    const float* values, int k, float* distances, idx_t* labels,

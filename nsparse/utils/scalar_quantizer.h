@@ -15,6 +15,10 @@
 #include <cstdint>
 #include <stdexcept>
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+#include <immintrin.h>
+#endif
+
 namespace nsparse {
 
 /// Quantization type for scalar quantizer
@@ -44,9 +48,7 @@ public:
     /// Encode array of values
     void encode(const float* vals, uint8_t* codes, size_t n) const {
         if (qtype_ == QuantizerType::QT_8bit) {
-            for (size_t i = 0; i < n; i++) {
-                codes[i] = encode_8bit(vals[i]);
-            }
+            encode_8bit_batch(vals, codes, n);
         } else {
             auto* codes16 = reinterpret_cast<uint16_t*>(codes);
             for (size_t i = 0; i < n; i++) {
@@ -86,6 +88,88 @@ public:
     }
 
 private:
+    void encode_8bit_batch(const float* vals, uint8_t* codes, size_t n) const {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        const float scale = kMax8bit / (vmax_ - vmin_);
+        const __m512 v_vmin = _mm512_set1_ps(vmin_);
+        const __m512 v_scale = _mm512_set1_ps(scale);
+        const __m512 v_zero = _mm512_setzero_ps();
+        const __m512 v_max = _mm512_set1_ps(kMax8bit);
+
+        size_t i = 0;
+        // Process 64 floats (4x16) per iteration → 64 uint8 output
+        for (; i + 64 <= n; i += 64) {
+            // Load and quantize 4 groups of 16 floats
+            __m512 f0 = _mm512_loadu_ps(vals + i);
+            __m512 f1 = _mm512_loadu_ps(vals + i + 16);
+            __m512 f2 = _mm512_loadu_ps(vals + i + 32);
+            __m512 f3 = _mm512_loadu_ps(vals + i + 48);
+
+            // (val - vmin) * scale, clamped to [0, 255]
+            f0 = _mm512_min_ps(v_max, _mm512_max_ps(v_zero,
+                _mm512_mul_ps(_mm512_sub_ps(f0, v_vmin), v_scale)));
+            f1 = _mm512_min_ps(v_max, _mm512_max_ps(v_zero,
+                _mm512_mul_ps(_mm512_sub_ps(f1, v_vmin), v_scale)));
+            f2 = _mm512_min_ps(v_max, _mm512_max_ps(v_zero,
+                _mm512_mul_ps(_mm512_sub_ps(f2, v_vmin), v_scale)));
+            f3 = _mm512_min_ps(v_max, _mm512_max_ps(v_zero,
+                _mm512_mul_ps(_mm512_sub_ps(f3, v_vmin), v_scale)));
+
+            // Convert to int32 with rounding
+            __m512i i0 = _mm512_cvt_roundps_epi32(f0,
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m512i i1 = _mm512_cvt_roundps_epi32(f1,
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m512i i2 = _mm512_cvt_roundps_epi32(f2,
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m512i i3 = _mm512_cvt_roundps_epi32(f3,
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+
+            // Pack 32-bit → 16-bit (saturating): 16+16 → 32 per pack
+            __m512i s01 = _mm512_packs_epi32(i0, i1);
+            __m512i s23 = _mm512_packs_epi32(i2, i3);
+
+            // Pack 16-bit → 8-bit (unsigned saturating): 32+32 → 64
+            __m512i bytes = _mm512_packus_epi16(s01, s23);
+
+            // The packs interleave lanes, need permutation to restore order
+            // After packs_epi32(A,B): [A0..A3,B0..B3, A4..A7,B4..B7,
+            //                          A8..A11,B8..B11, A12..A15,B12..B15]
+            // After packus_epi16(AB,CD): complex lane interleaving
+            // Use a permute to fix the order
+            const __m512i perm = _mm512_set_epi32(
+                15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0);
+            bytes = _mm512_permutexvar_epi32(perm, bytes);
+
+            _mm512_storeu_si512(codes + i, bytes);
+        }
+
+        // Process remaining 16 floats at a time
+        for (; i + 16 <= n; i += 16) {
+            __m512 f = _mm512_loadu_ps(vals + i);
+            f = _mm512_min_ps(v_max, _mm512_max_ps(v_zero,
+                _mm512_mul_ps(_mm512_sub_ps(f, v_vmin), v_scale)));
+            __m512i iv = _mm512_cvt_roundps_epi32(f,
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            // Extract and store scalar (small tail, perf not critical)
+            alignas(64) int32_t tmp[16];
+            _mm512_store_si512(tmp, iv);
+            for (int j = 0; j < 16; ++j) {
+                codes[i + j] = static_cast<uint8_t>(tmp[j]);
+            }
+        }
+
+        // Scalar tail
+        for (; i < n; i++) {
+            codes[i] = encode_8bit(vals[i]);
+        }
+#else
+        for (size_t i = 0; i < n; i++) {
+            codes[i] = encode_8bit(vals[i]);
+        }
+#endif
+    }
+
     /// Encode a single float value to 8-bit
     [[nodiscard]] uint8_t encode_8bit(float val) const {
         float scaled = (val - vmin_) * (kMax8bit / (vmax_ - vmin_));

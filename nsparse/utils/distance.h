@@ -69,8 +69,8 @@ inline auto dot_product_vectors_dense(const SparseVectors* vectors,
     const auto* values = vectors->values_data();
 
     for (size_t i = 0; i < n_vectors; ++i) {
-        const idx_t start = indptr[i];
-        const idx_t end = indptr[i + 1];
+        const offset_t start = indptr[i];
+        const offset_t end = indptr[i + 1];
         const size_t len = end - start;
         const term_t* idx_ptr = indices + start;
         // Cast to T* at the correct byte offset
