@@ -15,6 +15,7 @@ set(NSPARSE_TEST_SRC
     index_factory_test.cpp
     index_io_test.cpp
     inverted_index_test.cpp
+    inverted_index_recall_test.cpp
     inverted_list_clusters_test.cpp
     inverted_lists_test.cpp
     kmeans_utils_test.cpp
