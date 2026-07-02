@@ -411,5 +411,58 @@ TEST(InvertedIndexIO, roundtrip_preserves_fourcc) {
     delete loaded;
 }
 
+// Regression test: score_essential_terms must skip docs before window_base.
+// When scorers span multiple windows (>4096 docs) and re-partitioning changes
+// first_essential, a newly-essential scorer may have its cursor pointing at
+// docs before the current window. Without the bounds check, this produces a
+// negative slot index causing SIGBUS / out-of-bounds write.
+TEST(InvertedIndexSearch, search_multi_window_no_crash) {
+    // Use 2 terms. term0 has docs in early range, term1 has docs spread across
+    // multiple windows (>4096). This forces the BMW algorithm to process
+    // multiple scoring windows and potentially re-partition essential terms.
+    constexpr int kDim = 2;
+    constexpr int kNumDocs = 6000;  // > kScoreWindowSize (4096)
+    InvertedIndex index(kDim);
+
+    // Build docs: every doc has term0, every 3rd doc also has term1.
+    // This creates different posting list lengths that affect max_score
+    // partitioning.
+    std::vector<std::map<int, float>> docs;
+    docs.reserve(kNumDocs);
+    for (int i = 0; i < kNumDocs; ++i) {
+        std::map<int, float> doc;
+        doc[0] = 0.1F + static_cast<float>(i % 10) * 0.01F;
+        if (i % 3 == 0) {
+            doc[1] = 0.5F + static_cast<float>(i % 7) * 0.05F;
+        }
+        docs.push_back(doc);
+    }
+    add_docs(index, docs);
+    index.build();
+
+    // Query both terms — forces multi-term scoring across multiple windows.
+    std::vector<idx_t> query_indptr = {0, 2};
+    std::vector<term_t> query_indices = {0, 1};
+    std::vector<float> query_values = {1.0F, 1.0F};
+
+    constexpr int kTopK = 10;
+    std::vector<idx_t> labels(kTopK, -1);
+    std::vector<float> distances(kTopK, -1.0F);
+
+    Index* idx = &index;
+    // The main assertion is that this does not crash (SIGBUS).
+    idx->search(1, query_indptr.data(), query_indices.data(),
+                query_values.data(), kTopK, distances.data(), labels.data());
+
+    // Verify we got valid results.
+    EXPECT_GE(labels[0], 0);
+    EXPECT_GT(distances[0], 0.0F);
+
+    // Results should be sorted by score descending.
+    for (int i = 1; i < kTopK; ++i) {
+        EXPECT_GE(distances[i - 1], distances[i]);
+    }
+}
+
 }  // namespace
 }  // namespace nsparse

@@ -135,6 +135,10 @@ void score_essential_terms(std::vector<DirectTermScorer>& scorers,
             if (doc >= window_end) {
                 break;
             }
+            if (doc < window_base) {
+                ++scorer.current_index;
+                continue;
+            }
             int slot = doc - window_base;
             bitmap[slot >> 6] |= (1ULL << (slot & 63));
             window_scores[slot] +=
