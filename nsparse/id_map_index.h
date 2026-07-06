@@ -11,6 +11,7 @@
 #define ID_MAP_INDEX_H
 #include <algorithm>
 #include <array>
+#include <memory>
 #include <ranges>
 #include <vector>
 
@@ -78,6 +79,8 @@ class IDMapIndex : public Index, public IndexIO {
 public:
     IDMapIndex() = default;
     static constexpr std::array<char, 4> name = {'I', 'D', 'M', 'P'};
+    // Takes ownership of the delegate index; it is freed when this IDMapIndex
+    // is destroyed.
     explicit IDMapIndex(Index*);
     std::array<char, 4> id() const override { return name; }
 
@@ -95,7 +98,10 @@ public:
     void read_index(IOReader* io_reader) override;
 
 private:
-    Index* delegate_ = nullptr;
+    // Owns the wrapped delegate index. Using unique_ptr ensures the delegate is
+    // freed when the IDMapIndex is destroyed (previously a raw pointer with a
+    // defaulted destructor, which leaked the delegate and everything it owned).
+    std::unique_ptr<Index> delegate_;
     std::vector<idx_t> internal_to_external_;
     absl::flat_hash_map<idx_t, idx_t> external_to_internal_;
 };

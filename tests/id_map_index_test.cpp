@@ -14,6 +14,10 @@
 #include <vector>
 
 #include "nsparse/id_selector.h"
+#include "nsparse/index.h"
+#include "nsparse/inverted_index.h"
+#include "nsparse/io/buffered_io.h"
+#include "nsparse/io/index_io.h"
 #include "nsparse/seismic_index.h"
 #include "nsparse/types.h"
 
@@ -272,6 +276,64 @@ TEST_F(IDMapIndexTest, search_with_id_selector_excludes_all) {
     for (const auto& label : labels) {
         EXPECT_EQ(label, -1);
     }
+}
+
+namespace {
+
+// Minimal Index used to observe delegate destruction. Sets a caller-owned flag
+// to true in its destructor so a test can assert the IDMapIndex frees it.
+class DestructionTrackingIndex : public nsparse::Index {
+public:
+    explicit DestructionTrackingIndex(bool* destroyed)
+        : nsparse::Index(0), destroyed_(destroyed) {}
+    ~DestructionTrackingIndex() override { *destroyed_ = true; }
+
+    std::array<char, 4> id() const override { return {'T', 'E', 'S', 'T'}; }
+    void add(nsparse::idx_t, const nsparse::idx_t*, const nsparse::term_t*,
+             const float*) override {}
+
+private:
+    bool* destroyed_;
+};
+
+}  // namespace
+
+// Bug regression: IDMapIndex used to hold its delegate as a raw pointer with a
+// defaulted destructor, leaking the delegate (and everything it owned) on
+// destruction. The delegate must now be freed when the IDMapIndex is destroyed.
+TEST(IDMapIndexOwnership, DeletesDelegateOnDestruction) {
+    bool destroyed = false;
+    {
+        nsparse::IDMapIndex idmap(new DestructionTrackingIndex(&destroyed));
+        EXPECT_FALSE(destroyed);
+    }
+    EXPECT_TRUE(destroyed) << "IDMapIndex must delete its delegate index";
+}
+
+// The delegate acquired during deserialization must also be owned/freed. Before
+// the fix this leaked the freshly read delegate index.
+TEST(IDMapIndexOwnership, DeletesDelegateAcquiredViaReadIndex) {
+    // Build and serialize an idmap-wrapped inverted index.
+    auto* original = new nsparse::IDMapIndex(new nsparse::InvertedIndex(16));
+    std::vector<nsparse::idx_t> indptr = {0, 2, 4};
+    std::vector<nsparse::term_t> indices = {0, 1, 2, 3};
+    std::vector<float> values = {1.0F, 0.5F, 0.8F, 0.3F};
+    std::vector<nsparse::idx_t> ids = {100, 200};
+    original->add_with_ids(2, indptr.data(), indices.data(), values.data(),
+                           ids.data());
+    original->build();
+
+    nsparse::BufferedIOWriter writer;
+    nsparse::write_index(original, &writer);
+    delete original;  // must not leak its delegate
+
+    // read_index constructs a fresh IDMapIndex whose read_index() allocates a
+    // new delegate; deleting the wrapper must free that delegate too. Under
+    // ASan/LeakSanitizer this test fails if either delegate leaks.
+    nsparse::BufferedIOReader reader(writer.data());
+    nsparse::Index* loaded = nsparse::read_index(&reader);
+    ASSERT_NE(loaded, nullptr);
+    delete loaded;
 }
 
 TEST_F(IDMapIndexTest, search_with_not_id_selector) {
