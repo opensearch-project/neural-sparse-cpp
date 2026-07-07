@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <map>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -153,6 +154,123 @@ TEST(GpuClusterAssignerTest, AutoPathViaMapDocsMatchesReference) {
     ASSERT_EQ(actual.size(), expected.size());
     for (size_t j = 0; j < expected.size(); ++j) {
         EXPECT_EQ(actual[j], expected[j]) << "cluster " << j << " differs";
+    }
+}
+
+// CPU reference for the summarize max-pool: per-term max weight over the docs
+// of a cluster, plus the sum of maxes. Returns terms in ascending order.
+void cpu_reference_maxpool(const SparseVectors* vectors,
+                          const std::vector<idx_t>& doc_ids,
+                          std::vector<term_t>& terms,
+                          std::vector<float>& values, float& sum) {
+    const idx_t* indptr = vectors->indptr_data();
+    const term_t* indices = vectors->indices_data();
+    const float* vals = vectors->values_data_float();
+    std::map<term_t, float> m;
+    for (idx_t d : doc_ids) {
+        for (idx_t j = indptr[d]; j < indptr[d + 1]; ++j) {
+            auto& v = m[indices[j]];
+            v = std::max(v, vals[j]);
+        }
+    }
+    sum = 0.0F;
+    terms.clear();
+    values.clear();
+    for (auto& [t, v] : m) {
+        terms.push_back(t);
+        values.push_back(v);
+        sum += v;
+    }
+}
+
+// Compares GPU per-cluster max-pool against the CPU reference for a whole list
+// of several clusters processed in one batched call.
+TEST(GpuClusterAssignerTest, SummarizeListMaxpoolMatchesCpu) {
+    if (!GpuClusterAssigner::available()) {
+        GTEST_SKIP() << "No CUDA-capable GPU available";
+    }
+    constexpr size_t kNumDocs = 8000;
+    constexpr size_t kDim = 3000;
+    constexpr size_t kNnz = 50;
+    SparseVectors vectors = make_random_corpus(kNumDocs, kDim, kNnz, 7);
+
+    // Build a list of clusters: partition docs into varied-size groups.
+    std::vector<idx_t> flat_docs;
+    std::vector<idx_t> offsets = {0};
+    const std::vector<size_t> sizes = {5, 137, 1, 900, 42, 2000};
+    idx_t d = 0;
+    for (size_t sz : sizes) {
+        for (size_t k = 0; k < sz && d < static_cast<idx_t>(kNumDocs); ++k) {
+            flat_docs.push_back(d++);
+        }
+        offsets.push_back(static_cast<idx_t>(flat_docs.size()));
+    }
+    const size_t n_clusters = offsets.size() - 1;
+
+    std::vector<GpuClusterAssigner::ClusterSummary> gpu_out;
+    ASSERT_TRUE(GpuClusterAssigner::instance().summarize_list_maxpool(
+        &vectors, flat_docs.data(), offsets.data(), n_clusters, gpu_out));
+    ASSERT_EQ(gpu_out.size(), n_clusters);
+
+    for (size_t b = 0; b < n_clusters; ++b) {
+        std::vector<idx_t> cluster(flat_docs.begin() + offsets[b],
+                                   flat_docs.begin() + offsets[b + 1]);
+        std::vector<term_t> exp_terms;
+        std::vector<float> exp_vals;
+        float exp_sum = 0.0F;
+        cpu_reference_maxpool(&vectors, cluster, exp_terms, exp_vals, exp_sum);
+
+        // GPU returns terms in touched-append order; sort by term to compare.
+        const auto& gc = gpu_out[b];
+        std::vector<size_t> order(gc.terms.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::ranges::sort(order, [&](size_t a, size_t c) {
+            return gc.terms[a] < gc.terms[c];
+        });
+        ASSERT_EQ(gc.terms.size(), exp_terms.size()) << "cluster " << b;
+        for (size_t i = 0; i < order.size(); ++i) {
+            EXPECT_EQ(gc.terms[order[i]], exp_terms[i])
+                << "cluster " << b << " term " << i;
+            EXPECT_FLOAT_EQ(gc.values[order[i]], exp_vals[i])
+                << "cluster " << b << " value " << i;
+        }
+        EXPECT_NEAR(gc.sum, exp_sum, exp_sum * 1e-5F + 1e-5F) << "cluster " << b;
+    }
+}
+
+// A second list reusing the buffers must not leak accumulator state from the
+// first — verifies the touched-slot reset path.
+TEST(GpuClusterAssignerTest, SummarizeListMaxpoolReuseIsClean) {
+    if (!GpuClusterAssigner::available()) {
+        GTEST_SKIP() << "No CUDA-capable GPU available";
+    }
+    SparseVectors vectors = make_random_corpus(5000, 2500, 40, 21);
+    auto& gpu = GpuClusterAssigner::instance();
+
+    // First list.
+    std::vector<idx_t> docs1;
+    for (idx_t d = 0; d < 2000; ++d) docs1.push_back(d);
+    std::vector<idx_t> off1 = {0, 800, 2000};
+    std::vector<GpuClusterAssigner::ClusterSummary> out1;
+    gpu.summarize_list_maxpool(&vectors, docs1.data(), off1.data(), 2, out1);
+
+    // Second, different list must match its own CPU reference.
+    std::vector<idx_t> docs2;
+    for (idx_t d = 2000; d < 5000; ++d) docs2.push_back(d);
+    std::vector<idx_t> off2 = {0, 1500, 3000};
+    std::vector<GpuClusterAssigner::ClusterSummary> out2;
+    ASSERT_TRUE(
+        gpu.summarize_list_maxpool(&vectors, docs2.data(), off2.data(), 2,
+                                   out2));
+    for (size_t b = 0; b < 2; ++b) {
+        std::vector<idx_t> cluster(docs2.begin() + off2[b],
+                                   docs2.begin() + off2[b + 1]);
+        std::vector<term_t> et;
+        std::vector<float> ev;
+        float es = 0.0F;
+        cpu_reference_maxpool(&vectors, cluster, et, ev, es);
+        EXPECT_EQ(out2[b].terms.size(), et.size()) << "cluster " << b;
+        EXPECT_NEAR(out2[b].sum, es, es * 1e-5F + 1e-5F) << "cluster " << b;
     }
 }
 

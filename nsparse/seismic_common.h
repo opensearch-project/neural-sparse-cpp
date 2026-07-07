@@ -10,9 +10,15 @@
 #ifndef SEISMIC_COMMON_H
 #define SEISMIC_COMMON_H
 
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <numeric>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "nsparse/cluster/inverted_list_clusters.h"
 #include "nsparse/cluster/random_kmeans.h"
@@ -139,16 +145,51 @@ inline std::vector<InvertedListClusters> build_inverted_lists_clusters(
     size_t inverted_lists_size = inverted_lists->size();
     std::vector<InvertedListClusters> clustered_inverted_lists(
         inverted_lists_size);
-#pragma omp parallel for schedule(dynamic, 64)
+
+    // Optional coarse phase timing, enabled by NSPARSE_BUILD_PROFILE=1, to see
+    // how build CPU time splits across prune / train (k-means assignment) /
+    // summarize. Accumulates thread-seconds (sum across threads).
+    const bool build_prof =
+        std::getenv("NSPARSE_BUILD_PROFILE") != nullptr &&
+        std::getenv("NSPARSE_BUILD_PROFILE")[0] == '1';
+    double t_prune = 0.0;
+    double t_train = 0.0;
+    double t_summ = 0.0;
+
+#pragma omp parallel for schedule(dynamic, 64) \
+    reduction(+ : t_prune, t_train, t_summ)
     for (int64_t idx = 0; idx < static_cast<int64_t>(inverted_lists_size);
          ++idx) {
         auto& invlist = (*inverted_lists)[idx];
-        const auto& doc_ids = invlist.prune_and_keep_doc_ids(lambda);
-        InvertedListClusters inverted_list_clusters(
-            detail::RandomKMeans::train(vectors, doc_ids, beta));
-        inverted_list_clusters.summarize(vectors, seismic_cluster_params.alpha);
-        clustered_inverted_lists[idx] = std::move(inverted_list_clusters);
+        if (build_prof) {
+            double a = omp_get_wtime();
+            const auto doc_ids = invlist.prune_and_keep_doc_ids(lambda);
+            double b = omp_get_wtime();
+            InvertedListClusters inverted_list_clusters(
+                detail::RandomKMeans::train(vectors, doc_ids, beta));
+            double c = omp_get_wtime();
+            inverted_list_clusters.summarize(vectors,
+                                             seismic_cluster_params.alpha);
+            double d = omp_get_wtime();
+            t_prune += b - a;
+            t_train += c - b;
+            t_summ += d - c;
+            clustered_inverted_lists[idx] = std::move(inverted_list_clusters);
+        } else {
+            const auto& doc_ids = invlist.prune_and_keep_doc_ids(lambda);
+            InvertedListClusters inverted_list_clusters(
+                detail::RandomKMeans::train(vectors, doc_ids, beta));
+            inverted_list_clusters.summarize(vectors,
+                                             seismic_cluster_params.alpha);
+            clustered_inverted_lists[idx] = std::move(inverted_list_clusters);
+        }
         invlist.clear();
+    }
+    if (build_prof) {
+        std::fprintf(stderr,
+                     "[nsparse build] thread-seconds: prune=%.1f train=%.1f "
+                     "summarize=%.1f\n",
+                     t_prune, t_train, t_summ);
     }
     return clustered_inverted_lists;
 }

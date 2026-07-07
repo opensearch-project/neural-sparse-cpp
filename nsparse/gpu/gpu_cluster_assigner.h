@@ -70,6 +70,39 @@ public:
     void assign(const SparseVectors* vectors, const std::vector<idx_t>& docs,
                 std::vector<std::vector<idx_t>>& clusters);
 
+    /// Per-cluster max-pool result from summarize_list_maxpool(). Terms are in
+    /// GPU touched-append order (not sorted); the CPU sort/truncate handles
+    /// ordering, preserving the existing output semantics.
+    struct ClusterSummary {
+        std::vector<term_t> terms;
+        std::vector<float> values;
+        float sum = 0.0F;
+    };
+
+    /**
+     * @brief GPU max-pool for a whole inverted list's clusters in one launch.
+     *
+     * Given the flattened cluster layout of one inverted list (@p docs with
+     * @p offsets, where cluster b owns docs[offsets[b]..offsets[b+1])), computes
+     * on the GPU, per cluster and per term, the maximum weight across the
+     * cluster's documents — the per-term max-pool that dominates summarize().
+     *
+     * Processing the entire list in a single kernel launch + single stream sync
+     * (one thread block per cluster) is essential: clusters average only a
+     * handful of documents, so a per-cluster launch/sync is dominated by GPU
+     * round-trip overhead. The tie-order-sensitive sort/truncate stays on the
+     * CPU. Requires the corpus resident (shares assign()'s cache); float (U32)
+     * only. Returns false (caller falls back to CPU) if the GPU is unavailable
+     * or the list is empty.
+     *
+     * @param n_clusters  offsets.size() - 1.
+     * @param out         resized to n_clusters; out[b] holds cluster b's result.
+     */
+    bool summarize_list_maxpool(const SparseVectors* vectors,
+                                const idx_t* docs, const idx_t* offsets,
+                                size_t n_clusters,
+                                std::vector<ClusterSummary>& out);
+
     GpuClusterAssigner(const GpuClusterAssigner&) = delete;
     GpuClusterAssigner& operator=(const GpuClusterAssigner&) = delete;
 
@@ -95,6 +128,14 @@ private:
  * can be overridden with the NSPARSE_GPU_MIN_DOCS environment variable.
  */
 bool should_offload_assignment_to_gpu(size_t n_docs, size_t n_clusters);
+
+/**
+ * @brief Gate for the GPU summarize() max-pool offload.
+ *
+ * Returns true when a usable GPU is present and the offload is enabled (on by
+ * default when built with CUDA; can be disabled with NSPARSE_GPU_SUMMARIZE=0).
+ */
+bool should_offload_summarize_to_gpu();
 
 }  // namespace nsparse::detail
 
