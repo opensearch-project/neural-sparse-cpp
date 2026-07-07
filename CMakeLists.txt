@@ -21,7 +21,6 @@ include(cmake/third_party.cmake)
 # Valid values are "generic", "avx2", "avx512", "sve".
 option(NSPARSE_OPT_LEVEL "" "generic")
 option(NSPARSE_ENABLE_PYTHON "Build Python bindings" OFF)
-option(NSPARSE_BUILD_JNI "Build JNI shared library for Java integration" OFF)
 
 add_subdirectory(nsparse)
 
@@ -30,10 +29,9 @@ if(NSPARSE_ENABLE_PYTHON)
     add_subdirectory(nsparse/python)
 endif()
 
-# JNI bindings
-if(NSPARSE_BUILD_JNI)
-    add_subdirectory(jni)
-endif()
+# Note: JNI bindings for the OpenSearch neural-search plugin live in that
+# repository (it compiles jni/nsparse_jni.cpp against this library). This
+# repo stays a pure C++ sparse-index library.
 
 # CTest must be included in the top level to enable `make test` target.
 include(CTest)
