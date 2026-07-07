@@ -11,7 +11,10 @@
 
 #include <cusparse.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -47,6 +50,39 @@ void check_cusparse(cusparseStatus_t status, const char* what) {
 
 #define NSPARSE_CUDA_CHECK(expr) check_cuda((expr), #expr)
 #define NSPARSE_CUSPARSE_CHECK(expr) check_cusparse((expr), #expr)
+
+// Optional phase profiling, enabled by NSPARSE_GPU_PROFILE=1. Accumulates
+// wall-time (ns) across all list calls into a few buckets so the per-phase
+// split of the GPU path can be inspected without an external profiler. Cheap
+// (a handful of atomics per list) and compiled to near-nothing when disabled.
+struct Profile {
+    std::atomic<int64_t> host_prep{0};   // row_ptr/centroid host setup
+    std::atomic<int64_t> gpu_exec{0};     // upload+kernels+SpMM+sync
+    std::atomic<int64_t> host_assign{0};  // scatter results into clusters
+    std::atomic<int64_t> calls{0};
+    bool enabled = false;
+
+    Profile() {
+        const char* v = std::getenv("NSPARSE_GPU_PROFILE");
+        enabled = (v != nullptr && v[0] == '1');
+    }
+    ~Profile() {
+        if (!enabled) return;
+        std::fprintf(stderr,
+                     "[nsparse gpu] calls=%lld host_prep=%.3fs gpu_exec=%.3fs "
+                     "host_assign=%.3fs\n",
+                     static_cast<long long>(calls.load()),
+                     host_prep.load() / 1e9, gpu_exec.load() / 1e9,
+                     host_assign.load() / 1e9);
+    }
+};
+Profile g_profile;
+
+inline int64_t now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 // One thread per document row. Scans the n_clusters scores for that row and
 // selects the argmax, breaking ties toward the lowest cluster index (strict
@@ -93,6 +129,7 @@ __global__ void gather_csr_kernel(const int32_t* __restrict__ corpus_indptr,
         a_val[dst + t] = corpus_values[src + t];
     }
 }
+
 
 // Scatters centroid rows from the resident corpus into the dense B matrix
 // (dim x n_clusters, row-major, ldb = n_clusters). Column j of B is centroid j.
@@ -305,6 +342,9 @@ void GpuClusterAssigner::assign(const SparseVectors* vectors,
         return;
     }
 
+    const bool prof = g_profile.enabled;
+    const int64_t t0 = prof ? now_ns() : 0;
+
     const idx_t* indptr = vectors->indptr_data();
     const size_t dim = vectors->get_dimension();
 
@@ -328,47 +368,32 @@ void GpuClusterAssigner::assign(const SparseVectors* vectors,
     }
     const int64_t nnz_a = h_a_row_ptr[n_docs];
 
+    const int64_t t1 = prof ? now_ns() : 0;
+
     const DeviceCorpus& corpus =
         *static_cast<const DeviceCorpus*>(ensure_corpus_resident(vectors));
     ThreadCtx& ctx = thread_ctx();
+    cudaStream_t stream = ctx.stream;
 
-    // Size (grow-on-demand) all per-thread scratch buffers for this list.
+    // Upload only the small per-list metadata (doc/centroid ids). The actual
+    // doc/centroid payloads live on the GPU (resident corpus).
     ensure_capacity(&ctx.d_docs, ctx.docs_cap, n_docs * sizeof(int32_t));
     ensure_capacity(&ctx.d_centroids, ctx.cent_cap,
                     n_clusters * sizeof(int32_t));
-    ensure_capacity(&ctx.d_a_row_ptr, ctx.rowptr_cap,
-                    (n_docs + 1) * sizeof(int32_t));
-    ensure_capacity(&ctx.d_a_col, ctx.col_cap,
-                    static_cast<size_t>(nnz_a) * sizeof(int32_t));
-    ensure_capacity(&ctx.d_a_val, ctx.val_cap,
-                    static_cast<size_t>(nnz_a) * sizeof(float));
-    ensure_capacity(&ctx.d_b, ctx.b_cap, dim * n_clusters * sizeof(float));
-    ensure_capacity(&ctx.d_c, ctx.c_cap, n_docs * n_clusters * sizeof(float));
     ensure_capacity(&ctx.d_best, ctx.best_cap, n_docs * sizeof(int32_t));
+    ensure_capacity(&ctx.d_b, ctx.b_cap, dim * n_clusters * sizeof(float));
 
-    cudaStream_t stream = ctx.stream;
-
-    // Upload only the small per-list metadata; doc/centroid payloads stay on
-    // the GPU (gathered/scattered from the resident corpus below).
     NSPARSE_CUDA_CHECK(cudaMemcpyAsync(ctx.d_docs, docs.data(),
                                        n_docs * sizeof(int32_t),
                                        cudaMemcpyHostToDevice, stream));
     NSPARSE_CUDA_CHECK(cudaMemcpyAsync(ctx.d_centroids, centroid_docs.data(),
                                        n_clusters * sizeof(int32_t),
                                        cudaMemcpyHostToDevice, stream));
-    NSPARSE_CUDA_CHECK(cudaMemcpyAsync(ctx.d_a_row_ptr, h_a_row_ptr.data(),
-                                       (n_docs + 1) * sizeof(int32_t),
-                                       cudaMemcpyHostToDevice, stream));
 
-    // Gather A's CSR payload from the corpus.
+    // Build dense B (dim x n_clusters, row-major) from centroid rows. The
+    // fused kernel below reads B but not A's CSR separately; docs are gathered
+    // directly from the corpus inside the fused kernel.
     constexpr int kBlock = 256;
-    const int docs_grid = static_cast<int>((n_docs + kBlock - 1) / kBlock);
-    gather_csr_kernel<<<docs_grid, kBlock, 0, stream>>>(
-        corpus.indptr, corpus.indices, corpus.values, ctx.d_docs,
-        static_cast<int>(n_docs), ctx.d_a_row_ptr, ctx.d_a_col, ctx.d_a_val);
-    NSPARSE_CUDA_CHECK(cudaGetLastError());
-
-    // Build dense B (dim x n_clusters, row-major) from centroid rows.
     NSPARSE_CUDA_CHECK(cudaMemsetAsync(
         ctx.d_b, 0, dim * n_clusters * sizeof(float), stream));
     const int cent_grid =
@@ -378,41 +403,66 @@ void GpuClusterAssigner::assign(const SparseVectors* vectors,
         static_cast<int>(n_clusters), static_cast<int>(n_clusters), ctx.d_b);
     NSPARSE_CUDA_CHECK(cudaGetLastError());
 
-    // C = A * B, with A sparse (CSR), B/C dense row-major.
+    // cuSPARSE SpMM path: gathers A from corpus, then runs SpMM + argmax.
+    ensure_capacity(&ctx.d_a_row_ptr, ctx.rowptr_cap,
+                    (n_docs + 1) * sizeof(int32_t));
+    ensure_capacity(&ctx.d_a_col, ctx.col_cap,
+                    static_cast<size_t>(nnz_a) * sizeof(int32_t));
+    ensure_capacity(&ctx.d_a_val, ctx.val_cap,
+                    static_cast<size_t>(nnz_a) * sizeof(float));
+    ensure_capacity(&ctx.d_c, ctx.c_cap,
+                    n_docs * n_clusters * sizeof(float));
+
+    NSPARSE_CUDA_CHECK(cudaMemcpyAsync(ctx.d_a_row_ptr, h_a_row_ptr.data(),
+                                       (n_docs + 1) * sizeof(int32_t),
+                                       cudaMemcpyHostToDevice, stream));
+    const int docs_grid = static_cast<int>((n_docs + kBlock - 1) / kBlock);
+    gather_csr_kernel<<<docs_grid, kBlock, 0, stream>>>(
+        corpus.indptr, corpus.indices, corpus.values, ctx.d_docs,
+        static_cast<int>(n_docs), ctx.d_a_row_ptr, ctx.d_a_col, ctx.d_a_val);
+    NSPARSE_CUDA_CHECK(cudaGetLastError());
+
     cusparseSpMatDescr_t mat_a;
     cusparseDnMatDescr_t mat_b;
     cusparseDnMatDescr_t mat_c;
     NSPARSE_CUSPARSE_CHECK(cusparseCreateCsr(
-        &mat_a, static_cast<int64_t>(n_docs), static_cast<int64_t>(dim), nnz_a,
-        ctx.d_a_row_ptr, ctx.d_a_col, ctx.d_a_val, CUSPARSE_INDEX_32I,
-        CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F));
+        &mat_a, static_cast<int64_t>(n_docs), static_cast<int64_t>(dim),
+        nnz_a, ctx.d_a_row_ptr, ctx.d_a_col, ctx.d_a_val,
+        CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO,
+        CUDA_R_32F));
     NSPARSE_CUSPARSE_CHECK(cusparseCreateDnMat(
-        &mat_b, static_cast<int64_t>(dim), static_cast<int64_t>(n_clusters),
+        &mat_b, static_cast<int64_t>(dim),
+        static_cast<int64_t>(n_clusters),
         static_cast<int64_t>(n_clusters), ctx.d_b, CUDA_R_32F,
         CUSPARSE_ORDER_ROW));
     NSPARSE_CUSPARSE_CHECK(cusparseCreateDnMat(
-        &mat_c, static_cast<int64_t>(n_docs), static_cast<int64_t>(n_clusters),
+        &mat_c, static_cast<int64_t>(n_docs),
+        static_cast<int64_t>(n_clusters),
         static_cast<int64_t>(n_clusters), ctx.d_c, CUDA_R_32F,
         CUSPARSE_ORDER_ROW));
 
-    const float alpha = 1.0F;
-    const float beta = 0.0F;
+    const float alpha_v = 1.0F;
+    const float beta_v = 0.0F;
     size_t buffer_size = 0;
     NSPARSE_CUSPARSE_CHECK(cusparseSpMM_bufferSize(
         ctx.handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
-        CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, mat_a, mat_b, &beta, mat_c,
-        CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT, &buffer_size));
+        CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha_v, mat_a, mat_b, &beta_v,
+        mat_c, CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT, &buffer_size));
     ensure_capacity(reinterpret_cast<char**>(&ctx.d_spmm), ctx.spmm_cap,
                     buffer_size == 0 ? 1 : buffer_size);
     NSPARSE_CUSPARSE_CHECK(cusparseSpMM(
         ctx.handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
-        CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, mat_a, mat_b, &beta, mat_c,
-        CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT, ctx.d_spmm));
+        CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha_v, mat_a, mat_b, &beta_v,
+        mat_c, CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT, ctx.d_spmm));
 
     row_argmax_kernel<<<docs_grid, kBlock, 0, stream>>>(
         ctx.d_c, static_cast<int>(n_docs), static_cast<int>(n_clusters),
         ctx.d_best);
     NSPARSE_CUDA_CHECK(cudaGetLastError());
+
+    cusparseDestroySpMat(mat_a);
+    cusparseDestroyDnMat(mat_b);
+    cusparseDestroyDnMat(mat_c);
 
     std::vector<int32_t> h_best(n_docs);
     NSPARSE_CUDA_CHECK(cudaMemcpyAsync(h_best.data(), ctx.d_best,
@@ -420,9 +470,7 @@ void GpuClusterAssigner::assign(const SparseVectors* vectors,
                                        cudaMemcpyDeviceToHost, stream));
     NSPARSE_CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    cusparseDestroySpMat(mat_a);
-    cusparseDestroyDnMat(mat_b);
-    cusparseDestroyDnMat(mat_c);
+    const int64_t t2 = prof ? now_ns() : 0;
 
     // Append assignments on the host, skipping documents that are themselves a
     // centroid (matching the CPU reference exactly).
@@ -432,6 +480,14 @@ void GpuClusterAssigner::assign(const SparseVectors* vectors,
             continue;
         }
         clusters[h_best[i]].push_back(d);
+    }
+
+    if (prof) {
+        const int64_t t3 = now_ns();
+        g_profile.host_prep.fetch_add(t1 - t0, std::memory_order_relaxed);
+        g_profile.gpu_exec.fetch_add(t2 - t1, std::memory_order_relaxed);
+        g_profile.host_assign.fetch_add(t3 - t2, std::memory_order_relaxed);
+        g_profile.calls.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
