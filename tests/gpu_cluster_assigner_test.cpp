@@ -134,8 +134,8 @@ TEST(GpuClusterAssignerTest, AutoPathViaMapDocsMatchesReference) {
     if (!GpuClusterAssigner::available()) {
         GTEST_SKIP() << "No CUDA-capable GPU available";
     }
-    // Force the auto-offload gate to fire for this size.
-    ::setenv("NSPARSE_GPU_MIN_DOCS", "1", /*overwrite=*/1);
+    // With GPU support compiled in and a device present, map_docs_to_clusters
+    // routes through the GPU unconditionally (no size gate).
     constexpr size_t kNumDocs = 5000;
     constexpr size_t kDim = 1500;
     constexpr size_t kNnz = 30;

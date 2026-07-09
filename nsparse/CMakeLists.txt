@@ -140,19 +140,19 @@ endif()
 
 # GPU acceleration for the build() path via cuSPARSE (search() stays on CPU).
 # Compiled into every nsparse variant only when configured with
-# -DNSPARSE_ENABLE_CUDA=ON. Guarded by the NSPARSE_WITH_CUDA compile define so
+# -DNSPARSE_ENABLE_GPU=ON. Guarded by the NSPARSE_WITH_GPU compile define so
 # the CPU sources pick up the GPU assignment hook.
-if(NSPARSE_ENABLE_CUDA)
-    set(NSPARSE_CUDA_SRC gpu/gpu_cluster_assigner.cu)
-    set(NSPARSE_CUDA_TARGETS nsparse)
+if(NSPARSE_ENABLE_GPU)
+    set(NSPARSE_GPU_SRC gpu/gpu_cluster_assigner.cu)
+    set(NSPARSE_GPU_TARGETS nsparse)
     if(NSPARSE_IS_X86)
-        list(APPEND NSPARSE_CUDA_TARGETS nsparse_avx2 nsparse_avx512)
+        list(APPEND NSPARSE_GPU_TARGETS nsparse_avx2 nsparse_avx512)
     elseif(NSPARSE_IS_ARM AND NOT APPLE)
-        list(APPEND NSPARSE_CUDA_TARGETS nsparse_sve)
+        list(APPEND NSPARSE_GPU_TARGETS nsparse_sve)
     endif()
-    foreach(_tgt IN LISTS NSPARSE_CUDA_TARGETS)
-        target_sources(${_tgt} PRIVATE ${NSPARSE_CUDA_SRC})
-        target_compile_definitions(${_tgt} PUBLIC NSPARSE_WITH_CUDA)
+    foreach(_tgt IN LISTS NSPARSE_GPU_TARGETS)
+        target_sources(${_tgt} PRIVATE ${NSPARSE_GPU_SRC})
+        target_compile_definitions(${_tgt} PUBLIC NSPARSE_WITH_GPU)
         target_link_libraries(${_tgt} PRIVATE CUDA::cusparse CUDA::cudart)
         set_target_properties(${_tgt} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
     endforeach()

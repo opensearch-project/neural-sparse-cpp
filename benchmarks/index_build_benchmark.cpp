@@ -6,14 +6,14 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  *
- * Benchmarks SeismicIndex build() time on CPU vs GPU (cuSPARSE).
+ * Benchmarks SeismicIndex build() time.
  *
- * The GPU path accelerates the k-means document->centroid assignment step of
- * build() via cuSPARSE SpMM; the rest of build() (inverted-list construction,
- * summarization) stays on CPU. GPU vs CPU is selected at run time through the
- * NSPARSE_GPU_MIN_DOCS gate so both paths run from the same binary:
- *   - CPU:  set the gate above the largest inverted list (no list offloads).
- *   - GPU:  set the gate to 1 (every eligible list offloads).
+ * The GPU path accelerates the k-means document->centroid assignment and the
+ * summarize() max-pool of build() via cuSPARSE and custom kernels; the rest of
+ * build() (inverted-list construction, pruning) stays on CPU. Whether build()
+ * uses the GPU is decided at compile time (NSPARSE_ENABLE_GPU) plus device
+ * availability — there is no runtime gate. To compare CPU vs GPU, build this
+ * binary once without NSPARSE_ENABLE_GPU (CPU) and once with it (GPU).
  *
  * Data is the Big-ANN sparse-vectors (SPLADE MS MARCO) CSR file, e.g.
  * data/base_small.csr from cpp-sparse-ann's dataset.py.
@@ -38,7 +38,7 @@
 #include "nsparse/seismic_index.h"
 #include "nsparse/types.h"
 
-#ifdef NSPARSE_WITH_CUDA
+#ifdef NSPARSE_WITH_GPU
 #include "nsparse/gpu/gpu_cluster_assigner.h"
 #endif
 
@@ -115,20 +115,11 @@ const CSRMatrix& shared_data() {
 constexpr nsparse::SeismicClusterParameters kParams = {
     .lambda = 6000, .beta = 400, .alpha = 0.4F};
 
-// Force the GPU-offload gate one way or the other for this process. Setting the
-// minimum-docs threshold to 1 offloads every eligible list; setting it beyond
-// the largest inverted list keeps the whole build on the CPU.
-void set_gpu_offload(bool enabled) {
-    if (enabled) {
-        ::setenv("NSPARSE_GPU_MIN_DOCS", "1", /*overwrite=*/1);
-    } else {
-        // Larger than lambda (max pruned posting length), so no list offloads.
-        ::setenv("NSPARSE_GPU_MIN_DOCS", "1000000000", /*overwrite=*/1);
-    }
-}
-
 // Builds a fresh SeismicIndex from the shared corpus and times only build().
-void run_build(benchmark::State& state, bool use_gpu) {
+// Whether build() runs on CPU or offloads to the GPU is decided at compile time
+// (NSPARSE_ENABLE_GPU) plus device availability — there is no runtime gate. To
+// compare CPU vs GPU, build this binary once without and once with GPU support.
+void run_build(benchmark::State& state) {
     const CSRMatrix& data = shared_data();
     for (auto _ : state) {
         state.PauseTiming();
@@ -136,7 +127,6 @@ void run_build(benchmark::State& state, bool use_gpu) {
             static_cast<int>(data.ncol), kParams);
         index->add(static_cast<nsparse::idx_t>(data.nrow), data.indptr.data(),
                    data.indices.data(), data.data.data());
-        set_gpu_offload(use_gpu);
         state.ResumeTiming();
 
         index->build();
@@ -161,33 +151,16 @@ int env_int(const char* name, int fallback) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// CPU build (assignment on CPU)
+// SeismicIndex build(). Runs on GPU when the library was built with
+// NSPARSE_ENABLE_GPU and a device is available; otherwise on CPU.
 // ---------------------------------------------------------------------------
-static void BM_Seismic_Build_CPU(benchmark::State& state) {
-    run_build(state, /*use_gpu=*/false);
+static void BM_Seismic_Build(benchmark::State& state) {
+    run_build(state);
 }
-BENCHMARK(BM_Seismic_Build_CPU)
+BENCHMARK(BM_Seismic_Build)
     ->Unit(benchmark::kMillisecond)
     ->UseRealTime()
     ->Iterations(env_int("NSPARSE_BENCH_ITERS", 3))
     ->Repetitions(env_int("NSPARSE_BENCH_REPS", 3));
-
-// ---------------------------------------------------------------------------
-// GPU build (assignment via cuSPARSE) - only when compiled with CUDA
-// ---------------------------------------------------------------------------
-#ifdef NSPARSE_WITH_CUDA
-static void BM_Seismic_Build_GPU(benchmark::State& state) {
-    if (!nsparse::detail::GpuClusterAssigner::available()) {
-        state.SkipWithError("No CUDA-capable GPU available");
-        return;
-    }
-    run_build(state, /*use_gpu=*/true);
-}
-BENCHMARK(BM_Seismic_Build_GPU)
-    ->Unit(benchmark::kMillisecond)
-    ->UseRealTime()
-    ->Iterations(env_int("NSPARSE_BENCH_ITERS", 3))
-    ->Repetitions(env_int("NSPARSE_BENCH_REPS", 3));
-#endif
 
 BENCHMARK_MAIN();

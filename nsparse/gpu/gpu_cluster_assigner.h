@@ -35,8 +35,8 @@ namespace nsparse::detail {
  * The search() path is unaffected and always runs on the CPU.
  *
  * The implementation lives in gpu_cluster_assigner.cu and is only compiled when
- * the project is configured with -DNSPARSE_ENABLE_CUDA=ON (which defines
- * NSPARSE_WITH_CUDA). The declarations below are always visible so that callers
+ * the project is configured with -DNSPARSE_ENABLE_GPU=ON (which defines
+ * NSPARSE_WITH_GPU). The declarations below are always visible so that callers
  * can guard usage with a single runtime available() check.
  */
 class GpuClusterAssigner {
@@ -119,21 +119,22 @@ private:
 };
 
 /**
- * @brief Heuristic gate for the automatic GPU path in map_docs_to_clusters().
+ * @brief Gate for the GPU assignment path in map_docs_to_clusters().
  *
- * The per-inverted-list problems in a Seismic build are individually small and
- * the CPU already parallelizes across lists, so offloading tiny problems to the
- * GPU loses to transfer/launch overhead. This returns true only once the
- * problem is large enough to benefit. The threshold on the number of documents
- * can be overridden with the NSPARSE_GPU_MIN_DOCS environment variable.
+ * Returns true when the library was built with GPU support and a usable device
+ * is present (and the assignment has at least two clusters). Offload is
+ * unconditional beyond that — there is no runtime size threshold.
  */
 bool should_offload_assignment_to_gpu(size_t n_docs, size_t n_clusters);
 
 /**
  * @brief Gate for the GPU summarize() max-pool offload.
  *
- * Returns true when a usable GPU is present and the offload is enabled (on by
- * default when built with CUDA; can be disabled with NSPARSE_GPU_SUMMARIZE=0).
+ * Opt-in: returns true only when the library was built with GPU support, a
+ * usable device is present, and NSPARSE_GPU_SUMMARIZE=1 is set. The default
+ * (unset) keeps summarize on the CPU flat-array path, which is faster on
+ * high-core hosts and bit-identical. Enabling the GPU offload is a net win on
+ * GPU-rich / low-core hosts where CPU summarize dominates build wall-time.
  */
 bool should_offload_summarize_to_gpu();
 

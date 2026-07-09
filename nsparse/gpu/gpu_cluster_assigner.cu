@@ -728,31 +728,22 @@ bool GpuClusterAssigner::summarize_list_maxpool(
 }
 
 bool should_offload_assignment_to_gpu(size_t n_docs, size_t n_clusters) {
-    if (!GpuClusterAssigner::available()) {
-        return false;
-    }
-    // With on-device gather/scatter and per-thread streams the offload is
-    // efficient, but very small lists still favor the CPU. Overridable for
-    // tuning/benchmarking.
-    size_t min_docs = 1024;
-    if (const char* env = std::getenv("NSPARSE_GPU_MIN_DOCS")) {
-        min_docs = static_cast<size_t>(std::strtoull(env, nullptr, 10));
-    }
-    return n_docs >= min_docs && n_clusters >= 2;
+    // Offload whenever GPU support is compiled in and a device is available.
+    // k-means assignment needs at least two clusters to be meaningful.
+    return GpuClusterAssigner::available() && n_docs > 0 && n_clusters >= 2;
 }
 
 bool should_offload_summarize_to_gpu() {
     if (!GpuClusterAssigner::available()) {
         return false;
     }
-    // On by default when a GPU is present. The max-pool is batched as one
-    // kernel launch per inverted list (all clusters at once), so it avoids the
-    // per-cluster sync storm that made a naive offload far slower. Opt out with
-    // NSPARSE_GPU_SUMMARIZE=0.
-    if (const char* env = std::getenv("NSPARSE_GPU_SUMMARIZE")) {
-        return env[0] != '0';
-    }
-    return true;
+    // Opt-in. The CPU flat-array max-pool is faster on high-core hosts, so the
+    // default keeps summarize on the CPU (bit-identical, no GPU dependency).
+    // On GPU-rich / low-core hosts (e.g. an 8-vCPU single-GPU instance), the
+    // CPU summarize dominates wall-time and offloading its max-pool to the
+    // otherwise-idle GPU is a net win — enable it with NSPARSE_GPU_SUMMARIZE=1.
+    const char* env = std::getenv("NSPARSE_GPU_SUMMARIZE");
+    return env != nullptr && env[0] == '1';
 }
 
 }  // namespace nsparse::detail

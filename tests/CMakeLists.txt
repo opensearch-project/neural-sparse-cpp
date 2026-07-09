@@ -31,8 +31,8 @@ set(NSPARSE_TEST_SRC
     vector_process_test.cpp
 )
 
-# GPU parity test is only meaningful when CUDA support is compiled in.
-if(NSPARSE_ENABLE_CUDA)
+# GPU parity test is only meaningful when GPU support is compiled in.
+if(NSPARSE_ENABLE_GPU)
     list(APPEND NSPARSE_TEST_SRC gpu_cluster_assigner_test.cpp)
 endif()
 

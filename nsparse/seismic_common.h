@@ -146,12 +146,12 @@ inline std::vector<InvertedListClusters> build_inverted_lists_clusters(
     std::vector<InvertedListClusters> clustered_inverted_lists(
         inverted_lists_size);
 
-    // Optional coarse phase timing, enabled by NSPARSE_BUILD_PROFILE=1, to see
+    // Optional coarse phase timing, enabled by NSPARSE_GPU_PROFILE=1, to see
     // how build CPU time splits across prune / train (k-means assignment) /
     // summarize. Accumulates thread-seconds (sum across threads).
     const bool build_prof =
-        std::getenv("NSPARSE_BUILD_PROFILE") != nullptr &&
-        std::getenv("NSPARSE_BUILD_PROFILE")[0] == '1';
+        std::getenv("NSPARSE_GPU_PROFILE") != nullptr &&
+        std::getenv("NSPARSE_GPU_PROFILE")[0] == '1';
     double t_prune = 0.0;
     double t_train = 0.0;
     double t_summ = 0.0;

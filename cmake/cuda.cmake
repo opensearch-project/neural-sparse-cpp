@@ -7,7 +7,7 @@
 #
 # CUDA / cuSPARSE toolchain setup for GPU-accelerated index building.
 #
-# Enable with -DNSPARSE_ENABLE_CUDA=ON. When the CUDA toolkit is installed in a
+# Enable with -DNSPARSE_ENABLE_GPU=ON. When the CUDA toolkit is installed in a
 # non-standard location (for example, shipped inside a pip `nvidia-cu13` wheel),
 # point CMake at it with:
 #   -DNSPARSE_CUDA_TOOLKIT_ROOT=/path/to/nvidia/cu13

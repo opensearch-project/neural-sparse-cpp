@@ -22,21 +22,21 @@
 
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
-#ifdef NSPARSE_WITH_CUDA
+#ifdef NSPARSE_WITH_GPU
 #include "nsparse/gpu/gpu_cluster_assigner.h"
 #endif
 
 namespace nsparse {
 namespace {
 
-// Opt-in split timing for summarize (NSPARSE_SUMMARIZE_PROFILE=1): how much of
+// Opt-in split timing for summarize (NSPARSE_GPU_PROFILE=1): how much of
 // summarize is the memory-bound max-pool vs the per-cluster sort/truncate.
 struct SummarizeProfile {
     std::atomic<int64_t> maxpool_ns{0};
     std::atomic<int64_t> sort_ns{0};
     bool enabled = false;
     SummarizeProfile() {
-        const char* v = std::getenv("NSPARSE_SUMMARIZE_PROFILE");
+        const char* v = std::getenv("NSPARSE_GPU_PROFILE");
         enabled = (v != nullptr && v[0] == '1');
     }
     ~SummarizeProfile() {
@@ -79,13 +79,26 @@ SparseVectors summarize_(const SparseVectors* vectors,
     const bool prof = g_summ_profile.enabled;
     int64_t maxpool_acc = 0;
     int64_t sort_acc = 0;
-    // The per-term max-pool (the memory-bound majority of summarize) can be
-    // offloaded to the GPU for float (U32) weights, batched as ONE launch for
-    // the whole list's clusters (per-cluster launches are dominated by GPU
-    // round-trip overhead). The tie-order-sensitive sort/truncate below stays
-    // on the CPU so output ordering is preserved.
+
+    // Per-term max-pool over a flat, dim-sized accumulator reused across all
+    // clusters in this list (replaces a per-cluster std::unordered_map, which is
+    // slow for the many small clusters). A monotonically increasing per-cluster
+    // epoch marks which accumulator slots belong to the current cluster, so no
+    // per-cluster reset of the dim-sized buffers is needed. First touch of a
+    // term is detected via the epoch (not acc[t]==0), which is robust to
+    // legitimately-zero stored weights.
+    const size_t dim = vectors->get_dimension();
+    std::vector<T> acc(dim, T(0));
+    std::vector<uint32_t> epoch(dim, 0);
+    std::vector<term_t> touched;
+    uint32_t cur_epoch = 0;
+
+    // The per-term max-pool can optionally be offloaded to the GPU (batched as
+    // one kernel launch per list) instead of the CPU flat-array path above.
+    // Opt-in via NSPARSE_GPU_SUMMARIZE=1 (see should_offload_summarize_to_gpu);
+    // a net win on GPU-rich / low-core hosts. Everything downstream is identical.
+#ifdef NSPARSE_WITH_GPU
     bool gpu_ok = false;
-#ifdef NSPARSE_WITH_CUDA
     std::vector<detail::GpuClusterAssigner::ClusterSummary> gpu_clusters;
     if constexpr (std::is_same_v<T, float>) {
         if (detail::should_offload_summarize_to_gpu()) {
@@ -102,11 +115,11 @@ SparseVectors summarize_(const SparseVectors* vectors,
     for (size_t i = 0; i < offsets.size() - 1; ++i) {
         const int64_t ts0 = prof ? summ_now_ns() : 0;
         size_t n_docs = offsets[i + 1] - offsets[i];
-        std::vector<std::pair<term_t, T>> summary_vec;
         float sum = 0.0F;
+        std::vector<std::pair<term_t, T>> summary_vec;
 
         bool used_gpu = false;
-#ifdef NSPARSE_WITH_CUDA
+#ifdef NSPARSE_WITH_GPU
         if constexpr (std::is_same_v<T, float>) {
             if (gpu_ok) {
                 const auto& gc = gpu_clusters[i];
@@ -120,22 +133,36 @@ SparseVectors summarize_(const SparseVectors* vectors,
         }
 #endif
         if (!used_gpu) {
-            std::unordered_map<term_t, T> summary_map;
+            ++cur_epoch;
+            touched.clear();
             auto doc_ids = std::span<const idx_t>(
                 group_of_doc_ids.data() + offsets[i], n_docs);
             for (const auto& doc_id : doc_ids) {
                 int start = indptr_data[doc_id];
                 int end = indptr_data[doc_id + 1];
                 for (size_t j = start; j < end; ++j) {
-                    const auto old = summary_map[indices_data[j]];
-                    auto& value = summary_map[indices_data[j]];
+                    const term_t term = indices_data[j];
                     // j is element index, need byte offset for T access
-                    value = std::max(value, *reinterpret_cast<const T*>(
-                                                values_data + j * sizeof(T)));
-                    sum += value - old;
+                    const T v = *reinterpret_cast<const T*>(
+                        values_data + j * sizeof(T));
+                    if (epoch[term] != cur_epoch) {
+                        // First occurrence in this cluster. Matches the old map
+                        // semantics: value = max(0, v).
+                        epoch[term] = cur_epoch;
+                        const T value = std::max(T(0), v);
+                        acc[term] = value;
+                        touched.push_back(term);
+                        sum += value;
+                    } else if (v > acc[term]) {
+                        sum += v - acc[term];
+                        acc[term] = v;
+                    }
                 }
             }
-            summary_vec.assign(summary_map.begin(), summary_map.end());
+            summary_vec.reserve(touched.size());
+            for (const term_t term : touched) {
+                summary_vec.emplace_back(term, acc[term]);
+            }
         }
 
         const int64_t ts1 = prof ? summ_now_ns() : 0;

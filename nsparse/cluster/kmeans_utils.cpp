@@ -18,7 +18,7 @@
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
 #include "nsparse/utils/distance_simd.h"
-#ifdef NSPARSE_WITH_CUDA
+#ifdef NSPARSE_WITH_GPU
 #include "nsparse/gpu/gpu_cluster_assigner.h"
 #endif
 #if defined(__AVX512F__)
@@ -173,12 +173,12 @@ void map_docs_to_clusters(const SparseVectors* vectors,
     if (n_clusters == 0 || n_docs == 0) {
         return;
     }
-#if defined(NSPARSE_WITH_CUDA) && !defined(__AVX512F__)
-    // GPU-accelerated assignment via cuSPARSE for float (U32) weights on large
-    // problems. Produces assignments identical to the scalar CPU reference
-    // below (skips centroids, ties break to the lowest cluster index); on any
-    // failure we fall through to the CPU path. Disabled for AVX-512 builds
-    // whose assignment semantics differ.
+#if defined(NSPARSE_WITH_GPU) && !defined(__AVX512F__)
+    // GPU-accelerated assignment via cuSPARSE for float (U32) weights. Produces
+    // assignments identical to the scalar CPU reference below (skips centroids,
+    // ties break to the lowest cluster index); on any failure we fall through
+    // to the CPU path. Disabled for AVX-512 builds whose assignment semantics
+    // differ.
     if (vectors->get_element_size() == U32 &&
         should_offload_assignment_to_gpu(n_docs, n_clusters)) {
         try {
