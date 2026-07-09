@@ -140,10 +140,12 @@ endif()
 
 # GPU acceleration for the build() path via cuSPARSE (search() stays on CPU).
 # Compiled into every nsparse variant only when configured with
-# -DNSPARSE_ENABLE_GPU=ON. Guarded by the NSPARSE_WITH_GPU compile define so
-# the CPU sources pick up the GPU assignment hook.
+# -DNSPARSE_ENABLE_GPU=ON. gpu/CMakeLists.txt does the CUDA toolchain setup and
+# defines nsparse_attach_gpu(); it is include()d (not add_subdirectory'd) here,
+# after the library targets exist, so the function is visible in this scope and
+# can wire each target.
 if(NSPARSE_ENABLE_GPU)
-    set(NSPARSE_GPU_SRC gpu/gpu_cluster_assigner.cu)
+    include(gpu/CMakeLists.txt)
     set(NSPARSE_GPU_TARGETS nsparse)
     if(NSPARSE_IS_X86)
         list(APPEND NSPARSE_GPU_TARGETS nsparse_avx2 nsparse_avx512)
@@ -151,10 +153,7 @@ if(NSPARSE_ENABLE_GPU)
         list(APPEND NSPARSE_GPU_TARGETS nsparse_sve)
     endif()
     foreach(_tgt IN LISTS NSPARSE_GPU_TARGETS)
-        target_sources(${_tgt} PRIVATE ${NSPARSE_GPU_SRC})
-        target_compile_definitions(${_tgt} PUBLIC NSPARSE_WITH_GPU)
-        target_link_libraries(${_tgt} PRIVATE CUDA::cusparse CUDA::cudart)
-        set_target_properties(${_tgt} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+        nsparse_attach_gpu(${_tgt})
     endforeach()
 endif()
 
