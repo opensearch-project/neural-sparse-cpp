@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "nsparse/cluster/kmeans_utils.h"
+#include "nsparse/gpu/gpu_summarizer.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
 
@@ -186,7 +187,7 @@ void cpu_reference_maxpool(const SparseVectors* vectors,
 // Compares GPU per-cluster max-pool against the CPU reference for a whole list
 // of several clusters processed in one batched call.
 TEST(GpuClusterAssignerTest, SummarizeListMaxpoolMatchesCpu) {
-    if (!GpuClusterAssigner::available()) {
+    if (!GpuSummarizer::available()) {
         GTEST_SKIP() << "No CUDA-capable GPU available";
     }
     constexpr size_t kNumDocs = 8000;
@@ -207,8 +208,8 @@ TEST(GpuClusterAssignerTest, SummarizeListMaxpoolMatchesCpu) {
     }
     const size_t n_clusters = offsets.size() - 1;
 
-    std::vector<GpuClusterAssigner::ClusterSummary> gpu_out;
-    ASSERT_TRUE(GpuClusterAssigner::instance().summarize_list_maxpool(
+    std::vector<GpuSummarizer::ClusterSummary> gpu_out;
+    ASSERT_TRUE(GpuSummarizer::instance().summarize_list(
         &vectors, flat_docs.data(), offsets.data(), n_clusters, gpu_out));
     ASSERT_EQ(gpu_out.size(), n_clusters);
 
@@ -241,26 +242,26 @@ TEST(GpuClusterAssignerTest, SummarizeListMaxpoolMatchesCpu) {
 // A second list reusing the buffers must not leak accumulator state from the
 // first — verifies the touched-slot reset path.
 TEST(GpuClusterAssignerTest, SummarizeListMaxpoolReuseIsClean) {
-    if (!GpuClusterAssigner::available()) {
+    if (!GpuSummarizer::available()) {
         GTEST_SKIP() << "No CUDA-capable GPU available";
     }
     SparseVectors vectors = make_random_corpus(5000, 2500, 40, 21);
-    auto& gpu = GpuClusterAssigner::instance();
+    auto& gpu = GpuSummarizer::instance();
 
     // First list.
     std::vector<idx_t> docs1;
     for (idx_t d = 0; d < 2000; ++d) docs1.push_back(d);
     std::vector<idx_t> off1 = {0, 800, 2000};
-    std::vector<GpuClusterAssigner::ClusterSummary> out1;
-    gpu.summarize_list_maxpool(&vectors, docs1.data(), off1.data(), 2, out1);
+    std::vector<GpuSummarizer::ClusterSummary> out1;
+    gpu.summarize_list(&vectors, docs1.data(), off1.data(), 2, out1);
 
     // Second, different list must match its own CPU reference.
     std::vector<idx_t> docs2;
     for (idx_t d = 2000; d < 5000; ++d) docs2.push_back(d);
     std::vector<idx_t> off2 = {0, 1500, 3000};
-    std::vector<GpuClusterAssigner::ClusterSummary> out2;
+    std::vector<GpuSummarizer::ClusterSummary> out2;
     ASSERT_TRUE(
-        gpu.summarize_list_maxpool(&vectors, docs2.data(), off2.data(), 2,
+        gpu.summarize_list(&vectors, docs2.data(), off2.data(), 2,
                                    out2));
     for (size_t b = 0; b < 2; ++b) {
         std::vector<idx_t> cluster(docs2.begin() + off2[b],

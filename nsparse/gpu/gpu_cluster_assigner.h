@@ -18,125 +18,48 @@
 namespace nsparse::detail {
 
 /**
- * @brief GPU-accelerated k-means document-to-cluster assignment used by the
- *        index-building (build()) path.
+ * @brief GPU k-means document-to-cluster assignment for the build() path.
  *
- * The assignment step of Seismic clustering computes, for every document, the
- * dot product against each cluster centroid and picks the highest-scoring
- * cluster. Across a whole inverted list this is a sparse-times-dense matrix
- * product (documents as a CSR matrix, centroids as a dense matrix), which maps
- * directly onto NVIDIA cuSPARSE SpMM followed by a per-row argmax.
+ * Per inverted list, scoring every document against every centroid is a
+ * sparse-times-dense product (documents as CSR, centroids as dense), computed
+ * with cuSPARSE SpMM plus a per-row argmax. Output matches the scalar CPU
+ * map_docs_to_clusters(): centroids are not re-added, ties break to the lowest
+ * cluster index. float (U32) weights only; search() is unaffected (CPU).
  *
- * This class mirrors the CPU map_docs_to_clusters() semantics exactly for
- * float (U32) weights:
- *   - documents equal to a cluster centroid are left untouched (not re-added),
- *   - ties are broken toward the lowest cluster index (strict-greater update).
- *
- * The search() path is unaffected and always runs on the CPU.
- *
- * The implementation lives in gpu_cluster_assigner.cu and is only compiled when
- * the project is configured with -DNSPARSE_ENABLE_GPU=ON (which defines
- * NSPARSE_WITH_GPU). The declarations below are always visible so that callers
- * can guard usage with a single runtime available() check.
+ * Compiled only with -DNSPARSE_ENABLE_GPU=ON (defines NSPARSE_WITH_GPU); the
+ * declarations stay visible so callers guard on a single available() check.
  */
 class GpuClusterAssigner {
 public:
-    /// Process-wide singleton. Owns the cuSPARSE handle and serializes GPU
-    /// access so it is safe to call from OpenMP worker threads.
+    /// Process-wide singleton owning the per-thread cuSPARSE handles/streams.
     static GpuClusterAssigner& instance();
 
-    /// True when the library was built with CUDA support and a usable GPU is
-    /// present. When false, callers must use the CPU path.
+    /// True when built with GPU support and a usable device is present.
     static bool available();
 
     /**
      * @brief Assign each non-centroid document to its best cluster on the GPU.
      *
-     * For every document id in @p docs (interpreted as a row of @p vectors),
-     * computes the dot product against each cluster centroid
-     * (clusters[j].front()) and appends the document to the highest-scoring
-     * cluster. Documents that are themselves a centroid are skipped, matching
-     * the CPU reference.
-     *
-     * Only float (U32) weights are supported on the GPU. Callers must check
-     * vectors->get_element_size() == U32 and fall back to the CPU path
-     * otherwise.
-     *
-     * @param vectors  full corpus of sparse vectors (CSR-backed).
-     * @param docs     document ids belonging to this inverted list.
-     * @param clusters in/out clusters; clusters[j].front() is the centroid of
-     *                 cluster j and assigned documents are appended.
+     * @param vectors  corpus of sparse vectors (CSR-backed).
+     * @param docs     document ids in this inverted list.
+     * @param clusters in/out; clusters[j].front() is centroid j, assigned docs
+     *                 are appended. Documents that are a centroid are skipped.
      */
     void assign(const SparseVectors* vectors, const std::vector<idx_t>& docs,
                 std::vector<std::vector<idx_t>>& clusters);
-
-    /// Per-cluster max-pool result from summarize_list_maxpool(). Terms are in
-    /// GPU touched-append order (not sorted); the CPU sort/truncate handles
-    /// ordering, preserving the existing output semantics.
-    struct ClusterSummary {
-        std::vector<term_t> terms;
-        std::vector<float> values;
-        float sum = 0.0F;
-    };
-
-    /**
-     * @brief GPU max-pool for a whole inverted list's clusters in one launch.
-     *
-     * Given the flattened cluster layout of one inverted list (@p docs with
-     * @p offsets, where cluster b owns docs[offsets[b]..offsets[b+1])), computes
-     * on the GPU, per cluster and per term, the maximum weight across the
-     * cluster's documents — the per-term max-pool that dominates summarize().
-     *
-     * Processing the entire list in a single kernel launch + single stream sync
-     * (one thread block per cluster) is essential: clusters average only a
-     * handful of documents, so a per-cluster launch/sync is dominated by GPU
-     * round-trip overhead. The tie-order-sensitive sort/truncate stays on the
-     * CPU. Requires the corpus resident (shares assign()'s cache); float (U32)
-     * only. Returns false (caller falls back to CPU) if the GPU is unavailable
-     * or the list is empty.
-     *
-     * @param n_clusters  offsets.size() - 1.
-     * @param out         resized to n_clusters; out[b] holds cluster b's result.
-     */
-    bool summarize_list_maxpool(const SparseVectors* vectors,
-                                const idx_t* docs, const idx_t* offsets,
-                                size_t n_clusters,
-                                std::vector<ClusterSummary>& out);
 
     GpuClusterAssigner(const GpuClusterAssigner&) = delete;
     GpuClusterAssigner& operator=(const GpuClusterAssigner&) = delete;
 
 private:
-    GpuClusterAssigner();
-    ~GpuClusterAssigner();
-
-    struct Impl;
-    // Uploads the corpus to the GPU on first use (or when it changes) and
-    // returns an opaque handle to the resident device buffers. Thread-safe.
-    const void* ensure_corpus_resident(const SparseVectors* vectors);
-
-    Impl* impl_;
+    GpuClusterAssigner() = default;
 };
 
 /**
- * @brief Gate for the GPU assignment path in map_docs_to_clusters().
- *
- * Returns true when the library was built with GPU support and a usable device
- * is present (and the assignment has at least two clusters). Offload is
- * unconditional beyond that — there is no runtime size threshold.
+ * @brief Whether to run assignment on the GPU: built with GPU support, a device
+ * is present, and the list has >= 2 clusters. No runtime size threshold.
  */
 bool should_offload_assignment_to_gpu(size_t n_docs, size_t n_clusters);
-
-/**
- * @brief Gate for the GPU summarize() max-pool offload.
- *
- * Opt-in: returns true only when the library was built with GPU support, a
- * usable device is present, and NSPARSE_GPU_SUMMARIZE=1 is set. The default
- * (unset) keeps summarize on the CPU flat-array path, which is faster on
- * high-core hosts and bit-identical. Enabling the GPU offload is a net win on
- * GPU-rich / low-core hosts where CPU summarize dominates build wall-time.
- */
-bool should_offload_summarize_to_gpu();
 
 }  // namespace nsparse::detail
 

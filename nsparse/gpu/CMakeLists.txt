@@ -47,19 +47,21 @@ endif()
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# Absolute path to the CUDA translation unit, resolved once here so the helper
-# can be called from the parent directory scope. This file is include()d from
+# Absolute paths to the CUDA translation units, resolved here so the helper can
+# be called from the parent directory scope. This file is include()d from
 # nsparse/CMakeLists.txt, so CMAKE_CURRENT_LIST_DIR is this gpu/ directory.
-set(NSPARSE_GPU_CU "${CMAKE_CURRENT_LIST_DIR}/gpu_cluster_assigner.cu"
-    CACHE INTERNAL "nsparse GPU source")
+set(NSPARSE_GPU_SRC
+    "${CMAKE_CURRENT_LIST_DIR}/gpu_cluster_assigner.cu"
+    "${CMAKE_CURRENT_LIST_DIR}/gpu_summarizer.cu"
+    CACHE INTERNAL "nsparse GPU sources")
 
 message(STATUS "nsparse: GPU enabled (nvcc=${CMAKE_CUDA_COMPILER}, "
         "archs=${CMAKE_CUDA_ARCHITECTURES})")
 
-# Compile the GPU source into <target> and link cuSPARSE/cudart. Guarded by the
+# Compile the GPU sources into <target> and link cuSPARSE/cudart. Guarded by the
 # NSPARSE_WITH_GPU compile define so the CPU sources pick up the GPU hooks.
 function(nsparse_attach_gpu target)
-    target_sources(${target} PRIVATE "${NSPARSE_GPU_CU}")
+    target_sources(${target} PRIVATE ${NSPARSE_GPU_SRC})
     target_compile_definitions(${target} PUBLIC NSPARSE_WITH_GPU)
     target_link_libraries(${target} PRIVATE CUDA::cusparse CUDA::cudart)
     # Resolve device symbols into the library itself so pure-C++ consumers

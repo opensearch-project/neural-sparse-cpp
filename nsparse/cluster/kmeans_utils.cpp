@@ -174,11 +174,11 @@ void map_docs_to_clusters(const SparseVectors* vectors,
         return;
     }
 #if defined(NSPARSE_WITH_GPU) && !defined(__AVX512F__)
-    // GPU-accelerated assignment via cuSPARSE for float (U32) weights. Produces
-    // assignments identical to the scalar CPU reference below (skips centroids,
-    // ties break to the lowest cluster index); on any failure we fall through
-    // to the CPU path. Disabled for AVX-512 builds whose assignment semantics
-    // differ.
+    // GPU assignment (cuSPARSE) for float (U32) weights. It matches the scalar
+    // CPU path below (skips centroids); on any failure we fall through to CPU.
+    // Excluded from AVX-512 builds because that path (unlike the scalar one)
+    // does not skip centroids, so mixing GPU- and AVX-512-assigned lists in one
+    // build would be inconsistent.
     if (vectors->get_element_size() == U32 &&
         should_offload_assignment_to_gpu(n_docs, n_clusters)) {
         try {
