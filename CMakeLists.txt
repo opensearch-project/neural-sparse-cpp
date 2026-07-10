@@ -22,6 +22,12 @@ include(cmake/third_party.cmake)
 option(NSPARSE_OPT_LEVEL "" "generic")
 option(NSPARSE_ENABLE_PYTHON "Build Python bindings" OFF)
 
+# GPU acceleration for the index-building (build()) path via NVIDIA cuSPARSE.
+# The search() path always stays on CPU. Default OFF so CPU-only builds and CI
+# are unaffected when no CUDA toolkit is present. Toolchain setup and per-target
+# wiring live in nsparse/gpu/CMakeLists.txt (included from nsparse/CMakeLists.txt).
+option(NSPARSE_ENABLE_GPU "Build GPU-accelerated index building via cuSPARSE" OFF)
+
 add_subdirectory(nsparse)
 
 # Python bindings

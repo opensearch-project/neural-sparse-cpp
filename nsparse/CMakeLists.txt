@@ -138,6 +138,25 @@ if(NSPARSE_IS_X86)
   target_include_directories(nsparse_avx512 PUBLIC $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>)
 endif()
 
+# GPU acceleration for the build() path via cuSPARSE (search() stays on CPU).
+# Compiled into every nsparse variant only when configured with
+# -DNSPARSE_ENABLE_GPU=ON. gpu/CMakeLists.txt does the CUDA toolchain setup and
+# defines nsparse_attach_gpu(); it is include()d (not add_subdirectory'd) here,
+# after the library targets exist, so the function is visible in this scope and
+# can wire each target.
+if(NSPARSE_ENABLE_GPU)
+    include(gpu/CMakeLists.txt)
+    set(NSPARSE_GPU_TARGETS nsparse)
+    if(NSPARSE_IS_X86)
+        list(APPEND NSPARSE_GPU_TARGETS nsparse_avx2 nsparse_avx512)
+    elseif(NSPARSE_IS_ARM AND NOT APPLE)
+        list(APPEND NSPARSE_GPU_TARGETS nsparse_sve)
+    endif()
+    foreach(_tgt IN LISTS NSPARSE_GPU_TARGETS)
+        nsparse_attach_gpu(${_tgt})
+    endforeach()
+endif()
+
 find_package(OpenMP REQUIRED)
 # Link base library (always)
 target_link_libraries(nsparse PUBLIC OpenMP::OpenMP_CXX absl::flat_hash_set absl::flat_hash_map)

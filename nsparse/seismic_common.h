@@ -139,6 +139,7 @@ inline std::vector<InvertedListClusters> build_inverted_lists_clusters(
     size_t inverted_lists_size = inverted_lists->size();
     std::vector<InvertedListClusters> clustered_inverted_lists(
         inverted_lists_size);
+
 #pragma omp parallel for schedule(dynamic, 64)
     for (int64_t idx = 0; idx < static_cast<int64_t>(inverted_lists_size);
          ++idx) {

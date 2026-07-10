@@ -41,3 +41,16 @@ if(NSPARSE_BENCHMARK_SRC)
         absl::flat_hash_map
     )
 endif()
+
+# Build-time benchmark: SeismicIndex build() on CPU vs GPU (cuSPARSE). The GPU
+# case is compiled in only when the nsparse target carries CUDA support (the
+# NSPARSE_WITH_GPU define propagates from the nsparse target).
+add_executable(nsparse_build_benchmark index_build_benchmark.cpp)
+target_include_directories(nsparse_build_benchmark PRIVATE ${PROJECT_SOURCE_DIR})
+target_link_libraries(nsparse_build_benchmark PRIVATE
+    nsparse
+    OpenMP::OpenMP_CXX
+    benchmark::benchmark
+    absl::flat_hash_set
+    absl::flat_hash_map
+)
