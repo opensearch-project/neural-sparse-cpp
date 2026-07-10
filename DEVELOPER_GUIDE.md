@@ -7,6 +7,7 @@
   - [Build](#build)
     - [Build Options](#build-options)
     - [SIMD Optimization Levels](#simd-optimization-levels)
+    - [GPU Acceleration](#gpu-acceleration)
   - [Run Tests](#run-tests)
   - [Run Benchmarks](#run-benchmarks)
   - [Python Bindings](#python-bindings)
@@ -96,6 +97,7 @@ cmake --build build -j
 | `NSPARSE_ENABLE_PYTHON` | `OFF` | Build Python bindings |
 | `NSPARSE_ENABLE_TESTS` | `OFF` | Build unit tests |
 | `NSPARSE_ENABLE_BENCHMARKS` | `OFF` | Build benchmarks |
+| `NSPARSE_ENABLE_GPU` | `OFF` | GPU-accelerate index building via cuSPARSE (see [GPU Acceleration](#gpu-acceleration)) |
 
 Example with multiple options:
 ```bash
@@ -115,6 +117,43 @@ The `NSPARSE_OPT_LEVEL` option controls which SIMD instruction sets are compiled
 | `sve` | ARM (non-Apple) | Scalable Vector Extension |
 
 > Note: ARM NEON is used automatically on ARM platforms. SVE is not supported on Apple Silicon.
+
+### GPU Acceleration
+
+`NSPARSE_ENABLE_GPU=ON` compiles optional NVIDIA GPU acceleration for the
+**index-building** (`build()`) path of `SeismicIndex`, using cuSPARSE plus a few
+custom CUDA kernels. This offloads the two heaviest build phases — the k-means
+document→centroid assignment and the `summarize()` per-term max-pool. Search is
+unaffected and always runs on the CPU. The option is `OFF` by default, so
+CPU-only builds and platforms without a CUDA toolkit are unaffected.
+
+Requirements:
+
+- NVIDIA CUDA Toolkit (nvcc, cuSPARSE, cudart) and a CUDA-capable GPU
+- `float` (`U32`) weights — quantized (`seismic_sq`) indices fall back to the CPU
+
+Build:
+
+```bash
+cmake -S . -B build -DNSPARSE_ENABLE_GPU=ON
+cmake --build build -j
+```
+
+If the CUDA toolkit is in a non-standard location (for example, a pip-packaged
+`nvidia-cu*` wheel), point CMake at it:
+
+```bash
+cmake -S . -B build -DNSPARSE_ENABLE_GPU=ON \
+  -DNSPARSE_CUDA_TOOLKIT_ROOT=/path/to/nvidia/cuXX
+```
+
+Target GPU architectures default to `80;89` (Ampere / Ada); override with
+`-DNSPARSE_CUDA_ARCHITECTURES=...`. When built with GPU support and a device is
+present, assignment is offloaded unconditionally. The `summarize()` max-pool
+offload is opt-in via the `NSPARSE_GPU_SUMMARIZE=1` environment variable; the
+default keeps summarize on the CPU, which is faster on high-core hosts and
+produces identical output. The GPU build wiring lives in
+[`nsparse/gpu/CMakeLists.txt`](nsparse/gpu/CMakeLists.txt).
 
 ## Run Tests
 
@@ -212,6 +251,7 @@ In VS Code, you can set breakpoints and debug directly from the IDE using the te
 | [Google Benchmark](https://github.com/google/benchmark) | Benchmarking framework | Auto-fetched via CMake |
 | OpenMP | Parallelism | System package |
 | SWIG | Python bindings generation | System package |
+| CUDA Toolkit / cuSPARSE | GPU-accelerated index building (only with `NSPARSE_ENABLE_GPU=ON`) | System or CUDA pip wheel |
 
 ## Submitting Changes
 
@@ -232,6 +272,7 @@ Try to put new classes into existing directories if the directory name abstracts
 - `nsparse/invlists/` — Inverted list storage
 - `nsparse/io/` — Serialization and I/O
 - `nsparse/utils/` — Utilities (distance functions, SIMD, quantization, ranker)
+- `nsparse/gpu/` — Optional CUDA/cuSPARSE build-time acceleration (`NSPARSE_ENABLE_GPU`)
 - `nsparse/python/` — Python bindings (SWIG)
 
 ### Modular code
