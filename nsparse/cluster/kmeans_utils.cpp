@@ -61,9 +61,9 @@ static void map_docs_to_clusters_sparse_invindex(
         }
     }
 
-    // Build offset table (prefix sum)
+    // Build offset table (prefix sum). offsets[0] is already 0 from
+    // value-initialization of the vector.
     std::vector<uint32_t> offsets(dimension + 1);
-    offsets[0] = 0;
     for (size_t i = 0; i < dimension; ++i) {
         offsets[i + 1] = offsets[i] + term_counts[i];
     }
