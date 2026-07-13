@@ -445,12 +445,12 @@ inline auto dot_product_float_vectors_dense(const SparseVectors* vectors,
     const auto& [indptr, indices, values] = vectors->get_all_data();
 
     for (size_t i = 0; i < n_vectors; ++i) {
-        const idx_t start = indptr[i];
-        const idx_t end = indptr[i + 1];
+        const offset_t start = indptr[i];
+        const offset_t end = indptr[i + 1];
         const size_t len = end - start;
 
         if (i + 1 < n_vectors) {
-            const idx_t next_start = indptr[i + 1];
+            const offset_t next_start = indptr[i + 1];
             const size_t next_len = indptr[i + 2] - next_start;
             prefetch_vector(indices + next_start, values + next_start,
                             next_len);
@@ -467,17 +467,17 @@ inline auto dot_product_uint8_vectors_dense(const SparseVectors* vectors,
     size_t n_vectors = vectors->num_vectors();
     std::vector<float> results(n_vectors, 0);
 
-    const idx_t* indptr = vectors->indptr_data();
+    const offset_t* indptr = vectors->indptr_data();
     const term_t* indices = vectors->indices_data();
     const uint8_t* values = vectors->typed_values_data<uint8_t>();
 
     for (size_t i = 0; i < n_vectors; ++i) {
-        const idx_t start = indptr[i];
-        const idx_t end = indptr[i + 1];
+        const offset_t start = indptr[i];
+        const offset_t end = indptr[i + 1];
         const size_t len = end - start;
 
         if (i + 1 < n_vectors) {
-            const idx_t next_start = indptr[i + 1];
+            const offset_t next_start = indptr[i + 1];
             const size_t next_len = indptr[i + 2] - next_start;
             prefetch_vector(indices + next_start, values + next_start,
                             next_len);
@@ -494,17 +494,17 @@ inline auto dot_product_uint16_vectors_dense(const SparseVectors* vectors,
     size_t n_vectors = vectors->num_vectors();
     std::vector<float> results(n_vectors, 0);
 
-    const idx_t* indptr = vectors->indptr_data();
+    const offset_t* indptr = vectors->indptr_data();
     const term_t* indices = vectors->indices_data();
     const uint16_t* values = vectors->typed_values_data<uint16_t>();
 
     for (size_t i = 0; i < n_vectors; ++i) {
-        const idx_t start = indptr[i];
-        const idx_t end = indptr[i + 1];
+        const offset_t start = indptr[i];
+        const offset_t end = indptr[i + 1];
         const size_t len = end - start;
 
         if (i + 1 < n_vectors) {
-            const idx_t next_start = indptr[i + 1];
+            const offset_t next_start = indptr[i + 1];
             const size_t next_len = indptr[i + 2] - next_start;
             prefetch_vector(indices + next_start, values + next_start,
                             next_len);

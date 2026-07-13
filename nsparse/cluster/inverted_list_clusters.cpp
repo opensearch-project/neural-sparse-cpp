@@ -22,10 +22,12 @@ namespace nsparse {
 namespace {
 
 /**
- * @brief Generage summary sparse vector for posting lists
+ * @brief Generate summary sparse vector for posting lists
  *
  * @param vectors inverted index
  * @param group_of_doc_ids a list of posting list
+ * @param offsets prefix-sum boundaries delimiting each posting list within
+ *                group_of_doc_ids
  * @param alpha prune ratio
  * @return SparseVectors
  */
@@ -40,53 +42,90 @@ SparseVectors summarize_(const SparseVectors* vectors,
         return summarized_vectors;
     }
     const auto element_size = vectors->get_element_size();
-    const auto& indptr_data = vectors->indptr_data();
-    const auto& indices_data = vectors->indices_data();
-    const auto& values_data = vectors->values_data();
+    const auto* indptr_data = vectors->indptr_data();
+    const auto* indices_data = vectors->indices_data();
+    const auto* values_data = vectors->values_data();
+    const size_t dimension = vectors->get_dimension();
+
+    // Dense buffer for max-pooling (reused across clusters)
+    std::vector<T> dense_max;
+    if (dimension > 0) {
+        dense_max.resize(dimension, T{0});
+    }
+    std::vector<term_t> active_terms;
+    active_terms.reserve(1024);
+
     for (size_t i = 0; i < offsets.size() - 1; ++i) {
         size_t n_docs = offsets[i + 1] - offsets[i];
-        std::unordered_map<term_t, T> summary_map;
-        float sum = 0.0F;
         auto doc_ids = std::span<const idx_t>(
             group_of_doc_ids.data() + offsets[i], n_docs);
-        for (const auto& doc_id : doc_ids) {
-            int start = indptr_data[doc_id];
-            int end = indptr_data[doc_id + 1];
-            for (size_t j = start; j < end; ++j) {
-                const auto old = summary_map[indices_data[j]];
-                auto& value = summary_map[indices_data[j]];
-                // j is element index, need byte offset for T access
-                value = std::max(value, *reinterpret_cast<const T*>(
-                                            values_data + j * sizeof(T)));
-                sum += value - old;
+
+        std::vector<idx_t> sorted_docs(doc_ids.begin(), doc_ids.end());
+        std::sort(sorted_docs.begin(), sorted_docs.end());
+
+        float sum = 0.0F;
+        active_terms.clear();
+        std::vector<std::pair<term_t, T>> summary_vec;
+
+        if (dimension > 0) {
+            for (const auto& doc_id : sorted_docs) {
+                offset_t start = indptr_data[doc_id];
+                offset_t end = indptr_data[doc_id + 1];
+                for (offset_t j = start; j < end; ++j) {
+                    term_t term = indices_data[j];
+                    T val = *reinterpret_cast<const T*>(
+                        values_data + j * sizeof(T));
+                    T& cur = dense_max[term];
+                    if (cur == T{0}) {
+                        active_terms.push_back(term);
+                    }
+                    if (val > cur) {
+                        sum += static_cast<float>(val) -
+                               static_cast<float>(cur);
+                        cur = val;
+                    }
+                }
             }
+            summary_vec.reserve(active_terms.size());
+            for (term_t term : active_terms) {
+                summary_vec.emplace_back(term, dense_max[term]);
+                dense_max[term] = T{0};
+            }
+        } else {
+            std::unordered_map<term_t, T> summary_map;
+            for (const auto& doc_id : sorted_docs) {
+                offset_t start = indptr_data[doc_id];
+                offset_t end = indptr_data[doc_id + 1];
+                for (offset_t j = start; j < end; ++j) {
+                    const auto old = summary_map[indices_data[j]];
+                    auto& value = summary_map[indices_data[j]];
+                    value = std::max(value, *reinterpret_cast<const T*>(
+                                                values_data + j * sizeof(T)));
+                    sum += value - old;
+                }
+            }
+            summary_vec.assign(summary_map.begin(), summary_map.end());
         }
 
-        // Convert summary_map to vector of pairs
-        std::vector<std::pair<term_t, T>> summary_vec(summary_map.begin(),
-                                                      summary_map.end());
-
-        // Sort by value in descending order
+        // Sort by value descending for alpha pruning
         std::ranges::sort(summary_vec, [](const auto& a, const auto& b) {
             return a.second > b.second;
         });
 
         float addup = 0.0F;
-        for (int j = 0; j < summary_vec.size(); ++j) {
-            addup += summary_vec[j].second;
+        for (size_t j = 0; j < summary_vec.size(); ++j) {
+            addup += static_cast<float>(summary_vec[j].second);
             if (addup / sum >= alpha) {
-                summary_vec.erase(summary_vec.begin() + j + 1,
-                                  summary_vec.end());
+                summary_vec.resize(j + 1);
                 break;
             }
         }
 
-        // Sort by term_t order
+        // Sort by term order for sparse output
         std::ranges::sort(summary_vec, [](const auto& a, const auto& b) {
             return a.first < b.first;
         });
 
-        // Break into separate terms and values vectors
         std::vector<term_t> terms;
         std::vector<T> values;
         terms.reserve(summary_vec.size());

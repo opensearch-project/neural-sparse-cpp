@@ -12,6 +12,7 @@
 #include <memory>
 
 #include "nsparse/id_selector.h"
+#include "nsparse/io/file_io.h"
 #include "nsparse/io/index_io.h"
 #include "nsparse/io/io.h"
 #include "nsparse/utils/checks.h"
@@ -24,7 +25,48 @@ void IDMapIndex::add(idx_t n, const idx_t* indptr, const term_t* indices,
     delegate_->add(n, indptr, indices, values);
 }
 
+void IDMapIndex::reserve(size_t num_vectors, size_t total_nnz) {
+    delegate_->reserve(num_vectors, total_nnz);
+}
+
 void IDMapIndex::build() { delegate_->build(); }
+
+void IDMapIndex::build_and_save(const char* path) {
+    FileIOWriter writer(const_cast<char*>(path));
+
+    // Write IDMapIndex header (fourcc + dimension)
+    auto id_val = fourcc(name);
+    writer.write(&id_val, sizeof(uint32_t), 1);
+    auto dim = delegate_->get_dimension();
+    writer.write(&dim, sizeof(int), 1);
+
+    // Write body via IOWriter overload
+    build_and_save(&writer);
+
+    writer.close();
+}
+
+void IDMapIndex::build_and_save(IOWriter* writer) {
+    // Write delegate's header + body (streaming build)
+    auto delegate_id_val = fourcc(delegate_->id());
+    writer->write(&delegate_id_val, sizeof(uint32_t), 1);
+    auto delegate_dim = delegate_->get_dimension();
+    writer->write(&delegate_dim, sizeof(int), 1);
+    delegate_->build_and_save(writer);
+
+    // Write internal_to_external_ map
+    size_t map_size = internal_to_external_.size();
+    writer->write(&map_size, sizeof(size_t), 1);
+    if (map_size > 0) {
+        writer->write(internal_to_external_.data(), sizeof(idx_t), map_size);
+    }
+}
+
+void IDMapIndex::release_build_memory() {
+    if (delegate_) {
+        delegate_->release_build_memory();
+    }
+}
 
 void IDMapIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
                         const float* values, int k, float* distances,

@@ -266,7 +266,7 @@ auto InvertedIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
 
 #pragma omp parallel for
     for (idx_t query_idx = 0; query_idx < n; ++query_idx) {
-        const idx_t start = query_indptr[query_idx];
+        const offset_t start = query_indptr[query_idx];
         const size_t len = query_indptr[query_idx + 1] - start;
 
         auto [distances, labels] =

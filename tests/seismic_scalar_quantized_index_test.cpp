@@ -818,5 +818,93 @@ TEST(SeismicSQIndexSearch, search_with_id_selector_filters_results) {
     EXPECT_EQ(labels[2], -1);
 }
 
+// ============== build_and_save tests ==============
+
+TEST(SeismicSQBuildAndSave, produces_loadable_index) {
+    TestableSeismicSQIndex original(QuantizerType::QT_8bit, 0.0F, 1.0F, 10, 2,
+                                    0.5F, 4);
+
+    original.add_docs({{{0, 1.0F}, {1, 0.5F}},
+                       {{0, 0.8F}, {2, 0.6F}},
+                       {{1, 0.9F}, {3, 0.7F}}});
+
+    // build_and_save(IOWriter*) writes body only; prepend header for read_index
+    BufferedIOWriter writer;
+    auto id_val = fourcc(SeismicScalarQuantizedIndex::name);
+    int dim = 4;
+    writer.write(&id_val, sizeof(uint32_t), 1);
+    writer.write(&dim, sizeof(int), 1);
+    original.build_and_save(&writer);
+
+    BufferedIOReader reader(writer.data());
+    Index* loaded = read_index(&reader);
+
+    ASSERT_NE(loaded, nullptr);
+    EXPECT_EQ(loaded->get_dimension(), 4);
+    EXPECT_EQ(loaded->get_vectors()->num_vectors(), 3);
+
+    delete loaded;
+}
+
+TEST(SeismicSQBuildAndSave, search_matches_regular_build) {
+    TestableSeismicSQIndex streaming(QuantizerType::QT_8bit, 0.0F, 1.0F, 10, 2,
+                                     0.5F, 4);
+    TestableSeismicSQIndex regular(QuantizerType::QT_8bit, 0.0F, 1.0F, 10, 2,
+                                   0.5F, 4);
+
+    std::vector<std::map<int, float>> docs = {
+        {{0, 1.0F}, {1, 0.5F}},
+        {{0, 0.8F}, {2, 0.6F}},
+        {{1, 0.9F}, {3, 0.7F}}};
+
+    streaming.add_docs(docs);
+    regular.add_docs(docs);
+
+    // Regular path: build + write
+    regular.build();
+    BufferedIOWriter regular_writer;
+    write_index(&regular, &regular_writer);
+
+    // Streaming path: build_and_save (prepend header)
+    BufferedIOWriter streaming_writer;
+    auto id_val = fourcc(SeismicScalarQuantizedIndex::name);
+    int dim = 4;
+    streaming_writer.write(&id_val, sizeof(uint32_t), 1);
+    streaming_writer.write(&dim, sizeof(int), 1);
+    streaming.build_and_save(&streaming_writer);
+
+    // Load both
+    BufferedIOReader regular_reader(regular_writer.data());
+    Index* regular_loaded = read_index(&regular_reader);
+
+    BufferedIOReader streaming_reader(streaming_writer.data());
+    Index* streaming_loaded = read_index(&streaming_reader);
+
+    // Search both with same query
+    std::vector<idx_t> query_indptr = {0, 2};
+    std::vector<term_t> query_indices = {0, 1};
+    std::vector<float> query_values = {1.0F, 0.8F};
+
+    std::vector<idx_t> labels_regular(3, -1);
+    std::vector<float> distances_regular(3, -1.0F);
+    std::vector<idx_t> labels_streaming(3, -1);
+    std::vector<float> distances_streaming(3, -1.0F);
+
+    SeismicSearchParameters params(5, 1000.0F);
+    regular_loaded->search(1, query_indptr.data(), query_indices.data(),
+                           query_values.data(), 3, distances_regular.data(),
+                           labels_regular.data(), &params);
+    streaming_loaded->search(1, query_indptr.data(), query_indices.data(),
+                             query_values.data(), 3, distances_streaming.data(),
+                             labels_streaming.data(), &params);
+
+    EXPECT_EQ(labels_regular[0], labels_streaming[0]);
+    EXPECT_EQ(labels_regular[1], labels_streaming[1]);
+    EXPECT_EQ(labels_regular[2], labels_streaming[2]);
+
+    delete regular_loaded;
+    delete streaming_loaded;
+}
+
 }  // namespace
 }  // namespace nsparse

@@ -47,7 +47,11 @@ public:
     std::array<char, 4> id() const override { return name; }
     void add(idx_t n, const idx_t* indptr, const term_t* indices,
              const float* values) override;
+    void reserve(size_t num_vectors, size_t total_nnz) override;
     void build() override;
+    void build_and_save(const char* path) override;
+    void build_and_save(IOWriter* writer) override;
+    void release_build_memory() override;
     const SparseVectors* get_vectors() const override { return vectors_.get(); }
 
     const ScalarQuantizer& get_scalar_quantizer() const { return sq_; }

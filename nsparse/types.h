@@ -16,6 +16,7 @@
 namespace nsparse {
 
 using idx_t = int32_t;
+using offset_t = int64_t;
 using term_t = uint16_t;
 using weight_t = float;
 

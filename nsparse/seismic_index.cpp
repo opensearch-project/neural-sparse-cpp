@@ -23,6 +23,8 @@
 #include "nsparse/id_selector.h"
 #include "nsparse/index.h"
 #include "nsparse/invlists/inverted_lists.h"
+#include "nsparse/io/file_io.h"
+#include "nsparse/io/index_io.h"
 #include "nsparse/io/seismic_invlists_writer.h"
 #include "nsparse/seismic_common.h"
 #include "nsparse/sparse_vectors.h"
@@ -66,10 +68,8 @@ void query_single_inverted_list(const SparseVectors* vectors,
 
     for (const size_t& cluster_id : cluster_order) {
         const auto& cluster_score = summary_scores[cluster_id];
-        if (heap.full() && (cluster_score * heap_factor < heap.peek_score())) {
-            if (first_list) {
-                break;
-            }
+        if (heap.full() &&
+            (cluster_score * heap_factor < heap.peek_score())) {
             continue;
         }
         const auto& docs = cluster_invlist.get_docs(cluster_id);
@@ -83,7 +83,7 @@ void query_single_inverted_list(const SparseVectors* vectors,
             }
             if (i + kPrefetchDist1 < n_docs) {
                 const idx_t next_doc = docs[i + kPrefetchDist1];
-                const idx_t next_start = indptr[next_doc];
+                const offset_t next_start = indptr[next_doc];
                 const size_t next_len = indptr[next_doc + 1] - next_start;
                 detail::prefetch_vector(indices + next_start,
                                         values + next_start, next_len);
@@ -95,7 +95,7 @@ void query_single_inverted_list(const SparseVectors* vectors,
             if (id_selector != nullptr && !id_selector->is_member(doc_id)) {
                 continue;
             }
-            const idx_t start = indptr[doc_id];
+            const offset_t start = indptr[doc_id];
             const size_t len = indptr[doc_id + 1] - start;
             auto score = detail::dot_product_float_dense(
                 indices + start, values + start, len, dense.data());
@@ -109,6 +109,15 @@ SeismicIndex::SeismicIndex(int dim)
     : Index(dim), cluster_parameter_(detail::kDefaultSeismicClusterParams) {}
 SeismicIndex::SeismicIndex(int dim, SeismicClusterParameters parameter)
     : Index(dim), cluster_parameter_(parameter) {}
+
+void SeismicIndex::reserve(size_t num_vectors, size_t total_nnz) {
+    if (vectors_ == nullptr) {
+        vectors_ = std::unique_ptr<SparseVectors>(
+            new SparseVectors({.element_size = kElementSize,
+                               .dimension = static_cast<size_t>(dimension_)}));
+    }
+    vectors_->reserve(num_vectors, total_nnz);
+}
 
 void SeismicIndex::add(idx_t n, const idx_t* indptr, const term_t* indices,
                        const float* values) {
@@ -133,6 +142,42 @@ void SeismicIndex::build() {
         {.element_size = kElementSize,
          .dimension = static_cast<size_t>(get_dimension())},
         cluster_parameter_));
+}
+
+void SeismicIndex::build_and_save(const char* path) {
+    FileIOWriter writer(const_cast<char*>(path));
+
+    // Write index header (fourcc + dimension)
+    auto id_val = fourcc(name);
+    writer.write(&id_val, sizeof(uint32_t), 1);
+    writer.write(&dimension_, sizeof(int), 1);
+
+    // Write body via IOWriter overload
+    build_and_save(&writer);
+
+    writer.close();
+}
+
+void SeismicIndex::build_and_save(IOWriter* writer) {
+    // Write vectors
+    if (vectors_ == nullptr) {
+        empty_sparse_vectors.serialize(writer);
+    } else {
+        vectors_->serialize(writer);
+    }
+
+    // Stream clusters: build batch-by-batch, serialize each batch immediately
+    detail::build_and_save_inverted_lists_clusters(
+        vectors_.get(),
+        {.element_size = kElementSize,
+         .dimension = static_cast<size_t>(get_dimension())},
+        cluster_parameter_, writer);
+}
+
+void SeismicIndex::release_build_memory() {
+    vectors_.reset();
+    clustered_inverted_lists.clear();
+    clustered_inverted_lists.shrink_to_fit();
 }
 
 auto SeismicIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
@@ -179,7 +224,7 @@ auto SeismicIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
 #pragma omp parallel for
     for (idx_t query_idx = 0; query_idx < n; ++query_idx) {
         const auto& dense = query_vectors.get_dense_vector_float(query_idx);
-        const idx_t start = query_indptr[query_idx];
+        const offset_t start = query_indptr[query_idx];
         const size_t len = query_indptr[query_idx + 1] - start;
         const auto& cuts = detail::top_k_tokens(
             query_indices + start, query_values + start, len, parameters->cut);
@@ -213,7 +258,7 @@ auto SeismicIndex::single_query(const std::vector<float>& dense,
     absl::flat_hash_set<idx_t> visited;
     visited.reserve(cuts.size() * 5000);
     detail::TopKHolder<idx_t> holder(k);
-    bool first_list = true;
+    bool first_list = false;
     for (const auto& term : cuts) {
         if (term >= clustered_inverted_lists.size()) [[unlikely]] {
             continue;

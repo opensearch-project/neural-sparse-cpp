@@ -49,3 +49,13 @@ third_party/
 
 # build
 build/
+
+# out-of-source build directories (build/ already covered above)
+build-*/
+build_*/
+__pycache__/
+
+# SWIG SIMD variants are generated from swignsparse.swig at build time (configure_file COPYONLY)
+nsparse/python/swignsparse_avx2.swig
+nsparse/python/swignsparse_avx512.swig
+nsparse/python/swignsparse_sve.swig

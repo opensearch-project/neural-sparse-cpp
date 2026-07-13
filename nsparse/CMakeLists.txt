@@ -17,6 +17,7 @@ set(NSPARSE_SRC
     cluster/random_kmeans.cpp
     cluster/kmeans_utils.cpp
     cluster/inverted_list_clusters.cpp
+    seismic_common.cpp
     invlists/inverted_lists.cpp
     io/buffered_io.cpp
     io/file_io.cpp

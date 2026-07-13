@@ -10,9 +10,13 @@
 #ifndef SEISMIC_COMMON_H
 #define SEISMIC_COMMON_H
 
+#include <atomic>
+#include <cstdio>
 #include <memory>
 #include <numeric>
 #include <vector>
+
+#include <omp.h>
 
 #include "nsparse/cluster/inverted_list_clusters.h"
 #include "nsparse/cluster/random_kmeans.h"
@@ -27,6 +31,16 @@ struct SeismicClusterParameters {
     int lambda;
     int beta;
     float alpha;
+    // Memory budget (bytes) used to size the inverted-list build batches.
+    // 0 means "auto-detect" (see detail::resolve_build_mem_budget): on Linux
+    // this reads MemAvailable from /proc/meminfo; on platforms without that
+    // interface it falls back to a fixed default. Set explicitly (e.g. from
+    // the native-engine index description, "mem_budget=<bytes>") to control
+    // build-phase peak RSS deterministically.
+    size_t mem_budget_bytes = 0;
+    // When true, emit per-batch progress diagnostics to stderr during the
+    // inverted-list build. Off by default to keep production logs quiet.
+    bool verbose = false;
 };
 
 namespace detail {
@@ -38,8 +52,64 @@ constexpr float kDefaultBetaRatio = 0.1F;
 constexpr int kDefaultBeta = -1;
 constexpr float kDefaultAlpha = 0.4F;
 
+// Reserve headroom for clustering temporaries and the OS when auto-detecting.
+constexpr size_t kBuildMemReserveBytes = 4ULL * 1024 * 1024 * 1024;  // 4 GB
+// Fixed fallback when the available memory cannot be detected (non-Linux) and
+// no explicit budget was supplied.
+constexpr size_t kBuildMemFallbackBytes = 16ULL * 1024 * 1024 * 1024;  // 16 GB
+
 constexpr SeismicClusterParameters kDefaultSeismicClusterParams = {
     .lambda = kDefaultLambda, .beta = kDefaultBeta, .alpha = kDefaultAlpha};
+
+/**
+ * @brief Query the OS for currently-available physical memory, in bytes.
+ * @return available bytes, or 0 if the platform provides no supported
+ *         mechanism (e.g. non-Linux).
+ */
+inline size_t query_available_memory_bytes() {
+#ifdef __linux__
+    FILE* meminfo = fopen("/proc/meminfo", "r");
+    if (meminfo == nullptr) {
+        return 0;
+    }
+    size_t available = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), meminfo)) {
+        size_t kb = 0;
+        if (sscanf(line, "MemAvailable: %zu kB", &kb) == 1) {
+            available = kb * 1024;
+            break;
+        }
+    }
+    fclose(meminfo);
+    return available;
+#else
+    return 0;
+#endif
+}
+
+/**
+ * @brief Resolve the memory budget for build batching.
+ *
+ * Priority:
+ *   1. If @p requested_budget_bytes > 0, use it verbatim (caller override).
+ *   2. Otherwise auto-detect available memory and subtract a reserve.
+ *   3. If auto-detect is unavailable (returns 0) or too small, use a fixed
+ *      documented fallback so behavior is well-defined on every platform.
+ *
+ * @param requested_budget_bytes explicit budget (0 = auto)
+ * @return a positive budget in bytes, never 0.
+ */
+inline size_t resolve_build_mem_budget(size_t requested_budget_bytes) {
+    if (requested_budget_bytes > 0) {
+        return requested_budget_bytes;
+    }
+    size_t available = query_available_memory_bytes();
+    if (available > kBuildMemReserveBytes) {
+        return available - kBuildMemReserveBytes;
+    }
+    return kBuildMemFallbackBytes;
+}
 
 inline std::vector<float> calculate_summary_scores(
     const size_t element_size, const SparseVectors* summaries,
@@ -58,10 +128,10 @@ inline std::vector<float> calculate_summary_scores(
     return summary_scores;
 }
 
-inline float compute_similarity(idx_t doc_id, const idx_t* indptr,
+inline float compute_similarity(idx_t doc_id, const offset_t* indptr,
                                 const term_t* indices, const uint8_t* values,
                                 const uint8_t* dense, size_t element_size) {
-    const idx_t start = indptr[doc_id];
+    const offset_t start = indptr[doc_id];
     const size_t len = indptr[doc_id + 1] - start;
     float score = 0.0F;
     if (element_size == U32) {
@@ -126,32 +196,24 @@ inline int calculate_beta(int beta, int lambda) {
     return beta;
 }
 
-inline std::vector<InvertedListClusters> build_inverted_lists_clusters(
+/**
+ * @brief Build clustered inverted lists for all dimensions, in memory.
+ *
+ * Definition lives in seismic_common.cpp.
+ */
+std::vector<InvertedListClusters> build_inverted_lists_clusters(
     const SparseVectors* vectors, const SparseVectorsConfig& config,
-    const SeismicClusterParameters& seismic_cluster_params) {
-    // build inverted index
-    std::unique_ptr<ArrayInvertedLists> inverted_lists =
-        ArrayInvertedLists::build_inverted_lists(config.dimension,
-                                                 config.element_size, vectors);
-    int lambda =
-        calculate_lambda(seismic_cluster_params.lambda, vectors->num_vectors());
-    int beta = calculate_beta(seismic_cluster_params.beta, lambda);
-    size_t inverted_lists_size = inverted_lists->size();
-    std::vector<InvertedListClusters> clustered_inverted_lists(
-        inverted_lists_size);
-#pragma omp parallel for schedule(dynamic, 64)
-    for (int64_t idx = 0; idx < static_cast<int64_t>(inverted_lists_size);
-         ++idx) {
-        auto& invlist = (*inverted_lists)[idx];
-        const auto& doc_ids = invlist.prune_and_keep_doc_ids(lambda);
-        InvertedListClusters inverted_list_clusters(
-            detail::RandomKMeans::train(vectors, doc_ids, beta));
-        inverted_list_clusters.summarize(vectors, seismic_cluster_params.alpha);
-        clustered_inverted_lists[idx] = std::move(inverted_list_clusters);
-        invlist.clear();
-    }
-    return clustered_inverted_lists;
-}
+    const SeismicClusterParameters& seismic_cluster_params);
+
+// Streaming variant: builds inverted list clusters batch-by-batch and serializes
+// each batch's clusters immediately to the IOWriter, freeing memory after each
+// batch. This avoids accumulating all 65K InvertedListClusters in RAM.
+//
+// Definition lives in seismic_common.cpp.
+void build_and_save_inverted_lists_clusters(
+    const SparseVectors* vectors, const SparseVectorsConfig& config,
+    const SeismicClusterParameters& seismic_cluster_params,
+    IOWriter* io_writer);
 
 }  // namespace detail
 }  // namespace nsparse

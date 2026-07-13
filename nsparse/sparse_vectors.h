@@ -27,7 +27,7 @@ struct SparseVectorsConfig {
 };
 
 struct SparseVectorsData {
-    const idx_t* indptr_data;
+    const offset_t* indptr_data;
     const term_t* indices_data;
     const float* values_data;
 };
@@ -44,6 +44,8 @@ public:
     // move constructor
     SparseVectors(SparseVectors&& other) noexcept = default;
     SparseVectors& operator=(SparseVectors&& other) noexcept = default;
+
+    void reserve(size_t num_vectors, size_t total_nnz);
 
     void add_vectors(const std::vector<idx_t>& indptr,
                      const std::vector<term_t>& indices,
@@ -65,7 +67,7 @@ public:
 
     std::vector<float> get_dense_vector_float(idx_t vector_idx) const;
     std::vector<uint8_t> get_dense_vector(idx_t vector_idx) const;
-    const idx_t* indptr_data() const { return indptr_.data(); }
+    const offset_t* indptr_data() const { return indptr_.data(); }
     const term_t* indices_data() const { return indices_.data(); }
     const float* values_data_float() const {
         return reinterpret_cast<const float*>(values_.data());
@@ -88,7 +90,7 @@ public:
     void deserialize(IOReader* reader) override;
 
 private:
-    std::vector<idx_t> indptr_;
+    std::vector<offset_t> indptr_;
     std::vector<term_t> indices_;
     std::vector<uint8_t> values_;
     SparseVectorsConfig config_;

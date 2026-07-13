@@ -162,15 +162,15 @@ std::unique_ptr<ArrayInvertedLists> ArrayInvertedLists::build_inverted_lists(
         std::make_unique<ArrayInvertedLists>(n_term, element_size);
     size_t n_docs = vectors->num_vectors();
 
-    const auto& indptr_data = vectors->indptr_data();
-    const auto& indices_data = vectors->indices_data();
-    const auto& values_data = vectors->values_data();
+    const auto* indptr_data = vectors->indptr_data();
+    const auto* indices_data = vectors->indices_data();
+    const auto* values_data = vectors->values_data();
 
     // inverted_lists.add_entry is thread safe
     for (size_t i = 0; i < n_docs; ++i) {
-        int start = indptr_data[i];
-        int n_tokens = indptr_data[i + 1] - indptr_data[i];
-        for (size_t j = start; j < start + n_tokens; ++j) {
+        offset_t start = indptr_data[i];
+        offset_t n_tokens = indptr_data[i + 1] - indptr_data[i];
+        for (offset_t j = start; j < start + n_tokens; ++j) {
             term_t term_id = indices_data[j];
             inverted_lists->add_entry(term_id, i,
                                       values_data + j * element_size);

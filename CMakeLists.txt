@@ -29,6 +29,10 @@ if(NSPARSE_ENABLE_PYTHON)
     add_subdirectory(nsparse/python)
 endif()
 
+# Note: JNI bindings for the OpenSearch neural-search plugin live in that
+# repository (it compiles jni/nsparse_jni.cpp against this library). This
+# repo stays a pure C++ sparse-index library.
+
 # CTest must be included in the top level to enable `make test` target.
 include(CTest)
 
