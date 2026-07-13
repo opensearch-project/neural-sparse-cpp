@@ -21,6 +21,16 @@
 namespace nsparse {
 namespace {
 
+/**
+ * @brief Generate summary sparse vector for posting lists
+ *
+ * @param vectors inverted index
+ * @param group_of_doc_ids a list of posting list
+ * @param offsets prefix-sum boundaries delimiting each posting list within
+ *                group_of_doc_ids
+ * @param alpha prune ratio
+ * @return SparseVectors
+ */
 template <class T>
 SparseVectors summarize_(const SparseVectors* vectors,
                          const std::vector<idx_t>& group_of_doc_ids,
