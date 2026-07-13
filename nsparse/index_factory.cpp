@@ -107,10 +107,12 @@ Index* index_factory(int dimension, const char* description) {
         int beta = std::stoi(get_param("beta", "-1"));
         float alpha = std::stof(get_param("alpha", "0.4"));
         size_t mem_budget = std::stoull(get_param("mem_budget", "0"));
+        bool verbose = std::stoi(get_param("verbose", "0")) != 0;
         return new SeismicIndex(dimension, {.lambda = lambda,
                                             .beta = beta,
                                             .alpha = alpha,
-                                            .mem_budget_bytes = mem_budget});
+                                            .mem_budget_bytes = mem_budget,
+                                            .verbose = verbose});
     }
 
     if (index_type == "seismic_sq") {
@@ -125,11 +127,13 @@ Index* index_factory(int dimension, const char* description) {
         int beta = std::stoi(get_param("beta", "-1"));
         float alpha = std::stof(get_param("alpha", "0.4"));
         size_t mem_budget = std::stoull(get_param("mem_budget", "0"));
+        bool verbose = std::stoi(get_param("verbose", "0")) != 0;
         return new SeismicScalarQuantizedIndex(quantizer_type, vmin, vmax,
                                                {.lambda = lambda,
                                                 .beta = beta,
                                                 .alpha = alpha,
-                                                .mem_budget_bytes = mem_budget},
+                                                .mem_budget_bytes = mem_budget,
+                                                .verbose = verbose},
                                                dimension);
     }
 
