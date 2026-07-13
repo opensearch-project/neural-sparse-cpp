@@ -60,6 +60,8 @@ std::string trim(const std::string& str) {
 //   "brutal" - creates BrutalIndex with given dimension
 //   "seismic,lambda=10|beta=5|alpha=0.5" - creates SeismicIndex
 //   "seismic_sq,quantizer=8bit|vmin=0.0|vmax=1.0|lambda=10|beta=5|alpha=0.5"
+// Optional "mem_budget=<bytes>" (seismic / seismic_sq) sets the build-batch
+// memory budget; 0 or absent = auto-detect (Linux) with a fixed fallback.
 Index* index_factory(int dimension, const char* description) {
     if (description == nullptr || std::strlen(description) == 0) {
         throw std::invalid_argument("Description cannot be null or empty");
@@ -104,9 +106,11 @@ Index* index_factory(int dimension, const char* description) {
         int lambda = std::stoi(get_param("lambda", "-1"));
         int beta = std::stoi(get_param("beta", "-1"));
         float alpha = std::stof(get_param("alpha", "0.4"));
+        size_t mem_budget = std::stoull(get_param("mem_budget", "0"));
         return new SeismicIndex(dimension, {.lambda = lambda,
                                             .beta = beta,
-                                            .alpha = alpha});
+                                            .alpha = alpha,
+                                            .mem_budget_bytes = mem_budget});
     }
 
     if (index_type == "seismic_sq") {
@@ -120,10 +124,12 @@ Index* index_factory(int dimension, const char* description) {
         int lambda = std::stoi(get_param("lambda", "-1"));
         int beta = std::stoi(get_param("beta", "-1"));
         float alpha = std::stof(get_param("alpha", "0.4"));
+        size_t mem_budget = std::stoull(get_param("mem_budget", "0"));
         return new SeismicScalarQuantizedIndex(quantizer_type, vmin, vmax,
                                                {.lambda = lambda,
                                                 .beta = beta,
-                                                .alpha = alpha},
+                                                .alpha = alpha,
+                                                .mem_budget_bytes = mem_budget},
                                                dimension);
     }
 

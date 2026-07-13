@@ -313,5 +313,43 @@ TEST(BuildInvertedListsClusters, dimension_65536_no_overflow) {
         << "Expected non-empty inverted lists for high term IDs";
 }
 
+
+// ---- resolve_build_mem_budget tests ----
+
+TEST(ResolveBuildMemBudget, explicit_budget_used_verbatim) {
+    // A caller-supplied budget must be honored exactly, regardless of platform
+    // or available memory.
+    const size_t requested = 3ULL * 1024 * 1024 * 1024;  // 3 GB
+    EXPECT_EQ(resolve_build_mem_budget(requested), requested);
+}
+
+TEST(ResolveBuildMemBudget, explicit_small_budget_survives) {
+    // Small explicit budgets are returned verbatim (not clamped to the
+    // fallback), so behavior is deterministic on non-Linux platforms too.
+    const size_t tiny = 123456;
+    EXPECT_EQ(resolve_build_mem_budget(tiny), tiny);
+}
+
+TEST(ResolveBuildMemBudget, auto_detect_is_nonzero) {
+    // With 0 (auto), the result must always be a usable, non-zero budget:
+    //  - Linux: detected MemAvailable minus reserve (or fallback if tiny)
+    //  - non-Linux: the fixed fallback
+    // It must never be 0 (which would divide-by-zero in batch sizing).
+    EXPECT_GT(resolve_build_mem_budget(0), 0u);
+}
+
+TEST(ResolveBuildMemBudget, auto_detect_matches_query_or_fallback) {
+    // The auto path is a pure function of query_available_memory_bytes():
+    //   available > reserve -> available - reserve
+    //   otherwise           -> fixed fallback
+    const size_t available = query_available_memory_bytes();
+    const size_t budget = resolve_build_mem_budget(0);
+    if (available > kBuildMemReserveBytes) {
+        EXPECT_EQ(budget, available - kBuildMemReserveBytes);
+    } else {
+        EXPECT_EQ(budget, kBuildMemFallbackBytes);
+    }
+}
+
 }  // namespace detail
 }  // namespace nsparse

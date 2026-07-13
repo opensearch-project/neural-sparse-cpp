@@ -31,6 +31,13 @@ struct SeismicClusterParameters {
     int lambda;
     int beta;
     float alpha;
+    // Memory budget (bytes) used to size the inverted-list build batches.
+    // 0 means "auto-detect" (see detail::resolve_build_mem_budget): on Linux
+    // this reads MemAvailable from /proc/meminfo; on platforms without that
+    // interface it falls back to a fixed default. Set explicitly (e.g. from
+    // the native-engine index description, "mem_budget=<bytes>") to control
+    // build-phase peak RSS deterministically.
+    size_t mem_budget_bytes = 0;
 };
 
 namespace detail {
@@ -42,8 +49,64 @@ constexpr float kDefaultBetaRatio = 0.1F;
 constexpr int kDefaultBeta = -1;
 constexpr float kDefaultAlpha = 0.4F;
 
+// Reserve headroom for clustering temporaries and the OS when auto-detecting.
+constexpr size_t kBuildMemReserveBytes = 4ULL * 1024 * 1024 * 1024;  // 4 GB
+// Fixed fallback when the available memory cannot be detected (non-Linux) and
+// no explicit budget was supplied.
+constexpr size_t kBuildMemFallbackBytes = 16ULL * 1024 * 1024 * 1024;  // 16 GB
+
 constexpr SeismicClusterParameters kDefaultSeismicClusterParams = {
     .lambda = kDefaultLambda, .beta = kDefaultBeta, .alpha = kDefaultAlpha};
+
+/**
+ * @brief Query the OS for currently-available physical memory, in bytes.
+ * @return available bytes, or 0 if the platform provides no supported
+ *         mechanism (e.g. non-Linux).
+ */
+inline size_t query_available_memory_bytes() {
+#ifdef __linux__
+    FILE* meminfo = fopen("/proc/meminfo", "r");
+    if (meminfo == nullptr) {
+        return 0;
+    }
+    size_t available = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), meminfo)) {
+        size_t kb = 0;
+        if (sscanf(line, "MemAvailable: %zu kB", &kb) == 1) {
+            available = kb * 1024;
+            break;
+        }
+    }
+    fclose(meminfo);
+    return available;
+#else
+    return 0;
+#endif
+}
+
+/**
+ * @brief Resolve the memory budget for build batching.
+ *
+ * Priority:
+ *   1. If @p requested_budget_bytes > 0, use it verbatim (caller override).
+ *   2. Otherwise auto-detect available memory and subtract a reserve.
+ *   3. If auto-detect is unavailable (returns 0) or too small, use a fixed
+ *      documented fallback so behavior is well-defined on every platform.
+ *
+ * @param requested_budget_bytes explicit budget (0 = auto)
+ * @return a positive budget in bytes, never 0.
+ */
+inline size_t resolve_build_mem_budget(size_t requested_budget_bytes) {
+    if (requested_budget_bytes > 0) {
+        return requested_budget_bytes;
+    }
+    size_t available = query_available_memory_bytes();
+    if (available > kBuildMemReserveBytes) {
+        return available - kBuildMemReserveBytes;
+    }
+    return kBuildMemFallbackBytes;
+}
 
 inline std::vector<float> calculate_summary_scores(
     const size_t element_size, const SparseVectors* summaries,
@@ -150,30 +213,11 @@ inline std::vector<InvertedListClusters> build_inverted_lists_clusters(
     const size_t invlist_bytes_full =
         total_nnz * (sizeof(idx_t) + element_size);
 
-    // Choose batch count to fit inverted lists within available memory.
-    // Reserve 4 GB for clustering overhead and OS.
-    constexpr size_t kReserve = 4ULL * 1024 * 1024 * 1024;
-    size_t mem_budget = 0;
-#ifdef __linux__
-    // Use MemAvailable from /proc/meminfo
-    FILE* meminfo = fopen("/proc/meminfo", "r");
-    if (meminfo) {
-        char line[256];
-        while (fgets(line, sizeof(line), meminfo)) {
-            size_t kb = 0;
-            if (sscanf(line, "MemAvailable: %zu kB", &kb) == 1) {
-                mem_budget = kb * 1024;
-                break;
-            }
-        }
-        fclose(meminfo);
-    }
-#endif
-    if (mem_budget > kReserve) {
-        mem_budget -= kReserve;
-    } else {
-        mem_budget = 16ULL * 1024 * 1024 * 1024;  // fallback: 16 GB
-    }
+    // Choose batch count to fit inverted lists within the memory budget.
+    // Honors an explicit budget from cluster params; otherwise auto-detects
+    // (Linux) with a documented fixed fallback on other platforms.
+    const size_t mem_budget =
+        resolve_build_mem_budget(seismic_cluster_params.mem_budget_bytes);
 
     size_t n_batches = (invlist_bytes_full + mem_budget - 1) / mem_budget;
     if (n_batches < 1) n_batches = 1;
@@ -272,9 +316,17 @@ inline void build_and_save_inverted_lists_clusters(
     // Cap per-batch inverted list memory to keep peak RSS under physical RAM.
     // The CSR (~46 GB for float32 at 46M docs) remains throughout; each batch
     // adds inverted lists + k-means temporaries (~2x the raw invlist allocation).
-    constexpr size_t kMaxBatchBytes = 8ULL * 1024 * 1024 * 1024;  // 8 GB
-    size_t mem_budget = std::min(kMaxBatchBytes, invlist_bytes_full / 3);
+    // An explicit budget from cluster params wins; otherwise cap at 8 GB (or a
+    // third of the full invlist size, whichever is smaller).
+    size_t mem_budget;
+    if (seismic_cluster_params.mem_budget_bytes > 0) {
+        mem_budget = seismic_cluster_params.mem_budget_bytes;
+    } else {
+        constexpr size_t kMaxBatchBytes = 8ULL * 1024 * 1024 * 1024;  // 8 GB
+        mem_budget = std::min(kMaxBatchBytes, invlist_bytes_full / 3);
+    }
     if (mem_budget == 0) mem_budget = invlist_bytes_full;
+    if (mem_budget == 0) mem_budget = 1;  // guard: empty index
 
     size_t n_batches = (invlist_bytes_full + mem_budget - 1) / mem_budget;
     if (n_batches < 1) n_batches = 1;
