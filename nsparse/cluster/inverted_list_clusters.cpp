@@ -125,6 +125,11 @@ InvertedListClusters::InvertedListClusters(const InvertedListClusters& other) {
     } else {
         summaries_.reset();
     }
+    transpose_built_ = other.transpose_built_;
+    term_ids_ = other.term_ids_;
+    term_ptr_ = other.term_ptr_;
+    csc_cluster_ = other.csc_cluster_;
+    csc_value_ = other.csc_value_;
 }
 InvertedListClusters& InvertedListClusters::operator=(
     const InvertedListClusters& other) {
@@ -136,6 +141,11 @@ InvertedListClusters& InvertedListClusters::operator=(
         } else {
             summaries_.reset();
         }
+        transpose_built_ = other.transpose_built_;
+        term_ids_ = other.term_ids_;
+        term_ptr_ = other.term_ptr_;
+        csc_cluster_ = other.csc_cluster_;
+        csc_value_ = other.csc_value_;
     }
     return *this;
 }
@@ -161,6 +171,10 @@ void InvertedListClusters::summarize(const SparseVectors* vectors,
         summaries_ = std::make_unique<SparseVectors>(
             std::move(summarize_<uint8_t>(vectors, docs_, offsets_, alpha)));
     }
+    // Rebuild the term-major transpose from the freshly-computed summaries so
+    // the build() path (not just deserialize()) has it available at query time.
+    transpose_built_ = false;
+    build_transpose();
 }
 
 void InvertedListClusters::serialize(IOWriter* writer) const {
