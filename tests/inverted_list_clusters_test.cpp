@@ -16,6 +16,7 @@
 #include "nsparse/io/buffered_io.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
+#include "nsparse/utils/distance.h"
 
 namespace {
 
@@ -378,4 +379,68 @@ TEST(InvertedListClusters, move_assignment) {
     ASSERT_EQ(doc_span.size(), 2);
     ASSERT_EQ(doc_span[0], 2);
     ASSERT_EQ(doc_span[1], 3);
+}
+
+// Verifies that the query-driven transposed summary scorer
+// (score_summaries_transposed, CSC) produces exactly the same per-cluster
+// scores as the reference dense-gather over the CSR summaries. This is the
+// data-consistency check between the CSR and CSC representations.
+TEST(InvertedListClusters, transposed_scoring_matches_dense_gather) {
+    // Two clusters with overlapping and distinct summary terms.
+    std::vector<std::vector<nsparse::idx_t>> docs = {{0, 1}, {2}};
+    nsparse::InvertedListClusters clusters(docs);
+    auto vectors = create_float_vectors(
+        {{0, 3}, {1, 3}, {2, 5}}, {{1.0F, 2.0F}, {4.0F, 1.0F}, {3.0F, 2.0F}},
+        /*dimension=*/10);
+    clusters.summarize(&vectors, 1.0F);
+    clusters.build_transpose();
+
+    const size_t n_clusters = clusters.cluster_size();
+    ASSERT_EQ(n_clusters, 2U);
+
+    // Reference: dense-gather each summary against a dense query vector.
+    const auto& summaries = clusters.summaries();
+    const size_t dim = 10;
+    auto reference_scores = [&](const std::vector<nsparse::term_t>& q_idx,
+                                const std::vector<float>& q_val) {
+        std::vector<float> dense(dim, 0.0F);
+        for (size_t i = 0; i < q_idx.size(); ++i) dense[q_idx[i]] = q_val[i];
+        return nsparse::detail::dot_product_float_vectors_dense(&summaries,
+                                                                dense.data());
+    };
+
+    // Query terms exercising: a shared term (3), a term unique to one summary
+    // (0), a term absent from all summaries (7), and an out-of-range term id
+    // (9999 > dim) that must be safely ignored.
+    std::vector<std::vector<nsparse::term_t>> queries = {
+        {3}, {0, 5}, {0, 3, 5}, {7}, {9999}, {3, 7, 9999}};
+    std::vector<std::vector<float>> query_values = {
+        {2.0F}, {1.5F, 0.5F}, {1.0F, 1.0F, 1.0F},
+        {3.0F}, {2.0F},       {2.0F, 1.0F, 1.0F}};
+
+    for (size_t q = 0; q < queries.size(); ++q) {
+        std::vector<float> expected;
+        // Reference cannot index an out-of-range dim, so score it only over
+        // in-range terms; the transposed path must match that (it ignores the
+        // out-of-range term the same way).
+        std::vector<nsparse::term_t> in_range_idx;
+        std::vector<float> in_range_val;
+        for (size_t i = 0; i < queries[q].size(); ++i) {
+            if (queries[q][i] < dim) {
+                in_range_idx.push_back(queries[q][i]);
+                in_range_val.push_back(query_values[q][i]);
+            }
+        }
+        expected = reference_scores(in_range_idx, in_range_val);
+
+        std::vector<float> got;
+        clusters.score_summaries_transposed(
+            queries[q].data(), query_values[q].data(), queries[q].size(), got);
+
+        ASSERT_EQ(got.size(), expected.size());
+        for (size_t c = 0; c < got.size(); ++c) {
+            ASSERT_FLOAT_EQ(got[c], expected[c])
+                << "query " << q << ", cluster " << c;
+        }
+    }
 }

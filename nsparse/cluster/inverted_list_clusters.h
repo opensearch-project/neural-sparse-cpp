@@ -53,9 +53,8 @@ public:
     // each query term (t, qv), add qv*value to scores[cluster_id]. Avoids the
     // dense-buffer gather entirely.
     void build_transpose() const;
-    bool has_transpose() const { return transpose_built_; }
-    // term -> [start,end) into csc_cluster_/csc_value_ (size = dimension+1 via
-    // map)
+    // Accumulate per-cluster summary scores for a query into `out` (sized to
+    // the cluster count) using the transpose built by build_transpose().
     void score_summaries_transposed(const term_t* q_idx, const float* q_val,
                                     size_t q_len,
                                     std::vector<float>& out) const;
@@ -65,14 +64,16 @@ private:
     std::vector<idx_t> offsets_;
     std::unique_ptr<SparseVectors> summaries_;
 
-    // Transposed (term-major) summary storage, built lazily.
+    // Transposed (term-major) summary storage, built lazily. A query term is
+    // located by binary-searching term_ids_ (the distinct summary terms, in
+    // ascending order); no dimension-sized lookup table is retained, so the
+    // per-list footprint is proportional to the summaries' nnz, not to the
+    // vocabulary dimension.
     mutable bool transpose_built_ = false;
-    mutable std::vector<idx_t>
-        term_ptr_;  // per-term offset into csc arrays (sorted terms)
-    mutable std::vector<term_t>
-        term_ids_;  // distinct terms present (ascending)
-    mutable std::vector<int32_t>
-        term_lookup_;  // dim -> index into term_ids_ (+1), 0 = absent
+    // Distinct terms present across all summaries, ascending. term_ids_[i] owns
+    // csc entries [term_ptr_[i], term_ptr_[i + 1]).
+    mutable std::vector<term_t> term_ids_;
+    mutable std::vector<idx_t> term_ptr_;
     mutable std::vector<int32_t> csc_cluster_;  // cluster id per entry
     mutable std::vector<float> csc_value_;      // summary value per entry
 };
