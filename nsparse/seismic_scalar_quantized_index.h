@@ -65,7 +65,8 @@ private:
         -> pair_of_score_id_vectors_t override;
     auto encode(const float* values, size_t nnz,
                 SearchParameters* search_parameters) -> std::vector<uint8_t>;
-    auto single_query(const std::vector<uint8_t>& dense,
+    auto single_query(const std::vector<uint8_t>& dense, const term_t* q_idx,
+                      const uint8_t* q_val_bytes, size_t q_len,
                       const std::vector<term_t>& cuts, int k, float heap_factor,
                       const ScalarQuantizer& query_sq,
                       SearchParameters* search_parameters)

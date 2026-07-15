@@ -53,9 +53,10 @@ void query_single_inverted_list(
                                         ? nullptr
                                         : search_parameters->get_id_selector();
     // Query-driven summary scoring via the term-major transpose, avoiding the
-    // per-summary gather into the dimension-sized dense buffer.
-    cluster_invlist.score_summaries_transposed(q_idx, q_val, q_len,
-                                               score_scratch);
+    // per-summary gather into the dimension-sized dense buffer. The summaries
+    // hold float values, so the query values are passed as their raw bytes.
+    cluster_invlist.score_summaries_transposed(
+        q_idx, reinterpret_cast<const uint8_t*>(q_val), q_len, score_scratch);
     const std::vector<float>& summary_scores = score_scratch;
     size_t num_vectors = vectors->num_vectors();
 

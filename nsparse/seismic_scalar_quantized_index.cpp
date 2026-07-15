@@ -40,6 +40,8 @@ namespace {
 void query_single_inverted_list(const SparseVectors* vectors,
                                 const InvertedListClusters& cluster_invlist,
                                 const std::vector<uint8_t>& dense,
+                                const term_t* q_idx, const uint8_t* q_val_bytes,
+                                size_t q_len, std::vector<float>& score_scratch,
                                 float heap_factor, bool first_list,
                                 const SearchParameters* search_parameters,
                                 detail::TopKHolder<idx_t>& heap,
@@ -53,10 +55,11 @@ void query_single_inverted_list(const SparseVectors* vectors,
                                         ? nullptr
                                         : search_parameters->get_id_selector();
     const auto element_size = vectors->get_element_size();
-    const auto& summaries = cluster_invlist.summaries();
-    // compute dp with all summaries
-    std::vector<float> summary_scores =
-        detail::calculate_summary_scores(element_size, &summaries, dense);
+    // Query-driven summary scoring via the term-major transpose. The query
+    // values are the quantized codes in the summaries' element width.
+    cluster_invlist.score_summaries_transposed(q_idx, q_val_bytes, q_len,
+                                               score_scratch);
+    const std::vector<float>& summary_scores = score_scratch;
     size_t num_vectors = vectors->num_vectors();
 
     std::vector<size_t> cluster_order =
@@ -251,9 +254,10 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
                                                  parameters->cut);
         }
 
-        auto [distances, labels] =
-            single_query(dense, cuts, k, parameters->heap_factor, query_sq,
-                         search_parameters);
+        const uint8_t* q_val_bytes = query_values + start * element_size;
+        auto [distances, labels] = single_query(
+            dense, query_indices + start, q_val_bytes, len, cuts, k,
+            parameters->heap_factor, query_sq, search_parameters);
         result_distances[query_idx] = std::move(distances);
         result_labels[query_idx] = std::move(labels);
     }
@@ -262,8 +266,9 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
 }
 
 auto SeismicScalarQuantizedIndex::single_query(
-    const std::vector<uint8_t>& dense, const std::vector<term_t>& cuts, int k,
-    float heap_factor, const ScalarQuantizer& query_sq,
+    const std::vector<uint8_t>& dense, const term_t* q_idx,
+    const uint8_t* q_val_bytes, size_t q_len, const std::vector<term_t>& cuts,
+    int k, float heap_factor, const ScalarQuantizer& query_sq,
     SearchParameters* search_parameters) -> pair_of_score_id_vector_t {
     size_t num_docs = vectors_->num_vectors();
     if (num_docs == 0) {
@@ -272,6 +277,7 @@ auto SeismicScalarQuantizedIndex::single_query(
     absl::flat_hash_set<idx_t> visited;
     visited.reserve(cuts.size() * 5000);
     detail::TopKHolder<idx_t> holder(k);
+    std::vector<float> score_scratch;
     bool first_list = true;
     for (const auto& term : cuts) {
         if (term >= clustered_inverted_lists.size()) [[unlikely]] {
@@ -279,6 +285,7 @@ auto SeismicScalarQuantizedIndex::single_query(
         }
         const auto& cluster_invlist = clustered_inverted_lists[term];
         query_single_inverted_list(vectors_.get(), cluster_invlist, dense,
+                                   q_idx, q_val_bytes, q_len, score_scratch,
                                    heap_factor, first_list, search_parameters,
                                    holder, visited);
         first_list = false;
