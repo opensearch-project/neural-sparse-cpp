@@ -200,6 +200,71 @@ void InvertedListClusters::deserialize(IOReader* reader) {
     if (summaries_->num_vectors() == 0) {
         summaries_.reset();
     }
+    build_transpose();
+}
+
+void InvertedListClusters::build_transpose() const {
+    if (transpose_built_) return;
+    transpose_built_ = true;
+    if (summaries_ == nullptr || summaries_->num_vectors() == 0) return;
+    const size_t n_clusters = summaries_->num_vectors();
+    const auto* indptr = summaries_->indptr_data();
+    const auto* indices = summaries_->indices_data();
+    const auto* values = summaries_->values_data_float();
+    const size_t nnz = static_cast<size_t>(indptr[n_clusters]);
+
+    // Distinct terms present across all summaries, ascending.
+    size_t dim = summaries_->get_dimension();
+    term_lookup_.assign(dim, 0);
+    for (size_t j = 0; j < nnz; ++j) term_lookup_[indices[j]] = 1;
+    term_ids_.clear();
+    for (size_t t = 0; t < dim; ++t) {
+        if (term_lookup_[t]) {
+            term_lookup_[t] = static_cast<int32_t>(term_ids_.size()) + 1;
+            term_ids_.push_back(static_cast<term_t>(t));
+        }
+    }
+    const size_t n_terms = term_ids_.size();
+
+    // Count entries per term, build term_ptr_ (CSC offsets).
+    term_ptr_.assign(n_terms + 1, 0);
+    for (size_t j = 0; j < nnz; ++j) {
+        term_ptr_[term_lookup_[indices[j]]]++;  // note: lookup is +1 based
+    }
+    for (size_t t = 0; t < n_terms; ++t) term_ptr_[t + 1] += term_ptr_[t];
+
+    csc_cluster_.resize(nnz);
+    csc_value_.resize(nnz);
+    std::vector<idx_t> cursor(term_ptr_.begin(), term_ptr_.end() - 1);
+    for (size_t c = 0; c < n_clusters; ++c) {
+        const idx_t s = indptr[c];
+        const idx_t e = indptr[c + 1];
+        for (idx_t j = s; j < e; ++j) {
+            const int32_t ti = term_lookup_[indices[j]] - 1;
+            const idx_t pos = cursor[ti]++;
+            csc_cluster_[pos] = static_cast<int32_t>(c);
+            csc_value_[pos] = values[j];
+        }
+    }
+}
+
+void InvertedListClusters::score_summaries_transposed(
+    const term_t* q_idx, const float* q_val, size_t q_len,
+    std::vector<float>& out) const {
+    const size_t n_clusters = cluster_size();
+    out.assign(n_clusters, 0.0F);
+    if (!transpose_built_ || term_lookup_.empty()) return;
+    for (size_t i = 0; i < q_len; ++i) {
+        const term_t t = q_idx[i];
+        const int32_t li = term_lookup_[t];
+        if (li == 0) continue;  // term absent from all summaries
+        const float qv = q_val[i];
+        const idx_t s = term_ptr_[li - 1];
+        const idx_t e = term_ptr_[li];
+        for (idx_t j = s; j < e; ++j) {
+            out[csc_cluster_[j]] += qv * csc_value_[j];
+        }
+    }
 }
 
 }  // namespace nsparse

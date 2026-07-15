@@ -38,13 +38,12 @@ namespace {
 
 constexpr int kElementSize = U32;
 
-void query_single_inverted_list(const SparseVectors* vectors,
-                                const InvertedListClusters& cluster_invlist,
-                                const std::vector<float>& dense,
-                                const float heap_factor, const bool first_list,
-                                const SearchParameters* search_parameters,
-                                detail::TopKHolder<idx_t>& heap,
-                                absl::flat_hash_set<idx_t>& visited) {
+void query_single_inverted_list(
+    const SparseVectors* vectors, const InvertedListClusters& cluster_invlist,
+    const std::vector<float>& dense, const term_t* q_idx, const float* q_val,
+    size_t q_len, std::vector<float>& score_scratch, const float heap_factor,
+    const bool first_list, const SearchParameters* search_parameters,
+    detail::TopKHolder<idx_t>& heap, absl::flat_hash_set<idx_t>& visited) {
     // Skip empty clusters
     size_t csize = cluster_invlist.cluster_size();
     if (csize == 0) {
@@ -53,10 +52,11 @@ void query_single_inverted_list(const SparseVectors* vectors,
     const IDSelector* id_selector = search_parameters == nullptr
                                         ? nullptr
                                         : search_parameters->get_id_selector();
-    const auto& summaries = cluster_invlist.summaries();
-    // compute dp with all summaries
-    auto summary_scores =
-        detail::dot_product_float_vectors_dense(&summaries, dense.data());
+    // Query-driven summary scoring via the term-major transpose, avoiding the
+    // per-summary gather into the dimension-sized dense buffer.
+    cluster_invlist.score_summaries_transposed(q_idx, q_val, q_len,
+                                               score_scratch);
+    const std::vector<float>& summary_scores = score_scratch;
     size_t num_vectors = vectors->num_vectors();
 
     std::vector<size_t> cluster_order =
@@ -159,20 +159,18 @@ auto SeismicIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
         const IDSelector* sel = search_parameters->get_id_selector();
         // should_run_exact_match ignores its queries arg (only inspects the
         // selector + k), so nullptr is fine here.
-        if (sel != nullptr &&
-            detail::should_run_exact_match(sel, k, nullptr)) {
+        if (sel != nullptr && detail::should_run_exact_match(sel, k, nullptr)) {
             size_t indptr_size = n + 1;
             size_t nnz = indptr[n];
             SparseVectors query_vectors(
                 {.element_size = kElementSize,
                  .dimension = static_cast<size_t>(dimension_)});
-            query_vectors.add_vectors(
-                indptr, indptr_size, indices, nnz,
-                reinterpret_cast<const uint8_t*>(values), nnz * kElementSize);
+            query_vectors.add_vectors(indptr, indptr_size, indices, nnz,
+                                      reinterpret_cast<const uint8_t*>(values),
+                                      nnz * kElementSize);
             return detail::ExactMatcher::search(
-                vectors_.get(),
-                dynamic_cast<const IDSelectorEnumerable*>(sel), &query_vectors,
-                kElementSize, k);
+                vectors_.get(), dynamic_cast<const IDSelectorEnumerable*>(sel),
+                &query_vectors, kElementSize, k);
         }
     }
 
@@ -197,11 +195,11 @@ auto SeismicIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
             const size_t len = indptr[query_idx + 1] - start;
             const term_t* q_indices = indices + start;
             const float* q_values = values + start;
-            const auto& cuts = detail::top_k_tokens(q_indices, q_values, len,
-                                                    parameters->cut);
-            auto [distances, labels] = single_query(
-                dense, visited, q_indices, q_values, len, cuts, k,
-                parameters->heap_factor, search_parameters);
+            const auto& cuts =
+                detail::top_k_tokens(q_indices, q_values, len, parameters->cut);
+            auto [distances, labels] =
+                single_query(dense, visited, q_indices, q_values, len, cuts, k,
+                             parameters->heap_factor, search_parameters);
             result_distances[query_idx] = std::move(distances);
             result_labels[query_idx] = std::move(labels);
         }
@@ -238,6 +236,7 @@ auto SeismicIndex::single_query(std::vector<float>& dense,
     visited.clear();
 
     detail::TopKHolder<idx_t> holder(k);
+    std::vector<float> score_scratch;
     bool first_list = true;
     for (const auto& term : cuts) {
         if (term >= clustered_inverted_lists.size()) [[unlikely]] {
@@ -245,6 +244,7 @@ auto SeismicIndex::single_query(std::vector<float>& dense,
         }
         const auto& cluster_invlist = clustered_inverted_lists[term];
         query_single_inverted_list(vectors_.get(), cluster_invlist, dense,
+                                   q_indices, q_values, q_len, score_scratch,
                                    heap_factor, first_list, search_parameters,
                                    holder, visited);
         first_list = false;
