@@ -10,7 +10,9 @@
 #include "nsparse/cluster/inverted_list_clusters.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -154,6 +156,9 @@ void InvertedListClusters::build_transpose(const SparseVectors& summaries) {
     if (n_clusters_ == 0) {
         return;
     }
+    // cluster_id_t (uint16) must be able to represent every cluster index in
+    // this list; beta keeps this well under 2^16 for any workable config.
+    assert(n_clusters_ <= std::numeric_limits<cluster_id_t>::max() + size_t{1});
 
     const auto* indptr = summaries.indptr_data();
     const auto* indices = summaries.indices_data();
@@ -191,7 +196,7 @@ void InvertedListClusters::build_transpose(const SparseVectors& summaries) {
         for (idx_t j = start; j < end; ++j) {
             const size_t col = term_column(indices[j]);
             const idx_t pos = cursor[col]++;
-            csc_cluster_[pos] = static_cast<int32_t>(cluster);
+            csc_cluster_[pos] = static_cast<cluster_id_t>(cluster);
             std::copy_n(values + static_cast<size_t>(j) * esz, esz,
                         csc_value_.data() + static_cast<size_t>(pos) * esz);
         }
@@ -266,8 +271,8 @@ void InvertedListClusters::serialize(IOWriter* writer) const {
     size_t nnz = csc_cluster_.size();
     writer->write(&nnz, sizeof(size_t), 1);
     if (nnz > 0) {
-        writer->write(const_cast<int32_t*>(csc_cluster_.data()),
-                      sizeof(int32_t), nnz);
+        writer->write(const_cast<cluster_id_t*>(csc_cluster_.data()),
+                      sizeof(cluster_id_t), nnz);
         writer->write(const_cast<uint8_t*>(csc_value_.data()), sizeof(uint8_t),
                       nnz * element_size_);
     }
@@ -301,7 +306,7 @@ void InvertedListClusters::deserialize(IOReader* reader) {
     reader->read(&nnz, sizeof(size_t), 1);
     if (nnz > 0) {
         csc_cluster_.resize(nnz);
-        reader->read(csc_cluster_.data(), sizeof(int32_t), nnz);
+        reader->read(csc_cluster_.data(), sizeof(cluster_id_t), nnz);
         csc_value_.resize(nnz * element_size_);
         reader->read(csc_value_.data(), sizeof(uint8_t), nnz * element_size_);
     }

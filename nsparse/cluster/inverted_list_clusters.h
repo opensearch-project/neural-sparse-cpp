@@ -63,17 +63,25 @@ private:
     std::vector<idx_t> docs_;
     std::vector<idx_t> offsets_;
 
+    // Cluster ids within a posting list are bounded by beta (clusters per
+    // list), a small fraction of lambda (docs kept per list) that stays far
+    // below 2^16 for any workable configuration; the canonical Rust seismic
+    // stores this same field and likewise caps the summary count at 2^16. A
+    // 16-bit cluster id therefore halves this array vs a 32-bit one at no
+    // recall cost (build_transpose asserts the bound holds).
+    using cluster_id_t = uint16_t;
+
     // Term-major transpose of the cluster summaries (replaces a CSR store). For
     // each distinct summary term term_ids_[i], entries
     // [term_ptr_[i], term_ptr_[i + 1]) in csc_cluster_/csc_value_ hold the
     // (cluster id, summary value) pairs for that term. Scoring iterates the
     // query's terms and scatter-adds q_val * summary_value into out[cluster].
     size_t n_clusters_ = 0;
-    size_t element_size_ = U32;         // width of each csc_value_ entry
-    std::vector<term_t> term_ids_;      // distinct summary terms, ascending
-    std::vector<idx_t> term_ptr_;       // CSC offsets, size term_ids_+1
-    std::vector<int32_t> csc_cluster_;  // cluster id per entry
-    std::vector<uint8_t> csc_value_;    // summary value per entry (bytes)
+    size_t element_size_ = U32;              // width of each csc_value_ entry
+    std::vector<term_t> term_ids_;           // distinct summary terms, ascending
+    std::vector<idx_t> term_ptr_;            // CSC offsets, size term_ids_+1
+    std::vector<cluster_id_t> csc_cluster_;  // cluster id per entry
+    std::vector<uint8_t> csc_value_;         // summary value per entry (bytes)
 };
 
 }  // namespace nsparse
