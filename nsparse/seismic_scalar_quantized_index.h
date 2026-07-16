@@ -14,6 +14,7 @@
 #include <memory>
 #include <vector>
 
+#include "absl/container/flat_hash_set.h"
 #include "nsparse/cluster/inverted_list_clusters.h"
 #include "nsparse/index.h"
 #include "nsparse/seismic_index.h"
@@ -65,10 +66,16 @@ private:
         -> pair_of_score_id_vectors_t override;
     auto encode(const float* values, size_t nnz,
                 SearchParameters* search_parameters) -> std::vector<uint8_t>;
-    auto single_query(const std::vector<uint8_t>& dense, const term_t* q_idx,
+    // `dense` and `visited` are per-thread scratch reused across the queries a
+    // thread handles (see search()). `dense` (a dimension-sized quantized-code
+    // buffer, element_size bytes per dim) must be all-zero on entry and is
+    // restored to all-zero on exit via a sparse clear over the query's own dims
+    // (q_idx/q_len); `visited` is cleared on entry.
+    auto single_query(std::vector<uint8_t>& dense,
+                      absl::flat_hash_set<idx_t>& visited, const term_t* q_idx,
                       const uint8_t* q_val_bytes, size_t q_len,
-                      const std::vector<term_t>& cuts, int k, float heap_factor,
-                      const ScalarQuantizer& query_sq,
+                      size_t element_size, const std::vector<term_t>& cuts,
+                      int k, float heap_factor, const ScalarQuantizer& query_sq,
                       SearchParameters* search_parameters)
         -> pair_of_score_id_vector_t;
     ScalarQuantizer sq_;
