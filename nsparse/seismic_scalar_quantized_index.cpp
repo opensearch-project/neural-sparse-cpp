@@ -11,6 +11,7 @@
 
 #include <sys/types.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <typeinfo>
@@ -40,6 +41,8 @@ namespace {
 void query_single_inverted_list(const SparseVectors* vectors,
                                 const InvertedListClusters& cluster_invlist,
                                 const std::vector<uint8_t>& dense,
+                                const term_t* q_idx, const uint8_t* q_val_bytes,
+                                size_t q_len, std::vector<float>& score_scratch,
                                 float heap_factor, bool first_list,
                                 const SearchParameters* search_parameters,
                                 detail::TopKHolder<idx_t>& heap,
@@ -53,10 +56,11 @@ void query_single_inverted_list(const SparseVectors* vectors,
                                         ? nullptr
                                         : search_parameters->get_id_selector();
     const auto element_size = vectors->get_element_size();
-    const auto& summaries = cluster_invlist.summaries();
-    // compute dp with all summaries
-    std::vector<float> summary_scores =
-        detail::calculate_summary_scores(element_size, &summaries, dense);
+    // Query-driven summary scoring via the term-major transpose. The query
+    // values are the quantized codes in the summaries' element width.
+    cluster_invlist.score_summaries_transposed(q_idx, q_val_bytes, q_len,
+                                               score_scratch);
+    const std::vector<float>& summary_scores = score_scratch;
     size_t num_vectors = vectors->num_vectors();
 
     std::vector<size_t> cluster_order =
@@ -197,17 +201,22 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
                                    sq_params->vmax);
     }
 
-    // construct query vector
+    // Quantize the whole query batch once. `codes` holds the quantized values
+    // in the same CSR order as `indices`, so the batch (indptr/indices/codes)
+    // can be indexed directly below — no per-query SparseVectors needed.
     const size_t element_size = sq_.bytes_per_value();
-    SparseVectors query_vectors({.element_size = element_size,
-                                 .dimension = static_cast<size_t>(dimension_)});
     std::vector<uint8_t> codes = encode(values, nnz, search_parameters);
-    query_vectors.add_vectors(indptr, indptr_size, indices, nnz, codes.data(),
-                              nnz * element_size);
+    const uint8_t* query_values = codes.data();
 
-    // if filter ids size is <= k, just run exact match
+    // if filter ids size is <= k, just run exact match. Only this path needs a
+    // SparseVectors view of the query, so build one lazily just for it.
     if (detail::should_run_exact_match(search_parameters->get_id_selector(), k,
-                                       &query_vectors)) {
+                                       nullptr)) {
+        SparseVectors query_vectors(
+            {.element_size = element_size,
+             .dimension = static_cast<size_t>(dimension_)});
+        query_vectors.add_vectors(indptr, indptr_size, indices, nnz,
+                                  codes.data(), nnz * element_size);
         auto [distances, labels] = detail::ExactMatcher::search(
             vectors_.get(),
             dynamic_cast<const IDSelectorEnumerable*>(
@@ -228,50 +237,69 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
     // query
     const auto* parameters =
         dynamic_cast<const SeismicSearchParameters*>(search_parameters);
-    const auto* query_indptr = query_vectors.indptr_data();
-    const auto* query_indices = query_vectors.indices_data();
-    const auto* query_values = query_vectors.values_data();
+    const size_t dense_bytes =
+        static_cast<size_t>(dimension_) * element_size;
 
-#pragma omp parallel for
-    for (idx_t query_idx = 0; query_idx < n; ++query_idx) {
-        const auto& dense = query_vectors.get_dense_vector(query_idx);
-        const idx_t start = query_indptr[query_idx];
-        const size_t len = query_indptr[query_idx + 1] - start;
-        std::vector<term_t> cuts;
-        if (element_size == U16) {
-            // start is element index, need byte offset for uint16_t access
-            cuts = detail::top_k_tokens<uint16_t>(
-                query_indices + start,
-                reinterpret_cast<const uint16_t*>(query_values +
-                                                  start * sizeof(uint16_t)),
-                len, parameters->cut);
-        } else {
-            cuts = detail::top_k_tokens<uint8_t>(query_indices + start,
-                                                 query_values + start, len,
-                                                 parameters->cut);
+    // Per-thread scratch reused across all queries a thread handles: a
+    // dimension-sized quantized-code dense buffer (kept all-zero between queries
+    // via a sparse clear inside single_query) and the visited-doc set. This
+    // replaces the previous per-query allocation of both. schedule(dynamic, 64)
+    // matches the coarse-chunk scheduling used by SeismicIndex::search.
+#pragma omp parallel
+    {
+        std::vector<uint8_t> dense(dense_bytes, 0);
+        absl::flat_hash_set<idx_t> visited;
+        visited.reserve(static_cast<size_t>(std::max(k, 1)) * 4096);
+
+#pragma omp for schedule(dynamic, 64)
+        for (idx_t query_idx = 0; query_idx < n; ++query_idx) {
+            const idx_t start = indptr[query_idx];
+            const size_t len = indptr[query_idx + 1] - start;
+            const term_t* q_indices = indices + start;
+            const uint8_t* q_val_bytes = query_values + start * element_size;
+            std::vector<term_t> cuts;
+            if (element_size == U16) {
+                cuts = detail::top_k_tokens<uint16_t>(
+                    q_indices,
+                    reinterpret_cast<const uint16_t*>(q_val_bytes), len,
+                    parameters->cut);
+            } else {
+                cuts = detail::top_k_tokens<uint8_t>(q_indices, q_val_bytes,
+                                                     len, parameters->cut);
+            }
+
+            auto [distances, labels] = single_query(
+                dense, visited, q_indices, q_val_bytes, len, element_size, cuts,
+                k, parameters->heap_factor, query_sq, search_parameters);
+            result_distances[query_idx] = std::move(distances);
+            result_labels[query_idx] = std::move(labels);
         }
-
-        auto [distances, labels] =
-            single_query(dense, cuts, k, parameters->heap_factor, query_sq,
-                         search_parameters);
-        result_distances[query_idx] = std::move(distances);
-        result_labels[query_idx] = std::move(labels);
     }
 
     return {result_distances, result_labels};
 }
 
 auto SeismicScalarQuantizedIndex::single_query(
-    const std::vector<uint8_t>& dense, const std::vector<term_t>& cuts, int k,
+    std::vector<uint8_t>& dense, absl::flat_hash_set<idx_t>& visited,
+    const term_t* q_idx, const uint8_t* q_val_bytes, size_t q_len,
+    size_t element_size, const std::vector<term_t>& cuts, int k,
     float heap_factor, const ScalarQuantizer& query_sq,
     SearchParameters* search_parameters) -> pair_of_score_id_vector_t {
     size_t num_docs = vectors_->num_vectors();
     if (num_docs == 0) {
         return {{}, {}};
     }
-    absl::flat_hash_set<idx_t> visited;
-    visited.reserve(cuts.size() * 5000);
+
+    // Scatter the query's quantized codes into the reused dense buffer (all-zero
+    // on entry): element_size contiguous bytes per non-zero dim.
+    for (size_t i = 0; i < q_len; ++i) {
+        std::copy_n(q_val_bytes + i * element_size, element_size,
+                    dense.data() + static_cast<size_t>(q_idx[i]) * element_size);
+    }
+    visited.clear();
+
     detail::TopKHolder<idx_t> holder(k);
+    std::vector<float> score_scratch;
     bool first_list = true;
     for (const auto& term : cuts) {
         if (term >= clustered_inverted_lists.size()) [[unlikely]] {
@@ -279,9 +307,17 @@ auto SeismicScalarQuantizedIndex::single_query(
         }
         const auto& cluster_invlist = clustered_inverted_lists[term];
         query_single_inverted_list(vectors_.get(), cluster_invlist, dense,
+                                   q_idx, q_val_bytes, q_len, score_scratch,
                                    heap_factor, first_list, search_parameters,
                                    holder, visited);
         first_list = false;
+    }
+
+    // Restore the dense buffer to all-zero for the next query on this thread
+    // (sparse clear over only the dims this query touched).
+    for (size_t i = 0; i < q_len; ++i) {
+        std::fill_n(dense.data() + static_cast<size_t>(q_idx[i]) * element_size,
+                    element_size, uint8_t{0});
     }
 
     auto [distances, labels] = holder.top_k_items_descending();

@@ -12,6 +12,7 @@
 #include <array>
 #include <vector>
 
+#include "absl/container/flat_hash_set.h"
 #include "nsparse/cluster/inverted_list_clusters.h"
 #include "nsparse/index.h"
 #include "nsparse/io/io.h"
@@ -63,9 +64,15 @@ private:
                 SearchParameters* search_parameters = nullptr)
         -> pair_of_score_id_vectors_t override;
 
-    auto single_query(const std::vector<float>& dense,
-                      const std::vector<term_t>& cuts, int k, float heap_factor,
-                      SearchParameters* search_parameters)
+    // `dense` and `visited` are per-thread scratch reused across the queries a
+    // thread handles (see search()). `dense` must be all-zero on entry and is
+    // restored to all-zero on exit via a sparse clear over the query's own
+    // dims (q_indices/q_len); `visited` is cleared on entry.
+    auto single_query(std::vector<float>& dense,
+                      absl::flat_hash_set<idx_t>& visited,
+                      const term_t* q_indices, const float* q_values,
+                      size_t q_len, const std::vector<term_t>& cuts, int k,
+                      float heap_factor, SearchParameters* search_parameters)
         -> pair_of_score_id_vector_t;
     std::unique_ptr<SparseVectors> vectors_;
     SeismicClusterParameters cluster_parameter_;

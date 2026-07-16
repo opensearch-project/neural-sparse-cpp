@@ -235,10 +235,16 @@ BENCHMARK(BM_Seismic_Search)
 // Seismic Scalar Quantized Index
 // ---------------------------------------------------------------------------
 static void BM_SeismicSQ_Search(benchmark::State& state) {
-    auto& fix = IndexFixture::get(
-        "seismic_sq,quantizer=8bit|vmin=0.0|vmax=3.0|lambda=6000|beta=400|"
-        "alpha=0.4",
-        ".seismic_sq.dat");
+    // Quantizer width is configurable so int16 vs int8 can be compared
+    // (NSPARSE_SQ_BITS = "8bit" or "16bit"; default "8bit"). Each width caches
+    // to its own .dat suffix.
+    const char* bits_env = std::getenv("NSPARSE_SQ_BITS");
+    std::string bits =
+        (bits_env != nullptr && bits_env[0] != '\0') ? bits_env : "8bit";
+    std::string descriptor =
+        "seismic_sq,quantizer=" + bits +
+        "|vmin=0.0|vmax=3.0|lambda=6000|beta=400|alpha=0.4";
+    auto& fix = IndexFixture::get(descriptor, ".seismic_sq_" + bits + ".dat");
     const int k = static_cast<int>(state.range(0));
     const int n_queries = static_cast<int>(fix.query.nrow);
 

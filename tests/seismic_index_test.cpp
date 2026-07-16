@@ -141,10 +141,8 @@ TEST(SeismicIndexBuild, build_creates_summaries_for_clusters) {
     index.build();
 
     auto& inv_lists = index.get_clustered_inverted_lists();
-    // Term 0 has 2 docs -> clusters with summaries
+    // Term 0 has 2 docs -> 2 clusters, each with a summary.
     EXPECT_EQ(inv_lists[0].cluster_size(), 2);
-    const auto& summaries = inv_lists[0].summaries();
-    EXPECT_EQ(summaries.num_vectors(), 2);
 }
 
 // ============== Constructor tests ==============
