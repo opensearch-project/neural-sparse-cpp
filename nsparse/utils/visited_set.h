@@ -10,6 +10,7 @@
 #ifndef NSPARSE_VISITED_SET_H
 #define NSPARSE_VISITED_SET_H
 
+#include <cassert>
 #include <cstdint>
 #include <vector>
 
@@ -44,7 +45,13 @@ public:
     }
 
     // Mark `id` visited; return true if it was newly inserted this query.
+    // `id` must be in the doc-id domain [0, n) this set was sized for: unlike a
+    // hash set, an out-of-range id here is an out-of-bounds access on bits_, not
+    // a safe insert. Doc ids come from the corpus so this invariant holds, but
+    // it is now load-bearing — assert it in debug builds (compiles out in
+    // release, keeping the per-candidate hot path branch-free).
     bool insert(size_t id) {
+        assert(id < (bits_.size() << 6) && "VisitedSet id out of domain");
         const size_t w = id >> 6;
         const uint64_t mask = uint64_t{1} << (id & 63);
         const uint64_t prev = bits_[w];

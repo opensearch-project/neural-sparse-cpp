@@ -319,5 +319,14 @@ void SeismicIndex::read_index(IOReader* io_reader) {
     SeismicInvertedListsWriter inv_list_writer({});
     inv_list_writer.deserialize(io_reader);
     clustered_inverted_lists = std::move(inv_list_writer.release());
+    // The search path indexes a VisitedSet by doc id without a per-candidate
+    // bounds check; validate the loaded ids fall in the corpus domain once here
+    // so a corrupt/mismatched index fails loudly instead of writing OOB.
+    if (vectors_ != nullptr) {
+        const size_t num_docs = vectors_->num_vectors();
+        for (const auto& cluster_invlist : clustered_inverted_lists) {
+            cluster_invlist.validate_doc_ids(num_docs);
+        }
+    }
 }
 }  // namespace nsparse

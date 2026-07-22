@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -131,6 +132,18 @@ void InvertedListClusters::sort_cluster_docs() {
     if (offsets_.size() <= 1) return;
     for (size_t c = 0; c + 1 < offsets_.size(); ++c) {
         std::sort(docs_.begin() + offsets_[c], docs_.begin() + offsets_[c + 1]);
+    }
+}
+
+void InvertedListClusters::validate_doc_ids(size_t num_docs) const {
+    // docs_ is sorted per cluster but not globally, so scan the flat array.
+    // One O(nnz) pass at load; negligible against deserialize + the sort above.
+    for (const idx_t doc_id : docs_) {
+        if (static_cast<size_t>(doc_id) >= num_docs) {
+            throw std::out_of_range(
+                "InvertedListClusters: doc id out of range for corpus size; "
+                "index is corrupt or does not match its vectors");
+        }
     }
 }
 
