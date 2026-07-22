@@ -15,6 +15,7 @@
 #include "nsparse/io/io.h"
 #include "nsparse/types.h"
 #include "nsparse/utils/checks.h"
+#include "nsparse/utils/hugepage.h"
 
 namespace nsparse {
 SparseVectors::SparseVectors(SparseVectorsConfig config) : config_(config) {
@@ -165,6 +166,13 @@ void SparseVectors::deserialize(IOReader* io_reader) {
         size_t value_size = indptr_[vector_count] * element_size;
         values_.resize(value_size);
         io_reader->read(values_.data(), sizeof(uint8_t), value_size);
+
+        // The per-doc dot product gathers randomly across indices_/values_
+        // (multi-GB at scale); back them with huge pages to cut TLB/page-walk
+        // cost. indptr_ is also randomly indexed by doc id.
+        detail::advise_hugepage(indptr_);
+        detail::advise_hugepage(indices_);
+        detail::advise_hugepage(values_);
     }
 }
 }  // namespace nsparse

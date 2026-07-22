@@ -56,6 +56,9 @@ public:
 private:
     // Build the term-major (CSC) transpose from a per-cluster CSR summary.
     void build_transpose(const SparseVectors& summaries);
+    // Sort doc ids ascending within each cluster (result-order invariant) so
+    // the per-doc gather over the forward index is monotonic, not random.
+    void sort_cluster_docs();
     template <class T>
     void score_summaries_typed(const term_t* q_idx, const T* q_val,
                                size_t q_len, std::vector<float>& out) const;

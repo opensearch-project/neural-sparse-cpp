@@ -16,7 +16,6 @@
 #include <numeric>
 #include <vector>
 
-#include "absl/container/flat_hash_set.h"
 #include "nsparse/cluster/inverted_list_clusters.h"
 #include "nsparse/cluster/random_kmeans.h"
 #include "nsparse/exact_matcher.h"
@@ -32,6 +31,7 @@
 #include "nsparse/utils/prefetch.h"
 #include "nsparse/utils/ranker.h"
 #include "nsparse/utils/vector_process.h"
+#include "nsparse/utils/visited_set.h"
 
 namespace nsparse {
 namespace {
@@ -41,9 +41,10 @@ constexpr int kElementSize = U32;
 void query_single_inverted_list(
     const SparseVectors* vectors, const InvertedListClusters& cluster_invlist,
     const std::vector<float>& dense, const term_t* q_idx, const float* q_val,
-    size_t q_len, std::vector<float>& score_scratch, const float heap_factor,
+    size_t q_len, std::vector<float>& score_scratch,
+    std::vector<uint32_t>& cluster_order, const float heap_factor,
     const bool first_list, const SearchParameters* search_parameters,
-    detail::TopKHolder<idx_t>& heap, absl::flat_hash_set<idx_t>& visited) {
+    detail::TopKHolder<idx_t>& heap, detail::VisitedSet& visited) {
     // Skip empty clusters
     size_t csize = cluster_invlist.cluster_size();
     if (csize == 0) {
@@ -58,39 +59,39 @@ void query_single_inverted_list(
     cluster_invlist.score_summaries_transposed(
         q_idx, reinterpret_cast<const uint8_t*>(q_val), q_len, score_scratch);
     const std::vector<float>& summary_scores = score_scratch;
-    size_t num_vectors = vectors->num_vectors();
-
-    std::vector<size_t> cluster_order =
-        detail::reorder_clusters(summary_scores, first_list);
+    const size_t n_clusters = summary_scores.size();
 
     const auto& [indptr, indices, values] = vectors->get_all_data();
 
-    for (const size_t& cluster_id : cluster_order) {
-        const auto& cluster_score = summary_scores[cluster_id];
+    // Process one cluster: prune by summary score, then score its docs.
+    // Returns false when the early-out fires on the first (sorted) list, which
+    // means no later cluster can qualify either — the caller stops iterating.
+    auto process_cluster = [&](size_t cluster_id) -> bool {
+        const float cluster_score = summary_scores[cluster_id];
         if (heap.full() && (cluster_score * heap_factor < heap.peek_score())) {
-            if (first_list) {
-                break;
-            }
-            continue;
+            // On the first list clusters are visited in descending score order,
+            // so once one falls below the threshold every later one does too.
+            return !first_list;
         }
         const auto& docs = cluster_invlist.get_docs(cluster_id);
         const size_t n_docs = docs.size();
-        static constexpr size_t kPrefetchDist1 = 2;  // vector data prefetch
-        static constexpr size_t kPrefetchDist2 = 4;  // indptr prefetch
         for (size_t i = 0; i < n_docs; ++i) {
-            const auto& doc_id = docs[i];
-            if (i + kPrefetchDist2 < n_docs) {
-                detail::prefetch_indptr(indptr, docs[i + kPrefetchDist2]);
-            }
+            const idx_t doc_id = docs[i];
+            // Prefetch one doc ahead, only the leading lines of the upcoming
+            // row; the row is contiguous so the hardware streamer pulls the
+            // tail, while bounding outstanding software prefetches keeps the
+            // line-fill buffers from saturating (measured optimum ~4 lines).
+            static constexpr size_t kPrefetchDist1 = 1;
             if (i + kPrefetchDist1 < n_docs) {
-                const idx_t next_doc = docs[i + kPrefetchDist1];
-                const idx_t next_start = indptr[next_doc];
-                const size_t next_len = indptr[next_doc + 1] - next_start;
-                detail::prefetch_vector(indices + next_start,
-                                        values + next_start, next_len);
+                const idx_t nd = docs[i + kPrefetchDist1];
+                const idx_t next_start = indptr[nd];
+                const size_t next_len = indptr[nd + 1] - next_start;
+                static constexpr size_t kPrefetchHeadLines = 4;
+                detail::prefetch_vector_head(indices + next_start,
+                                             values + next_start, next_len,
+                                             kPrefetchHeadLines);
             }
-            auto [_, inserted] = visited.insert(doc_id);
-            if (!inserted) {
+            if (!visited.insert(static_cast<size_t>(doc_id))) {
                 continue;
             }
             if (id_selector != nullptr && !id_selector->is_member(doc_id)) {
@@ -101,6 +102,29 @@ void query_single_inverted_list(
             auto score = detail::dot_product_float_dense(
                 indices + start, values + start, len, dense.data());
             heap.add(score, doc_id);
+        }
+        return true;
+    };
+
+    if (first_list) {
+        // Only the first list is score-ordered; sort a per-thread scratch of
+        // narrow (u32) cluster ids instead of allocating a size_t vector per
+        // list. Clusters per list stay well under 2^32.
+        cluster_order.resize(n_clusters);
+        std::iota(cluster_order.begin(), cluster_order.end(), 0U);
+        std::ranges::sort(cluster_order, [&](uint32_t a, uint32_t b) {
+            return summary_scores[a] > summary_scores[b];
+        });
+        for (const uint32_t cluster_id : cluster_order) {
+            if (!process_cluster(cluster_id)) {
+                break;
+            }
+        }
+    } else {
+        // Later lists are visited in natural cluster order, so iterate directly
+        // — no order array, iota, or sort needed.
+        for (size_t cluster_id = 0; cluster_id < n_clusters; ++cluster_id) {
+            process_cluster(cluster_id);
         }
     }
 }
@@ -187,8 +211,14 @@ auto SeismicIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
 #pragma omp parallel
     {
         std::vector<float> dense(dim, 0.0F);
-        absl::flat_hash_set<idx_t> visited;
-        visited.reserve(static_cast<size_t>(std::max(k, 1)) * 4096);
+        // Generation-stamped visited set over the doc-id domain: O(1) reset per
+        // query and a single indexed load per candidate instead of a hashed
+        // random probe (the doc loop is memory-bound on random gathers).
+        detail::VisitedSet visited(vectors_->num_vectors());
+        // Per-thread scratch reused across queries: the per-cluster summary
+        // score buffer and the sorted cluster-order buffer (first list only).
+        std::vector<float> score_scratch;
+        std::vector<uint32_t> cluster_order;
 
 #pragma omp for schedule(dynamic, 64)
         for (idx_t query_idx = 0; query_idx < n; ++query_idx) {
@@ -200,7 +230,8 @@ auto SeismicIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
                 detail::top_k_tokens(q_indices, q_values, len, parameters->cut);
             auto [distances, labels] =
                 single_query(dense, visited, q_indices, q_values, len, cuts, k,
-                             parameters->heap_factor, search_parameters);
+                             parameters->heap_factor, search_parameters,
+                             score_scratch, cluster_order);
             result_distances[query_idx] = std::move(distances);
             result_labels[query_idx] = std::move(labels);
         }
@@ -219,11 +250,13 @@ auto SeismicIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
  * @return std::pair<std::vector<float>, std::vector<idx_t>>
  */
 auto SeismicIndex::single_query(std::vector<float>& dense,
-                                absl::flat_hash_set<idx_t>& visited,
+                                detail::VisitedSet& visited,
                                 const term_t* q_indices, const float* q_values,
                                 size_t q_len, const std::vector<term_t>& cuts,
                                 int k, float heap_factor,
-                                SearchParameters* search_parameters)
+                                SearchParameters* search_parameters,
+                                std::vector<float>& score_scratch,
+                                std::vector<uint32_t>& cluster_order)
     -> pair_of_score_id_vector_t {
     size_t num_docs = vectors_->num_vectors();
     if (num_docs == 0) {
@@ -234,10 +267,9 @@ auto SeismicIndex::single_query(std::vector<float>& dense,
     for (size_t i = 0; i < q_len; ++i) {
         dense[q_indices[i]] = q_values[i];
     }
-    visited.clear();
+    visited.new_query();
 
     detail::TopKHolder<idx_t> holder(k);
-    std::vector<float> score_scratch;
     bool first_list = true;
     for (const auto& term : cuts) {
         if (term >= clustered_inverted_lists.size()) [[unlikely]] {
@@ -246,8 +278,8 @@ auto SeismicIndex::single_query(std::vector<float>& dense,
         const auto& cluster_invlist = clustered_inverted_lists[term];
         query_single_inverted_list(vectors_.get(), cluster_invlist, dense,
                                    q_indices, q_values, q_len, score_scratch,
-                                   heap_factor, first_list, search_parameters,
-                                   holder, visited);
+                                   cluster_order, heap_factor, first_list,
+                                   search_parameters, holder, visited);
         first_list = false;
     }
 
