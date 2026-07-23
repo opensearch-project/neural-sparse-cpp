@@ -333,7 +333,7 @@ inline float dot_product_float_dense(const term_t* indices,
         // Gather 16 values from dense vector using indices
         __m512 dense_vals = _mm512_i32gather_ps(idx, dense, sizeof(float));
 
-        // Load 16 weights (aligned load - weights must be 64-byte aligned)
+        // Load 16 weights
         __m512 weight_vals = _mm512_loadu_ps(weights + i);
 
         // Fused multiply-add: sum += weights * dense_vals

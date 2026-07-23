@@ -41,6 +41,13 @@ public:
     void serialize(IOWriter* writer) const override;
     void deserialize(IOReader* reader) override;
 
+    // Validate that every stored doc id is within [0, num_docs). The search
+    // path indexes a VisitedSet sized to num_docs by doc id with no per-
+    // candidate bounds check (that would cost a branch on the hot path), so an
+    // out-of-domain id from a corrupt or mismatched serialized index would be
+    // an out-of-bounds write. Called once at load to fail loudly instead.
+    void validate_doc_ids(size_t num_docs) const;
+
     // Accumulate per-cluster summary scores for a query into `out` (resized to
     // the cluster count) using the term-major transpose. The query is given as
     // its sparse (term, value) pairs; `q_val_bytes` points at the query values
@@ -56,6 +63,9 @@ public:
 private:
     // Build the term-major (CSC) transpose from a per-cluster CSR summary.
     void build_transpose(const SparseVectors& summaries);
+    // Sort doc ids ascending within each cluster (result-order invariant) so
+    // the per-doc gather over the forward index is monotonic, not random.
+    void sort_cluster_docs();
     template <class T>
     void score_summaries_typed(const term_t* q_idx, const T* q_val,
                                size_t q_len, std::vector<float>& out) const;

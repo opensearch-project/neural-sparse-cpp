@@ -12,13 +12,13 @@
 #include <array>
 #include <vector>
 
-#include "absl/container/flat_hash_set.h"
 #include "nsparse/cluster/inverted_list_clusters.h"
 #include "nsparse/index.h"
 #include "nsparse/io/io.h"
 #include "nsparse/seismic_common.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
+#include "nsparse/utils/visited_set.h"
 
 namespace nsparse {
 
@@ -67,12 +67,15 @@ private:
     // `dense` and `visited` are per-thread scratch reused across the queries a
     // thread handles (see search()). `dense` must be all-zero on entry and is
     // restored to all-zero on exit via a sparse clear over the query's own
-    // dims (q_indices/q_len); `visited` is cleared on entry.
-    auto single_query(std::vector<float>& dense,
-                      absl::flat_hash_set<idx_t>& visited,
+    // dims (q_indices/q_len); `visited` starts a new generation on entry.
+    // `score_scratch` and `cluster_order` are per-thread scratch reused across
+    // queries (resized in place), avoiding a per-query/per-list allocation.
+    auto single_query(std::vector<float>& dense, detail::VisitedSet& visited,
                       const term_t* q_indices, const float* q_values,
                       size_t q_len, const std::vector<term_t>& cuts, int k,
-                      float heap_factor, SearchParameters* search_parameters)
+                      float heap_factor, SearchParameters* search_parameters,
+                      std::vector<float>& score_scratch,
+                      std::vector<uint32_t>& cluster_order)
         -> pair_of_score_id_vector_t;
     std::unique_ptr<SparseVectors> vectors_;
     SeismicClusterParameters cluster_parameter_;

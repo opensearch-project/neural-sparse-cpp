@@ -56,4 +56,9 @@ target_link_libraries(nsparse_test PRIVATE
 )
 
 include(GoogleTest)
-gtest_discover_tests(nsparse_test)
+# DISCOVERY_TIMEOUT: gtest_discover_tests runs the built executable with
+# --gtest_list_tests as a post-build step. On cold Windows CI runners, loading
+# the exe together with its deployed DLLs (e.g. abseil_dll.dll) and enumerating
+# every test case can exceed the 5s default, causing a spurious build failure.
+# Bump the timeout well above that to keep discovery robust.
+gtest_discover_tests(nsparse_test DISCOVERY_TIMEOUT 120)

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -117,6 +118,32 @@ InvertedListClusters::InvertedListClusters(
     for (const auto& doc_ids : docs) {
         docs_.insert(docs_.end(), doc_ids.begin(), doc_ids.end());
         offsets_.push_back(docs_.size());
+    }
+    sort_cluster_docs();
+}
+
+// Sort the doc ids within each cluster ascending. Within-cluster iteration
+// order does not affect search results (the top-k heap and the visited dedup
+// are order-independent), but it dictates the memory access pattern of the
+// per-doc gather: indptr[doc_id] and the forward-index rows it points at are
+// spread across the multi-GB corpus. Ascending doc ids turn that per-doc random
+// gather into a monotonic sweep the hardware prefetcher and TLB can follow.
+void InvertedListClusters::sort_cluster_docs() {
+    if (offsets_.size() <= 1) return;
+    for (size_t c = 0; c + 1 < offsets_.size(); ++c) {
+        std::sort(docs_.begin() + offsets_[c], docs_.begin() + offsets_[c + 1]);
+    }
+}
+
+void InvertedListClusters::validate_doc_ids(size_t num_docs) const {
+    // docs_ is sorted per cluster but not globally, so scan the flat array.
+    // One O(nnz) pass at load; negligible against deserialize + the sort above.
+    for (const idx_t doc_id : docs_) {
+        if (static_cast<size_t>(doc_id) >= num_docs) {
+            throw std::out_of_range(
+                "InvertedListClusters: doc id out of range for corpus size; "
+                "index is corrupt or does not match its vectors");
+        }
     }
 }
 
@@ -291,6 +318,10 @@ void InvertedListClusters::deserialize(IOReader* reader) {
         offsets_.resize(n_offsets);
         reader->read(offsets_.data(), sizeof(idx_t), n_offsets);
     }
+    // Order within each cluster does not affect results but makes the per-doc
+    // gather monotonic (see sort_cluster_docs). Applied on load so existing
+    // serialized indexes benefit without a rebuild.
+    sort_cluster_docs();
 
     reader->read(&n_clusters_, sizeof(size_t), 1);
     reader->read(&element_size_, sizeof(size_t), 1);

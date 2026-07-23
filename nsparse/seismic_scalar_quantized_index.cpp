@@ -17,7 +17,6 @@
 #include <typeinfo>
 #include <vector>
 
-#include "absl/container/flat_hash_set.h"
 #include "nsparse/cluster/inverted_list_clusters.h"
 #include "nsparse/cluster/random_kmeans.h"
 #include "nsparse/exact_matcher.h"
@@ -34,6 +33,7 @@
 #include "nsparse/utils/prefetch.h"
 #include "nsparse/utils/scalar_quantizer.h"
 #include "nsparse/utils/vector_process.h"
+#include "nsparse/utils/visited_set.h"
 
 namespace nsparse {
 namespace {
@@ -46,7 +46,7 @@ void query_single_inverted_list(const SparseVectors* vectors,
                                 float heap_factor, bool first_list,
                                 const SearchParameters* search_parameters,
                                 detail::TopKHolder<idx_t>& heap,
-                                absl::flat_hash_set<idx_t>& visited) {
+                                detail::VisitedSet& visited) {
     // Skip empty clusters
     size_t csize = cluster_invlist.cluster_size();
     if (csize == 0) {
@@ -80,31 +80,23 @@ void query_single_inverted_list(const SparseVectors* vectors,
         }
         const auto& docs = cluster_invlist.get_docs(cluster_id);
         const size_t n_docs = docs.size();
-        // Two-stage prefetch pipeline:
-        // Stage 1 (distance 2): prefetch indptr[docs[i+2]] so the indptr
-        //   lookup is cached by the time we need it next iteration.
-        // Stage 2 (distance 1): read indptr[docs[i+1]] (now cached from
-        //   stage 1 issued last iteration), prefetch the actual vector data.
-        static constexpr size_t kPrefetchDist1 = 2;  // vector data prefetch
-        static constexpr size_t kPrefetchDist2 = 4;  // indptr prefetch
         for (size_t i = 0; i < n_docs; ++i) {
-            const auto& doc_id = docs[i];
-            // Stage 1: prefetch indptr entry for doc at distance 2
-            if (i + kPrefetchDist2 < n_docs) {
-                detail::prefetch_indptr(indptr, docs[i + kPrefetchDist2]);
-            }
-            // Stage 2: prefetch vector data for next doc (indptr should
-            // already be cached from stage 1 issued kPrefetchDist2 -
-            // kPrefetchDist1 iterations ago)
+            const idx_t doc_id = docs[i];
+            // Prefetch one doc ahead, only the leading lines of the upcoming
+            // row; the row is contiguous so the hardware streamer pulls the
+            // tail, while bounding outstanding software prefetches keeps the
+            // line-fill buffers from saturating (measured optimum ~4 lines).
+            static constexpr size_t kPrefetchDist1 = 1;
             if (i + kPrefetchDist1 < n_docs) {
                 const idx_t next_doc = docs[i + kPrefetchDist1];
                 const idx_t next_start = indptr[next_doc];
                 const size_t next_len = indptr[next_doc + 1] - next_start;
-                detail::prefetch_vector(indices + next_start,
-                                        values + next_start, next_len);
+                static constexpr size_t kPrefetchHeadLines = 4;
+                detail::prefetch_vector_head(indices + next_start,
+                                             values + next_start, next_len,
+                                             kPrefetchHeadLines);
             }
-            auto [_, inserted] = visited.insert(doc_id);
-            if (!inserted) {
+            if (!visited.insert(static_cast<size_t>(doc_id))) {
                 continue;
             }
             if (id_selector != nullptr && !id_selector->is_member(doc_id)) {
@@ -248,8 +240,7 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
 #pragma omp parallel
     {
         std::vector<uint8_t> dense(dense_bytes, 0);
-        absl::flat_hash_set<idx_t> visited;
-        visited.reserve(static_cast<size_t>(std::max(k, 1)) * 4096);
+        detail::VisitedSet visited(vectors_->num_vectors());
 
 #pragma omp for schedule(dynamic, 64)
         for (idx_t query_idx = 0; query_idx < n; ++query_idx) {
@@ -280,7 +271,7 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
 }
 
 auto SeismicScalarQuantizedIndex::single_query(
-    std::vector<uint8_t>& dense, absl::flat_hash_set<idx_t>& visited,
+    std::vector<uint8_t>& dense, detail::VisitedSet& visited,
     const term_t* q_idx, const uint8_t* q_val_bytes, size_t q_len,
     size_t element_size, const std::vector<term_t>& cuts, int k,
     float heap_factor, const ScalarQuantizer& query_sq,
@@ -296,7 +287,7 @@ auto SeismicScalarQuantizedIndex::single_query(
         std::copy_n(q_val_bytes + i * element_size, element_size,
                     dense.data() + static_cast<size_t>(q_idx[i]) * element_size);
     }
-    visited.clear();
+    visited.new_query();
 
     detail::TopKHolder<idx_t> holder(k);
     std::vector<float> score_scratch;
@@ -353,6 +344,15 @@ void SeismicScalarQuantizedIndex::read_index(IOReader* io_reader) {
     SeismicInvertedListsWriter inv_list_writer({});
     inv_list_writer.deserialize(io_reader);
     clustered_inverted_lists = std::move(inv_list_writer.release());
+    // The search path indexes a VisitedSet by doc id without a per-candidate
+    // bounds check; validate the loaded ids fall in the corpus domain once here
+    // so a corrupt/mismatched index fails loudly instead of writing OOB.
+    if (vectors_ != nullptr) {
+        const size_t num_docs = vectors_->num_vectors();
+        for (const auto& cluster_invlist : clustered_inverted_lists) {
+            cluster_invlist.validate_doc_ids(num_docs);
+        }
+    }
 }
 
 void SeismicScalarQuantizedIndex::write_header(IOWriter* io_writer) {
