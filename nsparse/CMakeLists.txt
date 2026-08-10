@@ -10,6 +10,7 @@ set(NSPARSE_SRC
     brutal_index.cpp
     seismic_index.cpp
     seismic_scalar_quantized_index.cpp
+    inline_forward_index.cpp
     sparse_vectors.cpp
     index_factory.cpp
     id_map_index.cpp
@@ -30,6 +31,7 @@ set(NSPARSE_HEADERS
     brutal_index.h
     seismic_index.h
     seismic_scalar_quantized_index.h
+    inline_forward_index.h
     index_factory.h
     id_map_index.h
     inverted_index.h

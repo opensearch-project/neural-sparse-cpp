@@ -14,6 +14,7 @@ set(NSPARSE_TEST_SRC
     id_selector_test.cpp
     index_factory_test.cpp
     index_io_test.cpp
+    inline_forward_index_test.cpp
     inverted_index_test.cpp
     inverted_index_recall_test.cpp
     inverted_list_clusters_test.cpp
