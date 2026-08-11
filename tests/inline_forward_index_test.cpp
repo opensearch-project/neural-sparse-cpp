@@ -20,7 +20,6 @@
 
 #include "nsparse/cluster/inverted_list_clusters.h"
 #include "nsparse/io/buffered_io.h"
-#include "nsparse/io/io.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
 
@@ -213,22 +212,20 @@ TEST(InlineForwardIndex, HeaderAndDirectoryLayout) {
     writer.write(lists, vectors, &bin, &dir);
 
     const auto header = parse_bin_header(bin.data());
-    EXPECT_EQ(header.magic, nsparse::fourcc(nsparse::kInlineForwardIndexMagic));
-    EXPECT_EQ(header.version, nsparse::kInlineForwardIndexVersion);
+    EXPECT_EQ(header.magic, nsparse::InlineForwardIndexHeader::kMagic);
     EXPECT_EQ(header.element_size, nsparse::U32);
-    EXPECT_EQ(header.reserved, 0U);
     EXPECT_EQ(header.n_blocks, 4U);
-    EXPECT_EQ(header.page_size, nsparse::kDefaultInlinePageSize);
+    EXPECT_EQ(header.page_size,
+              nsparse::InlineForwardIndexWriter::kDefaultPageSize);
 
     nsparse::InlineDirHeader dir_header{};
     auto entries = parse_dir(dir.data(), dir_header);
-    EXPECT_EQ(dir_header.magic, nsparse::fourcc(nsparse::kInlineDirMagic));
-    EXPECT_EQ(dir_header.version, nsparse::kInlineForwardIndexVersion);
+    EXPECT_EQ(dir_header.magic, nsparse::InlineDirHeader::kMagic);
     EXPECT_EQ(dir_header.element_size, nsparse::U32);
-    EXPECT_EQ(dir_header.reserved, 0U);
     EXPECT_EQ(dir_header.n_lists, 2U);
     EXPECT_EQ(dir_header.n_entries, 4U);
-    EXPECT_EQ(dir_header.page_size, nsparse::kDefaultInlinePageSize);
+    EXPECT_EQ(dir_header.page_size,
+              nsparse::InlineForwardIndexWriter::kDefaultPageSize);
     ASSERT_EQ(entries.size(), 4U);
 
     // Entries are (pl, block) in ascending order, first block page-aligned, and
@@ -239,9 +236,12 @@ TEST(InlineForwardIndex, HeaderAndDirectoryLayout) {
     for (size_t i = 0; i < entries.size(); ++i) {
         EXPECT_EQ(entries[i].pl, expected_ids[i].first);
         EXPECT_EQ(entries[i].block, expected_ids[i].second);
-        EXPECT_EQ(entries[i].byte_off % nsparse::kDefaultInlinePageSize, 0U);
+        EXPECT_EQ(entries[i].byte_off %
+                      nsparse::InlineForwardIndexWriter::kDefaultPageSize,
+                  0U);
         if (i == 0) {
-            EXPECT_EQ(entries[i].byte_off, nsparse::kDefaultInlinePageSize);
+            EXPECT_EQ(entries[i].byte_off,
+                      nsparse::InlineForwardIndexWriter::kDefaultPageSize);
         } else {
             EXPECT_GT(entries[i].byte_off, prev_off);
         }
@@ -251,9 +251,10 @@ TEST(InlineForwardIndex, HeaderAndDirectoryLayout) {
     // Each block's byte_off must equal the previous block's end rounded up.
     for (size_t i = 1; i < entries.size(); ++i) {
         const uint64_t prev_end = entries[i - 1].byte_off + entries[i - 1].len;
-        EXPECT_EQ(entries[i].byte_off,
-                  nsparse::inline_align_up(prev_end,
-                                           nsparse::kDefaultInlinePageSize));
+        EXPECT_EQ(
+            entries[i].byte_off,
+            nsparse::inline_align_up(
+                prev_end, nsparse::InlineForwardIndexWriter::kDefaultPageSize));
     }
 }
 
@@ -405,9 +406,10 @@ TEST(InlineForwardIndex, NoListsWritesEmptyDirectory) {
     EXPECT_EQ(header.n_blocks, 0U);
     // Header is padded out to a full page even with no blocks, and the pad
     // bytes are zero (the artifact must be byte-reproducible).
-    EXPECT_EQ(bin.data().size(), nsparse::kDefaultInlinePageSize);
+    EXPECT_EQ(bin.data().size(),
+              nsparse::InlineForwardIndexWriter::kDefaultPageSize);
     expect_zero_range(bin.data(), sizeof(nsparse::InlineForwardIndexHeader),
-                      nsparse::kDefaultInlinePageSize);
+                      nsparse::InlineForwardIndexWriter::kDefaultPageSize);
     nsparse::InlineDirHeader dir_header{};
     auto entries = parse_dir(dir.data(), dir_header);
     EXPECT_EQ(dir_header.n_lists, 0U);
@@ -568,8 +570,9 @@ TEST(InlineForwardIndex, PackedLayoutHasNoPadding) {
         {{0, 1}, {2, 3, 4}}, {{3, 5}, {0}}};
     auto lists = build_lists(layout, vectors);
 
-    nsparse::InlineForwardIndexWriter writer(nsparse::kDefaultInlinePageSize,
-                                             nsparse::InlineLayout::kPacked);
+    nsparse::InlineForwardIndexWriter writer(
+        nsparse::InlineForwardIndexWriter::kDefaultPageSize,
+        nsparse::InlineLayout::kPacked);
     nsparse::BufferedIOWriter bin;
     nsparse::BufferedIOWriter dir;
     writer.write(lists, vectors, &bin, &dir);
@@ -617,8 +620,9 @@ TEST(InlineForwardIndex, PackedLayoutParityAcrossWidthsAndEdges) {
     // list1: a single-doc block.
     auto lists = build_lists({{{0, 1}, {}}, {{2}}}, vectors);
 
-    nsparse::InlineForwardIndexWriter writer(nsparse::kDefaultInlinePageSize,
-                                             nsparse::InlineLayout::kPacked);
+    nsparse::InlineForwardIndexWriter writer(
+        nsparse::InlineForwardIndexWriter::kDefaultPageSize,
+        nsparse::InlineLayout::kPacked);
     nsparse::BufferedIOWriter bin;
     nsparse::BufferedIOWriter dir;
     writer.write(lists, vectors, &bin, &dir);

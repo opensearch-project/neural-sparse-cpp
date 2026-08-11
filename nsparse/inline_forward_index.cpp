@@ -80,10 +80,8 @@ void InlineForwardIndexWriter::write(
     // --- inline.bin header, padded (when page-aligned) so the first block
     // starts on an alignment() boundary; no padding is written when packed. ---
     InlineForwardIndexHeader header{};
-    header.magic = fourcc(kInlineForwardIndexMagic);
-    header.version = kInlineForwardIndexVersion;
+    header.magic = InlineForwardIndexHeader::kMagic;
     header.element_size = static_cast<uint32_t>(element_size);
-    header.reserved = 0;
     header.n_blocks = n_blocks;
     header.page_size = align;
     bin_writer->write(&header, sizeof(header), 1);
@@ -170,10 +168,8 @@ void InlineForwardIndexWriter::write(
 
     // --- inline.bin.dir: header followed by the block directory. ---
     InlineDirHeader dir_header{};
-    dir_header.magic = fourcc(kInlineDirMagic);
-    dir_header.version = kInlineForwardIndexVersion;
+    dir_header.magic = InlineDirHeader::kMagic;
     dir_header.element_size = static_cast<uint32_t>(element_size);
-    dir_header.reserved = 0;
     dir_header.n_lists = lists.size();
     dir_header.n_entries = entries.size();
     dir_header.page_size = align;
