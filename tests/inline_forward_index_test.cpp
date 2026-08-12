@@ -20,6 +20,7 @@
 
 #include "nsparse/cluster/inverted_list_clusters.h"
 #include "nsparse/io/buffered_io.h"
+#include "nsparse/io/inline_forward_index_writer.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
 
@@ -94,7 +95,7 @@ std::vector<nsparse::InvertedListClusters> build_lists(
     return lists;
 }
 
-nsparse::InlineForwardIndexHeader parse_bin_header(
+nsparse::InlineForwardIndexHeader parse_header(
     const std::vector<uint8_t>& bin) {
     nsparse::InlineForwardIndexHeader header{};
     EXPECT_GE(bin.size(), sizeof(header));
@@ -104,29 +105,46 @@ nsparse::InlineForwardIndexHeader parse_bin_header(
     return header;
 }
 
+// Read the trailer at EOF and the directory it points to. Bounds-checked so a
+// regressed writer yields a clean EXPECT failure instead of reading past the
+// buffer.
 std::vector<nsparse::InlineDirEntry> parse_dir(
-    const std::vector<uint8_t>& dir, nsparse::InlineDirHeader& header_out) {
-    header_out = nsparse::InlineDirHeader{};
+    const std::vector<uint8_t>& bin,
+    nsparse::InlineForwardIndexTrailer& trailer_out) {
+    trailer_out = nsparse::InlineForwardIndexTrailer{};
     std::vector<nsparse::InlineDirEntry> entries;
-    EXPECT_GE(dir.size(), sizeof(header_out));
-    if (dir.size() < sizeof(header_out)) {
+    const size_t tsz = sizeof(nsparse::InlineForwardIndexTrailer);
+    EXPECT_GE(bin.size(), tsz);
+    if (bin.size() < tsz) {
         return entries;
     }
-    header_out = read_pod<nsparse::InlineDirHeader>(dir.data());
-    const size_t base = sizeof(header_out);
-    EXPECT_EQ(dir.size(),
-              base + header_out.n_entries * sizeof(nsparse::InlineDirEntry));
-    // Bound the reads by what the buffer actually holds so a regressed writer
-    // (inflated n_entries / truncated buffer) yields a clean EXPECT failure
-    // instead of reading past the vector.
-    const uint64_t available =
-        (dir.size() - base) / sizeof(nsparse::InlineDirEntry);
-    const uint64_t n = std::min<uint64_t>(header_out.n_entries, available);
+    trailer_out = read_pod<nsparse::InlineForwardIndexTrailer>(
+        bin.data() + bin.size() - tsz);
+    // The directory occupies [dir_offset, bin.size() - tsz).
+    EXPECT_LE(trailer_out.dir_offset, bin.size() - tsz);
+    if (trailer_out.dir_offset > bin.size() - tsz) {
+        return entries;
+    }
+    const uint64_t dir_bytes = (bin.size() - tsz) - trailer_out.dir_offset;
+    EXPECT_EQ(trailer_out.n_entries * sizeof(nsparse::InlineDirEntry),
+              dir_bytes);
+    const uint64_t available = dir_bytes / sizeof(nsparse::InlineDirEntry);
+    const uint64_t n = std::min<uint64_t>(trailer_out.n_entries, available);
     for (uint64_t i = 0; i < n; ++i) {
         entries.push_back(read_pod<nsparse::InlineDirEntry>(
-            dir.data() + base + i * sizeof(nsparse::InlineDirEntry)));
+            bin.data() + trailer_out.dir_offset +
+            i * sizeof(nsparse::InlineDirEntry)));
     }
     return entries;
+}
+
+// Total file size the writer must produce for a given directory: the directory
+// starts at trailer.dir_offset, holds n_entries entries, and is followed by the
+// fixed trailer.
+uint64_t expected_file_size(const nsparse::InlineForwardIndexTrailer& trailer) {
+    return trailer.dir_offset +
+           trailer.n_entries * sizeof(nsparse::InlineDirEntry) +
+           sizeof(nsparse::InlineForwardIndexTrailer);
 }
 
 // Parse the block at entry.byte_off and assert every record reproduces the
@@ -190,7 +208,7 @@ void expect_zero_range(const std::vector<uint8_t>& buf, size_t from,
 
 }  // namespace
 
-TEST(InlineForwardIndex, HeaderAndDirectoryLayout) {
+TEST(InlineForwardIndex, HeaderTrailerAndDirectoryLayout) {
     // dimension 10; term ids < 10.
     auto vectors =
         create_float_vectors({{0, 3}, {1}, {2, 4, 6}, {0, 9}, {5}, {3, 7}},
@@ -208,24 +226,20 @@ TEST(InlineForwardIndex, HeaderAndDirectoryLayout) {
 
     nsparse::InlineForwardIndexWriter writer;  // default 4 KiB page
     nsparse::BufferedIOWriter bin;
-    nsparse::BufferedIOWriter dir;
-    writer.write(lists, vectors, &bin, &dir);
+    writer.write(lists, vectors, &bin);
 
-    const auto header = parse_bin_header(bin.data());
+    const auto page = nsparse::InlineForwardIndexWriter::kDefaultPageSize;
+    const auto header = parse_header(bin.data());
     EXPECT_EQ(header.magic, nsparse::InlineForwardIndexHeader::kMagic);
     EXPECT_EQ(header.element_size, nsparse::U32);
     EXPECT_EQ(header.n_blocks, 4U);
-    EXPECT_EQ(header.page_size,
-              nsparse::InlineForwardIndexWriter::kDefaultPageSize);
+    EXPECT_EQ(header.page_size, page);
 
-    nsparse::InlineDirHeader dir_header{};
-    auto entries = parse_dir(dir.data(), dir_header);
-    EXPECT_EQ(dir_header.magic, nsparse::InlineDirHeader::kMagic);
-    EXPECT_EQ(dir_header.element_size, nsparse::U32);
-    EXPECT_EQ(dir_header.n_lists, 2U);
-    EXPECT_EQ(dir_header.n_entries, 4U);
-    EXPECT_EQ(dir_header.page_size,
-              nsparse::InlineForwardIndexWriter::kDefaultPageSize);
+    nsparse::InlineForwardIndexTrailer trailer{};
+    auto entries = parse_dir(bin.data(), trailer);
+    EXPECT_EQ(trailer.magic, nsparse::InlineForwardIndexTrailer::kMagic);
+    EXPECT_EQ(trailer.n_lists, 2U);
+    EXPECT_EQ(trailer.n_entries, 4U);
     ASSERT_EQ(entries.size(), 4U);
 
     // Entries are (pl, block) in ascending order, first block page-aligned, and
@@ -236,26 +250,27 @@ TEST(InlineForwardIndex, HeaderAndDirectoryLayout) {
     for (size_t i = 0; i < entries.size(); ++i) {
         EXPECT_EQ(entries[i].pl, expected_ids[i].first);
         EXPECT_EQ(entries[i].block, expected_ids[i].second);
-        EXPECT_EQ(entries[i].byte_off %
-                      nsparse::InlineForwardIndexWriter::kDefaultPageSize,
-                  0U);
+        EXPECT_EQ(entries[i].byte_off % page, 0U);
         if (i == 0) {
-            EXPECT_EQ(entries[i].byte_off,
-                      nsparse::InlineForwardIndexWriter::kDefaultPageSize);
+            EXPECT_EQ(entries[i].byte_off, page);
         } else {
             EXPECT_GT(entries[i].byte_off, prev_off);
         }
         prev_off = entries[i].byte_off;
     }
 
-    // Each block's byte_off must equal the previous block's end rounded up.
+    // Each block's byte_off equals the previous block's end rounded up.
     for (size_t i = 1; i < entries.size(); ++i) {
         const uint64_t prev_end = entries[i - 1].byte_off + entries[i - 1].len;
-        EXPECT_EQ(
-            entries[i].byte_off,
-            nsparse::inline_align_up(
-                prev_end, nsparse::InlineForwardIndexWriter::kDefaultPageSize));
+        EXPECT_EQ(entries[i].byte_off,
+                  nsparse::inline_align_up(prev_end, page));
     }
+
+    // The directory begins right after the last (padded) block, and the file
+    // ends after the directory + trailer.
+    const uint64_t last_end = entries.back().byte_off + entries.back().len;
+    EXPECT_EQ(trailer.dir_offset, nsparse::inline_align_up(last_end, page));
+    EXPECT_EQ(bin.data().size(), expected_file_size(trailer));
 }
 
 TEST(InlineForwardIndex, BlockContentsMatchForwardVectors) {
@@ -274,11 +289,10 @@ TEST(InlineForwardIndex, BlockContentsMatchForwardVectors) {
 
     nsparse::InlineForwardIndexWriter writer;
     nsparse::BufferedIOWriter bin;
-    nsparse::BufferedIOWriter dir;
-    writer.write(lists, vectors, &bin, &dir);
+    writer.write(lists, vectors, &bin);
 
-    nsparse::InlineDirHeader dir_header{};
-    auto entries = parse_dir(dir.data(), dir_header);
+    nsparse::InlineForwardIndexTrailer trailer{};
+    auto entries = parse_dir(bin.data(), trailer);
     ASSERT_EQ(entries.size(), 4U);
 
     // Verify every block's records reproduce the source vectors, and that a
@@ -297,14 +311,12 @@ TEST(InlineForwardIndex, ElementSizeVariantsU16) {
 
     nsparse::InlineForwardIndexWriter writer;
     nsparse::BufferedIOWriter bin;
-    nsparse::BufferedIOWriter dir;
-    writer.write(lists, vectors, &bin, &dir);
+    writer.write(lists, vectors, &bin);
 
-    const auto header = parse_bin_header(bin.data());
+    const auto header = parse_header(bin.data());
     EXPECT_EQ(header.element_size, nsparse::U16);
-    nsparse::InlineDirHeader dir_header{};
-    auto entries = parse_dir(dir.data(), dir_header);
-    EXPECT_EQ(dir_header.element_size, nsparse::U16);
+    nsparse::InlineForwardIndexTrailer trailer{};
+    auto entries = parse_dir(bin.data(), trailer);
     ASSERT_EQ(entries.size(), 2U);
     verify_block(bin.data(), entries[0], {0, 1}, vectors);
     verify_block(bin.data(), entries[1], {2}, vectors);
@@ -317,14 +329,12 @@ TEST(InlineForwardIndex, ElementSizeVariantsU8) {
 
     nsparse::InlineForwardIndexWriter writer;
     nsparse::BufferedIOWriter bin;
-    nsparse::BufferedIOWriter dir;
-    writer.write(lists, vectors, &bin, &dir);
+    writer.write(lists, vectors, &bin);
 
-    const auto header = parse_bin_header(bin.data());
+    const auto header = parse_header(bin.data());
     EXPECT_EQ(header.element_size, nsparse::U8);
-    nsparse::InlineDirHeader dir_header{};
-    auto entries = parse_dir(dir.data(), dir_header);
-    EXPECT_EQ(dir_header.element_size, nsparse::U8);
+    nsparse::InlineForwardIndexTrailer trailer{};
+    auto entries = parse_dir(bin.data(), trailer);
     ASSERT_EQ(entries.size(), 2U);
     verify_block(bin.data(), entries[0], {0, 1}, vectors);
     verify_block(bin.data(), entries[1], {2}, vectors);
@@ -336,13 +346,12 @@ TEST(InlineForwardIndex, SingleDocBlock) {
 
     nsparse::InlineForwardIndexWriter writer;
     nsparse::BufferedIOWriter bin;
-    nsparse::BufferedIOWriter dir;
-    writer.write(lists, vectors, &bin, &dir);
+    writer.write(lists, vectors, &bin);
 
-    const auto header = parse_bin_header(bin.data());
+    const auto header = parse_header(bin.data());
     EXPECT_EQ(header.n_blocks, 1U);
-    nsparse::InlineDirHeader dir_header{};
-    auto entries = parse_dir(dir.data(), dir_header);
+    nsparse::InlineForwardIndexTrailer trailer{};
+    auto entries = parse_dir(bin.data(), trailer);
     ASSERT_EQ(entries.size(), 1U);
     EXPECT_EQ(entries[0].n_docs, 1U);
     verify_block(bin.data(), entries[0], {0}, vectors);
@@ -356,11 +365,10 @@ TEST(InlineForwardIndex, EmptyClusterProducesZeroDocBlock) {
 
     nsparse::InlineForwardIndexWriter writer;
     nsparse::BufferedIOWriter bin;
-    nsparse::BufferedIOWriter dir;
-    writer.write(lists, vectors, &bin, &dir);
+    writer.write(lists, vectors, &bin);
 
-    nsparse::InlineDirHeader dir_header{};
-    auto entries = parse_dir(dir.data(), dir_header);
+    nsparse::InlineForwardIndexTrailer trailer{};
+    auto entries = parse_dir(bin.data(), trailer);
     ASSERT_EQ(entries.size(), 2U);
     EXPECT_EQ(entries[1].n_docs, 0U);
     EXPECT_EQ(entries[1].len, sizeof(uint32_t));  // just the n_docs prefix
@@ -379,14 +387,13 @@ TEST(InlineForwardIndex, EmptyListsContributeNoBlocks) {
 
     nsparse::InlineForwardIndexWriter writer;
     nsparse::BufferedIOWriter bin;
-    nsparse::BufferedIOWriter dir;
-    writer.write(lists, vectors, &bin, &dir);
+    writer.write(lists, vectors, &bin);
 
-    const auto header = parse_bin_header(bin.data());
+    const auto header = parse_header(bin.data());
     EXPECT_EQ(header.n_blocks, 1U);
-    nsparse::InlineDirHeader dir_header{};
-    auto entries = parse_dir(dir.data(), dir_header);
-    EXPECT_EQ(dir_header.n_lists, 2U);
+    nsparse::InlineForwardIndexTrailer trailer{};
+    auto entries = parse_dir(bin.data(), trailer);
+    EXPECT_EQ(trailer.n_lists, 2U);
     ASSERT_EQ(entries.size(), 1U);
     EXPECT_EQ(entries[0].pl, 0U);
     verify_block(bin.data(), entries[0], {0, 1}, vectors);
@@ -399,22 +406,24 @@ TEST(InlineForwardIndex, NoListsWritesEmptyDirectory) {
 
     nsparse::InlineForwardIndexWriter writer;
     nsparse::BufferedIOWriter bin;
-    nsparse::BufferedIOWriter dir;
-    writer.write(lists, vectors, &bin, &dir);
+    writer.write(lists, vectors, &bin);
 
-    const auto header = parse_bin_header(bin.data());
+    const auto page = nsparse::InlineForwardIndexWriter::kDefaultPageSize;
+    const auto header = parse_header(bin.data());
     EXPECT_EQ(header.n_blocks, 0U);
-    // Header is padded out to a full page even with no blocks, and the pad
-    // bytes are zero (the artifact must be byte-reproducible).
-    EXPECT_EQ(bin.data().size(),
-              nsparse::InlineForwardIndexWriter::kDefaultPageSize);
-    expect_zero_range(bin.data(), sizeof(nsparse::InlineForwardIndexHeader),
-                      nsparse::InlineForwardIndexWriter::kDefaultPageSize);
-    nsparse::InlineDirHeader dir_header{};
-    auto entries = parse_dir(dir.data(), dir_header);
-    EXPECT_EQ(dir_header.n_lists, 0U);
-    EXPECT_EQ(dir_header.n_entries, 0U);
+
+    nsparse::InlineForwardIndexTrailer trailer{};
+    auto entries = parse_dir(bin.data(), trailer);
+    EXPECT_EQ(trailer.n_lists, 0U);
+    EXPECT_EQ(trailer.n_entries, 0U);
     EXPECT_TRUE(entries.empty());
+    // With no blocks the directory starts at the (still page-aligned) first
+    // block offset; the file is header + pad + (empty dir) + trailer.
+    EXPECT_EQ(trailer.dir_offset, page);
+    EXPECT_EQ(bin.data().size(), expected_file_size(trailer));
+    // The header padding is zero-filled (byte-reproducible artifact).
+    expect_zero_range(bin.data(), sizeof(nsparse::InlineForwardIndexHeader),
+                      page);
 }
 
 TEST(InlineForwardIndex, CustomPageSizeAlignsBlocks) {
@@ -425,13 +434,12 @@ TEST(InlineForwardIndex, CustomPageSizeAlignsBlocks) {
 
     nsparse::InlineForwardIndexWriter writer(64);  // small power-of-two page
     nsparse::BufferedIOWriter bin;
-    nsparse::BufferedIOWriter dir;
-    writer.write(lists, vectors, &bin, &dir);
+    writer.write(lists, vectors, &bin);
 
-    const auto header = parse_bin_header(bin.data());
+    const auto header = parse_header(bin.data());
     EXPECT_EQ(header.page_size, 64U);
-    nsparse::InlineDirHeader dir_header{};
-    auto entries = parse_dir(dir.data(), dir_header);
+    nsparse::InlineForwardIndexTrailer trailer{};
+    auto entries = parse_dir(bin.data(), trailer);
     ASSERT_EQ(entries.size(), 2U);
     for (const auto& e : entries) {
         EXPECT_EQ(e.byte_off % 64U, 0U);
@@ -461,11 +469,10 @@ TEST(InlineForwardIndex, MultiPageBlockSpansAndPadsCorrectly) {
 
     nsparse::InlineForwardIndexWriter writer(32);
     nsparse::BufferedIOWriter bin;
-    nsparse::BufferedIOWriter dir;
-    writer.write(lists, vectors, &bin, &dir);
+    writer.write(lists, vectors, &bin);
 
-    nsparse::InlineDirHeader dir_header{};
-    auto entries = parse_dir(dir.data(), dir_header);
+    nsparse::InlineForwardIndexTrailer trailer{};
+    auto entries = parse_dir(bin.data(), trailer);
     ASSERT_EQ(entries.size(), 2U);
 
     // block0: page-aligned start, exact multi-page payload length.
@@ -488,13 +495,13 @@ TEST(InlineForwardIndex, MultiPageBlockSpansAndPadsCorrectly) {
     verify_block(bin.data(), entries[0], {0, 1, 2, 3}, vectors);
     verify_block(bin.data(), entries[1], {4, 5}, vectors);
 
-    // The file ends exactly at the last block's payload rounded up to a page,
-    // and every byte of the final trailing pad is zero (byte-reproducible).
-    const uint64_t total =
-        nsparse::inline_align_up(entries[1].byte_off + entries[1].len, 32);
-    EXPECT_EQ(bin.data().size(), total);
-    expect_zero_range(bin.data(), entries[1].byte_off + entries[1].len,
-                      bin.data().size());
+    // The directory starts at the last block's payload rounded up to a page,
+    // the last block's trailing pad is zero, and the file ends after the
+    // directory + trailer.
+    const uint64_t last_end = entries[1].byte_off + entries[1].len;
+    EXPECT_EQ(trailer.dir_offset, nsparse::inline_align_up(last_end, 32));
+    expect_zero_range(bin.data(), last_end, trailer.dir_offset);
+    EXPECT_EQ(bin.data().size(), expected_file_size(trailer));
 }
 
 TEST(InlineForwardIndex, ZeroNnzDocumentIsStored) {
@@ -504,11 +511,10 @@ TEST(InlineForwardIndex, ZeroNnzDocumentIsStored) {
 
     nsparse::InlineForwardIndexWriter writer;
     nsparse::BufferedIOWriter bin;
-    nsparse::BufferedIOWriter dir;
-    writer.write(lists, vectors, &bin, &dir);
+    writer.write(lists, vectors, &bin);
 
-    nsparse::InlineDirHeader dir_header{};
-    auto entries = parse_dir(dir.data(), dir_header);
+    nsparse::InlineForwardIndexTrailer trailer{};
+    auto entries = parse_dir(bin.data(), trailer);
     ASSERT_EQ(entries.size(), 1U);
     // n_docs(4) + doc0[doc_id(4)+nnz(4)] +
     // doc1[doc_id(4)+nnz(4)+comps(2)+val(4)]
@@ -524,9 +530,7 @@ TEST(InlineForwardIndex, RejectsUnsupportedElementSize) {
 
     nsparse::InlineForwardIndexWriter writer;
     nsparse::BufferedIOWriter bin;
-    nsparse::BufferedIOWriter dir;
-    EXPECT_THROW(writer.write(lists, vectors, &bin, &dir),
-                 std::invalid_argument);
+    EXPECT_THROW(writer.write(lists, vectors, &bin), std::invalid_argument);
 }
 
 TEST(InlineForwardIndex, RejectsNullWriter) {
@@ -535,9 +539,7 @@ TEST(InlineForwardIndex, RejectsNullWriter) {
     std::vector<nsparse::InvertedListClusters> lists;
 
     nsparse::InlineForwardIndexWriter writer;
-    nsparse::BufferedIOWriter dir;
-    EXPECT_THROW(writer.write(lists, vectors, nullptr, &dir),
-                 std::invalid_argument);
+    EXPECT_THROW(writer.write(lists, vectors, nullptr), std::invalid_argument);
 }
 
 TEST(InlineForwardIndex, RejectsOutOfRangeDocId) {
@@ -551,9 +553,7 @@ TEST(InlineForwardIndex, RejectsOutOfRangeDocId) {
     auto vectors_small = create_float_vectors({{0}, {1}}, {{1.0F}, {2.0F}}, 4);
     nsparse::InlineForwardIndexWriter writer;
     nsparse::BufferedIOWriter bin;
-    nsparse::BufferedIOWriter dir;
-    EXPECT_THROW(writer.write(lists, vectors_small, &bin, &dir),
-                 std::out_of_range);
+    EXPECT_THROW(writer.write(lists, vectors_small, &bin), std::out_of_range);
 }
 
 TEST(InlineForwardIndex, PackedLayoutHasNoPadding) {
@@ -574,16 +574,14 @@ TEST(InlineForwardIndex, PackedLayoutHasNoPadding) {
         nsparse::InlineForwardIndexWriter::kDefaultPageSize,
         nsparse::InlineLayout::kPacked);
     nsparse::BufferedIOWriter bin;
-    nsparse::BufferedIOWriter dir;
-    writer.write(lists, vectors, &bin, &dir);
+    writer.write(lists, vectors, &bin);
 
-    // Effective alignment 1 is recorded in both headers.
-    const auto header = parse_bin_header(bin.data());
+    // Effective alignment 1 is recorded in the header.
+    const auto header = parse_header(bin.data());
     EXPECT_EQ(header.page_size, 1U);
     EXPECT_EQ(header.n_blocks, 4U);
-    nsparse::InlineDirHeader dir_header{};
-    auto entries = parse_dir(dir.data(), dir_header);
-    EXPECT_EQ(dir_header.page_size, 1U);
+    nsparse::InlineForwardIndexTrailer trailer{};
+    auto entries = parse_dir(bin.data(), trailer);
     ASSERT_EQ(entries.size(), 4U);
 
     // Blocks are back-to-back: the first immediately follows the (unpadded)
@@ -593,8 +591,9 @@ TEST(InlineForwardIndex, PackedLayoutHasNoPadding) {
         EXPECT_EQ(e.byte_off, running);
         running += e.len;
     }
-    // The whole file is header + payloads, with no padding anywhere.
-    EXPECT_EQ(bin.data().size(), running);
+    // The directory follows the last block with no padding, then the trailer.
+    EXPECT_EQ(trailer.dir_offset, running);
+    EXPECT_EQ(bin.data().size(), expected_file_size(trailer));
 
     verify_block(bin.data(), entries[0], layout[0][0], vectors);
     verify_block(bin.data(), entries[1], layout[0][1], vectors);
@@ -605,8 +604,7 @@ TEST(InlineForwardIndex, PackedLayoutHasNoPadding) {
     // data.
     nsparse::InlineForwardIndexWriter padded_writer;  // default: page-aligned
     nsparse::BufferedIOWriter padded_bin;
-    nsparse::BufferedIOWriter padded_dir;
-    padded_writer.write(lists, vectors, &padded_bin, &padded_dir);
+    padded_writer.write(lists, vectors, &padded_bin);
     EXPECT_LT(bin.data().size(), padded_bin.data().size());
 }
 
@@ -624,16 +622,14 @@ TEST(InlineForwardIndex, PackedLayoutParityAcrossWidthsAndEdges) {
         nsparse::InlineForwardIndexWriter::kDefaultPageSize,
         nsparse::InlineLayout::kPacked);
     nsparse::BufferedIOWriter bin;
-    nsparse::BufferedIOWriter dir;
-    writer.write(lists, vectors, &bin, &dir);
+    writer.write(lists, vectors, &bin);
 
-    const auto header = parse_bin_header(bin.data());
+    const auto header = parse_header(bin.data());
     EXPECT_EQ(header.element_size, nsparse::U8);
     EXPECT_EQ(header.page_size, 1U);
-    nsparse::InlineDirHeader dir_header{};
-    auto entries = parse_dir(dir.data(), dir_header);
-    EXPECT_EQ(dir_header.element_size, nsparse::U8);
-    EXPECT_EQ(dir_header.n_lists, 2U);
+    nsparse::InlineForwardIndexTrailer trailer{};
+    auto entries = parse_dir(bin.data(), trailer);
+    EXPECT_EQ(trailer.n_lists, 2U);
     ASSERT_EQ(entries.size(), 3U);
 
     // Back-to-back from just after the header, no padding anywhere -- even with
@@ -643,7 +639,8 @@ TEST(InlineForwardIndex, PackedLayoutParityAcrossWidthsAndEdges) {
         EXPECT_EQ(e.byte_off, running);
         running += e.len;
     }
-    EXPECT_EQ(bin.data().size(), running);
+    EXPECT_EQ(trailer.dir_offset, running);
+    EXPECT_EQ(bin.data().size(), expected_file_size(trailer));
     EXPECT_EQ(entries[1].n_docs, 0U);             // the empty block
     EXPECT_EQ(entries[1].len, sizeof(uint32_t));  // just the n_docs prefix
 
