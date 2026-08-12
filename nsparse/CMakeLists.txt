@@ -21,6 +21,7 @@ set(NSPARSE_SRC
     io/buffered_io.cpp
     io/file_io.cpp
     io/index_io.cpp
+    io/inline_forward_index_writer.cpp
 )
 
 set(NSPARSE_HEADERS

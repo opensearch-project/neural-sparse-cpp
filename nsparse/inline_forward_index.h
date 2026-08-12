@@ -37,9 +37,6 @@ enum class InlineLayout : uint8_t { kPageAligned, kPacked };
 // Header at the start of the file (padded to page_size when page-aligned; none
 // when packed).
 struct InlineForwardIndexHeader {
-    static constexpr uint32_t kMagic = 0x4946534E;  // "NSFI"
-
-    uint32_t magic;
     uint32_t element_size;  // 1, 2, or 4
     uint64_t n_blocks;
     uint64_t page_size;  // effective alignment; 1 when packed
@@ -64,17 +61,13 @@ static_assert(std::is_standard_layout_v<InlineDirEntry>);
 static_assert(std::is_trivially_copyable_v<InlineDirEntry>);
 
 // Fixed-size trailer at EOF. A reader reads the last sizeof(trailer) bytes,
-// validates magic, then reads n_entries InlineDirEntry starting at dir_offset.
+// then reads n_entries InlineDirEntry starting at dir_offset.
 struct InlineForwardIndexTrailer {
-    static constexpr uint32_t kMagic = 0x5446534E;  // "NSFT"
-
-    uint32_t magic;
-    uint32_t reserved;    // 0
     uint64_t dir_offset;  // byte offset where the directory array begins
     uint64_t n_entries;   // number of InlineDirEntry (== header n_blocks)
     uint64_t n_lists;     // posting lists covered
 };
-static_assert(sizeof(InlineForwardIndexTrailer) == 32);
+static_assert(sizeof(InlineForwardIndexTrailer) == 24);
 static_assert(std::is_standard_layout_v<InlineForwardIndexTrailer>);
 static_assert(std::is_trivially_copyable_v<InlineForwardIndexTrailer>);
 

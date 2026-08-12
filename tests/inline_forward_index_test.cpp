@@ -230,14 +230,12 @@ TEST(InlineForwardIndex, HeaderTrailerAndDirectoryLayout) {
 
     const auto page = nsparse::InlineForwardIndexWriter::kDefaultPageSize;
     const auto header = parse_header(bin.data());
-    EXPECT_EQ(header.magic, nsparse::InlineForwardIndexHeader::kMagic);
     EXPECT_EQ(header.element_size, nsparse::U32);
     EXPECT_EQ(header.n_blocks, 4U);
     EXPECT_EQ(header.page_size, page);
 
     nsparse::InlineForwardIndexTrailer trailer{};
     auto entries = parse_dir(bin.data(), trailer);
-    EXPECT_EQ(trailer.magic, nsparse::InlineForwardIndexTrailer::kMagic);
     EXPECT_EQ(trailer.n_lists, 2U);
     EXPECT_EQ(trailer.n_entries, 4U);
     ASSERT_EQ(entries.size(), 4U);
