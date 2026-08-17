@@ -45,6 +45,9 @@ void InlineForwardIndexWriter::write(
     const SparseVectors& vectors, IOWriter* writer) const {
     throw_if_null(writer, "writer cannot be null");
 
+    static_assert(sizeof(term_t) == kInlineCompWidth,
+                  "component id width must match the inline format");
+
     const size_t element_size = vectors.get_element_size();
     if (element_size != 1 && element_size != 2 && element_size != 4) {
         throw std::invalid_argument(
@@ -62,7 +65,8 @@ void InlineForwardIndexWriter::write(
         n_blocks += list.cluster_size();
     }
 
-    // page_size when page-aligned, else 1 (packed: align_up is a no-op).
+    // page_size when page-aligned, else kMinBlockAlign (packed): blocks are
+    // still aligned to 8 so their sub-arrays stay in-place readable.
     const uint64_t align = alignment();
     const std::vector<uint8_t> zero_pad(align, 0);  // any pad < align
 
@@ -84,17 +88,31 @@ void InlineForwardIndexWriter::write(
 
     std::vector<InlineDirEntry> entries;
     entries.reserve(n_blocks);
+    // Reused per block to hold the structure-of-arrays header (doc ids + the
+    // within-block CSR offsets) before the comps/vals payloads.
+    std::vector<uint32_t> doc_ids;
+    std::vector<uint32_t> offsets;
     for (size_t pl = 0; pl < lists.size(); ++pl) {
         const InvertedListClusters& list = lists[pl];
         const size_t n_clusters = list.cluster_size();
         for (size_t block = 0; block < n_clusters; ++block) {
             const std::span<const idx_t> docs = list.get_docs(block);
             const uint64_t block_off = cur_off;
-
+            // n_docs and the within-block offsets are u32 on the wire.
+            if (docs.size() > UINT32_MAX) {
+                throw std::length_error(
+                    "InlineForwardIndexWriter: block has more than 2^32 docs");
+            }
             const uint32_t n_docs = static_cast<uint32_t>(docs.size());
-            writer->write(const_cast<uint32_t*>(&n_docs), sizeof(uint32_t), 1);
-            uint64_t block_len = sizeof(uint32_t);
 
+            // First pass: validate doc ids and build doc_id[]/off[] (the CSR
+            // prefix sum). off[] is u32, so the running total must stay < 2^32
+            // or it would wrap and desync the block from its recorded length.
+            doc_ids.clear();
+            offsets.assign(1, 0);
+            doc_ids.reserve(n_docs);
+            offsets.reserve(n_docs + 1);
+            uint64_t total_nnz = 0;
             for (const idx_t doc_id : docs) {
                 // Fail loudly on a bad doc id (asserts are off in Release).
                 if (doc_id < 0 || static_cast<size_t>(doc_id) >= num_vectors) {
@@ -103,29 +121,58 @@ void InlineForwardIndexWriter::write(
                         std::to_string(doc_id) + " outside [0, " +
                         std::to_string(num_vectors) + ")");
                 }
-                const idx_t start = indptr[doc_id];
-                const uint32_t nnz =
-                    static_cast<uint32_t>(indptr[doc_id + 1] - start);
+                total_nnz +=
+                    static_cast<uint64_t>(indptr[doc_id + 1] - indptr[doc_id]);
+                if (total_nnz > UINT32_MAX) {
+                    throw std::length_error(
+                        "InlineForwardIndexWriter: block total nnz exceeds the "
+                        "u32 offset range");
+                }
+                doc_ids.push_back(static_cast<uint32_t>(doc_id));
+                offsets.push_back(static_cast<uint32_t>(total_nnz));
+            }
+            const InlineBlockOffsets layout =
+                inline_block_offsets(n_docs, total_nnz, element_size);
 
-                uint32_t doc_id_u32 = static_cast<uint32_t>(doc_id);
-                writer->write(&doc_id_u32, sizeof(uint32_t), 1);
-                uint32_t nnz_field = nnz;
-                writer->write(&nnz_field, sizeof(uint32_t), 1);
+            // [n_docs][doc_id[]][off[]]
+            writer->write(const_cast<uint32_t*>(&n_docs), sizeof(uint32_t), 1);
+            if (n_docs > 0) {
+                writer->write(doc_ids.data(), sizeof(uint32_t), n_docs);
+            }
+            writer->write(offsets.data(), sizeof(uint32_t), n_docs + 1);
+
+            // comps[] then (pad to element_size) then vals[], each doc's slice
+            // concatenated in block order.
+            for (const idx_t doc_id : docs) {
+                const idx_t start = indptr[doc_id];
+                const size_t nnz = indptr[doc_id + 1] - start;
                 if (nnz > 0) {
                     writer->write(const_cast<term_t*>(indices + start),
                                   sizeof(term_t), nnz);
+                }
+            }
+            const uint64_t comps_end =
+                layout.comps + total_nnz * sizeof(term_t);
+            const uint64_t vals_pad = layout.vals - comps_end;
+            if (vals_pad > 0) {
+                writer->write(const_cast<uint8_t*>(zero_pad.data()), 1,
+                              vals_pad);
+            }
+            for (const idx_t doc_id : docs) {
+                const idx_t start = indptr[doc_id];
+                const size_t nnz = indptr[doc_id + 1] - start;
+                if (nnz > 0) {
                     writer->write(
                         const_cast<uint8_t*>(
                             values + static_cast<size_t>(start) * element_size),
-                        1, static_cast<size_t>(nnz) * element_size);
+                        1, nnz * element_size);
                 }
-                block_len += 2 * sizeof(uint32_t) +
-                             static_cast<uint64_t>(nnz) * sizeof(term_t) +
-                             static_cast<uint64_t>(nnz) * element_size;
             }
+
+            const uint64_t block_len = layout.end;
             cur_off += block_len;
 
-            // Pad to the next alignment boundary (no-op when packed).
+            // Pad to the next block-alignment boundary.
             const uint64_t padded = inline_align_up(cur_off, align);
             if (padded > cur_off) {
                 writer->write(const_cast<uint8_t*>(zero_pad.data()), 1,

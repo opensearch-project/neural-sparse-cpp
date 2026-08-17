@@ -37,9 +37,11 @@ public:
     uint64_t page_size() const { return page_size_; }
     InlineLayout layout() const { return layout_; }
 
-    // page_size when page-aligned, else 1 (packed).
+    // page_size when page-aligned, else kMinBlockAlign (packed): blocks are
+    // still aligned enough for their sub-arrays to be read in place.
     uint64_t alignment() const {
-        return layout_ == InlineLayout::kPageAligned ? page_size_ : 1;
+        return layout_ == InlineLayout::kPageAligned ? page_size_
+                                                     : kMinBlockAlign;
     }
 
 private:

@@ -21,25 +21,38 @@ namespace nsparse {
  * contiguous mmap read. Single file, host byte order, rebuildable (no
  * cross-version guarantee):
  *   [InlineForwardIndexHeader]  (padded to page_size when page-aligned)
- *   per block: [u32 n_docs] then n_docs records
- *              [u32 doc_id][u32 nnz][u16 comps[nnz]][vals nnz*element_size]
+ *   per block (structure-of-arrays, a within-block CSR):
+ *       [u32 n_docs]
+ *       [u32 doc_id[n_docs]]
+ *       [u32 off[n_docs + 1]]           within-block offsets into comps/vals
+ *       [u16 comps[total_nnz]]          term ids, total_nnz == off[n_docs]
+ *       (pad to element_size)
+ *       [vals[total_nnz * element_size]]
  *   [directory: n_entries x InlineDirEntry]  ((pl, block) -> byte range)
  *   [InlineForwardIndexTrailer]  (fixed size at EOF; locates the directory)
- * Records hold exactly what compute_similarity reads and have no per-field
- * padding, so a reader must use unaligned/memcpy loads. Writer:
- * io/inline_forward_index_writer.h; reader is P1.
+ * Blocks start on a kMinBlockAlign (or page_size) boundary and each array is
+ * laid out so it can be read in place as a typed array: doc_id/off are u32,
+ * comps is u16, and vals is padded up to element_size. Field widths are exactly
+ * what compute_similarity consumes. Writer: io/inline_forward_index_writer.h.
  */
 
-// Block placement: page-aligned (padded, mmap-friendly; default) or packed
-// (back-to-back, no padding). The header page_size records it (1 when packed).
+// Block placement: page-aligned (padded to page_size, mmap-friendly; default)
+// or packed (blocks back-to-back on the minimum kMinBlockAlign boundary that
+// keeps the per-block arrays readable in place). The header page_size records
+// the effective alignment.
 enum class InlineLayout : uint8_t { kPageAligned, kPacked };
 
-// Header at the start of the file (padded to page_size when page-aligned; none
-// when packed).
+// Minimum block-start alignment. Blocks begin on this boundary even when
+// packed, so doc_id/off (u32), comps (u16), and vals (<= 4-byte) sub-arrays all
+// land on an address their element type can be loaded from.
+inline constexpr uint64_t kMinBlockAlign = 8;
+
+// Header at the start of the file (padded to page_size when page-aligned; only
+// to kMinBlockAlign when packed).
 struct InlineForwardIndexHeader {
     uint32_t element_size;  // 1, 2, or 4
     uint64_t n_blocks;
-    uint64_t page_size;  // effective alignment; 1 when packed
+    uint64_t page_size;  // effective block alignment (>= kMinBlockAlign)
 };
 static_assert(sizeof(InlineForwardIndexHeader) == 24);
 static_assert(std::is_standard_layout_v<InlineForwardIndexHeader>);
@@ -51,8 +64,8 @@ static_assert(std::is_trivially_copyable_v<InlineForwardIndexHeader>);
 struct InlineDirEntry {
     uint32_t pl;
     uint32_t block;
-    uint64_t byte_off;  // block offset (page-aligned unless packed)
-    uint64_t len;       // payload length, excluding trailing padding
+    uint64_t byte_off;  // block offset (a multiple of the block alignment)
+    uint64_t len;       // payload length, excluding trailing block padding
     uint32_t n_docs;
     uint32_t reserved;  // 0 (pads the entry to 8-byte alignment)
 };
@@ -71,9 +84,42 @@ static_assert(sizeof(InlineForwardIndexTrailer) == 24);
 static_assert(std::is_standard_layout_v<InlineForwardIndexTrailer>);
 static_assert(std::is_trivially_copyable_v<InlineForwardIndexTrailer>);
 
+// Width of a component id on the wire (term_t is uint16_t; kept independent so
+// this format header carries no dependency on types.h).
+inline constexpr uint64_t kInlineCompWidth = sizeof(uint16_t);
+
 // Round offset up to the next multiple of alignment (> 0).
 inline uint64_t inline_align_up(uint64_t offset, uint64_t alignment) {
     return ((offset + alignment - 1) / alignment) * alignment;
+}
+
+// Byte offsets, relative to a block's start, of each structure-of-arrays
+// sub-array for a block holding `n_docs` documents and `total_nnz` nonzeros at
+// `element_size`-byte values. Shared by the writer and reader so their layout
+// can never drift. `end` is the block's payload length (the directory entry's
+// len, excluding trailing block padding).
+//
+// n_docs and total_nnz are u32 on the wire (doc_id[] and off[] are uint32_t),
+// so every product below stays within uint64 without an overflow check.
+struct InlineBlockOffsets {
+    uint64_t doc_ids;  // uint32_t[n_docs]
+    uint64_t off;      // uint32_t[n_docs + 1]
+    uint64_t comps;    // uint16_t[total_nnz]
+    uint64_t vals;     // element_size bytes * total_nnz
+    uint64_t end;
+};
+
+inline InlineBlockOffsets inline_block_offsets(uint64_t n_docs,
+                                               uint64_t total_nnz,
+                                               uint64_t element_size) {
+    InlineBlockOffsets o{};
+    o.doc_ids = sizeof(uint32_t);  // just past the [u32 n_docs] prefix
+    o.off = o.doc_ids + n_docs * sizeof(uint32_t);
+    o.comps = o.off + (n_docs + 1) * sizeof(uint32_t);
+    const uint64_t comps_end = o.comps + total_nnz * kInlineCompWidth;
+    o.vals = inline_align_up(comps_end, element_size);
+    o.end = o.vals + total_nnz * element_size;
+    return o;
 }
 
 }  // namespace nsparse

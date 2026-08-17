@@ -147,54 +147,63 @@ uint64_t expected_file_size(const nsparse::InlineForwardIndexTrailer& trailer) {
            sizeof(nsparse::InlineForwardIndexTrailer);
 }
 
-// Parse the block at entry.byte_off and assert every record reproduces the
-// source document's component ids and value bytes exactly, in the order given.
+// Parse the structure-of-arrays block at entry.byte_off and assert every
+// document's component ids and value bytes reproduce the source exactly, in
+// order. Layout: [n_docs][doc_id[]][off[]][comps[]](pad)[vals[]].
 void verify_block(const std::vector<uint8_t>& bin,
                   const nsparse::InlineDirEntry& entry,
                   const std::vector<nsparse::idx_t>& expected_docs,
                   const nsparse::SparseVectors& vectors) {
     ASSERT_LE(entry.byte_off + entry.len, bin.size());
     EXPECT_EQ(entry.reserved, 0U);  // reserved must be zero-filled
-    const uint8_t* base = bin.data();
-    size_t off = entry.byte_off;
+    const uint8_t* base = bin.data() + entry.byte_off;
 
-    const uint32_t n_docs = read_pod<uint32_t>(base + off);
-    off += sizeof(uint32_t);
+    const uint32_t n_docs = read_pod<uint32_t>(base);
     EXPECT_EQ(n_docs, entry.n_docs);
     ASSERT_EQ(n_docs, expected_docs.size());
 
+    // doc_id[] and off[] offsets are independent of total_nnz.
+    const size_t off_pos = sizeof(uint32_t) + n_docs * sizeof(uint32_t);
+    std::vector<uint32_t> off(n_docs + 1);
+    for (uint32_t i = 0; i <= n_docs; ++i) {
+        off[i] = read_pod<uint32_t>(base + off_pos + i * sizeof(uint32_t));
+    }
+    EXPECT_EQ(off[0], 0U);
+    const uint32_t total_nnz = off[n_docs];
     const size_t element_size = vectors.get_element_size();
+    const auto layout =
+        nsparse::inline_block_offsets(n_docs, total_nnz, element_size);
+    // The payload length recorded in the directory must be exact.
+    EXPECT_EQ(layout.end, entry.len);
+
     const auto* indptr = vectors.indptr_data();
     const auto* indices = vectors.indices_data();
     const auto* values = vectors.values_data();
 
     for (uint32_t i = 0; i < n_docs; ++i) {
-        const uint32_t doc_id = read_pod<uint32_t>(base + off);
-        off += sizeof(uint32_t);
-        const uint32_t nnz = read_pod<uint32_t>(base + off);
-        off += sizeof(uint32_t);
-
+        const uint32_t doc_id =
+            read_pod<uint32_t>(base + sizeof(uint32_t) + i * sizeof(uint32_t));
         EXPECT_EQ(doc_id, static_cast<uint32_t>(expected_docs[i]));
         ASSERT_LT(doc_id, vectors.num_vectors());  // guard before indexing
         const nsparse::idx_t start = indptr[doc_id];
         const uint32_t src_nnz =
             static_cast<uint32_t>(indptr[doc_id + 1] - start);
+        const uint32_t nnz = off[i + 1] - off[i];  // offsets are monotonic
         ASSERT_EQ(nnz, src_nnz);
 
-        EXPECT_EQ(0, std::memcmp(base + off, indices + start,
-                                 nnz * sizeof(nsparse::term_t)))
+        // Each doc's comps/vals slice starts at its within-block offset off[i].
+        EXPECT_EQ(0, std::memcmp(
+                         base + layout.comps + off[i] * sizeof(nsparse::term_t),
+                         indices + start, nnz * sizeof(nsparse::term_t)))
             << "component mismatch for doc " << doc_id;
-        off += nnz * sizeof(nsparse::term_t);
-
         EXPECT_EQ(
-            0, std::memcmp(base + off,
+            0, std::memcmp(base + layout.vals + off[i] * element_size,
                            values + static_cast<size_t>(start) * element_size,
                            static_cast<size_t>(nnz) * element_size))
             << "value bytes mismatch for doc " << doc_id;
-        off += static_cast<size_t>(nnz) * element_size;
     }
-    // The payload length recorded in the directory must be exact.
-    EXPECT_EQ(off - entry.byte_off, entry.len);
+    // vals must start on an element_size boundary so it can be read in place.
+    EXPECT_EQ((entry.byte_off + layout.vals) % element_size, 0U);
 }
 
 // Assert every byte in [from, to) of the buffer is zero (padding regions).
@@ -369,7 +378,9 @@ TEST(InlineForwardIndex, EmptyClusterProducesZeroDocBlock) {
     auto entries = parse_dir(bin.data(), trailer);
     ASSERT_EQ(entries.size(), 2U);
     EXPECT_EQ(entries[1].n_docs, 0U);
-    EXPECT_EQ(entries[1].len, sizeof(uint32_t));  // just the n_docs prefix
+    // Empty block: [n_docs=0][off[0]=0], no doc_id/comps/vals.
+    EXPECT_EQ(entries[1].len,
+              nsparse::inline_block_offsets(0, 0, nsparse::U32).end);
     verify_block(bin.data(), entries[0], {0, 1}, vectors);
     verify_block(bin.data(), entries[1], {}, vectors);
 }
@@ -439,8 +450,8 @@ TEST(InlineForwardIndex, CustomPageSizeAlignsBlocks) {
     nsparse::InlineForwardIndexTrailer trailer{};
     auto entries = parse_dir(bin.data(), trailer);
     ASSERT_EQ(entries.size(), 2U);
-    for (const auto& e : entries) {
-        EXPECT_EQ(e.byte_off % 64U, 0U);
+    for (const auto& entry : entries) {
+        EXPECT_EQ(entry.byte_off % 64U, 0U);
     }
     EXPECT_EQ(entries[0].byte_off, 64U);
     EXPECT_EQ(
@@ -451,7 +462,7 @@ TEST(InlineForwardIndex, CustomPageSizeAlignsBlocks) {
 }
 
 TEST(InlineForwardIndex, MultiPageBlockSpansAndPadsCorrectly) {
-    // Six docs, each nnz=2 -> record = 8 + 2*2 + 2*4 = 20 bytes.
+    // Six docs, each nnz=2.
     auto vectors =
         create_float_vectors({{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3}},
                              {{1.0F, 2.0F},
@@ -461,8 +472,8 @@ TEST(InlineForwardIndex, MultiPageBlockSpansAndPadsCorrectly) {
                               {9.0F, 10.0F},
                               {11.0F, 12.0F}},
                              10);
-    // block0 has 4 docs -> payload 4 + 4*20 = 84 bytes, spanning multiple
-    // 32-byte pages; block1 has 2 docs -> payload 4 + 2*20 = 44 bytes.
+    // block0 has 4 docs (total_nnz=8) -> SoA payload 88 bytes, spanning
+    // multiple 32-byte pages; block1 has 2 docs (total_nnz=4) -> 48 bytes.
     auto lists = build_lists({{{0, 1, 2, 3}, {4, 5}}}, vectors);
 
     nsparse::InlineForwardIndexWriter writer(32);
@@ -473,9 +484,14 @@ TEST(InlineForwardIndex, MultiPageBlockSpansAndPadsCorrectly) {
     auto entries = parse_dir(bin.data(), trailer);
     ASSERT_EQ(entries.size(), 2U);
 
+    const uint64_t len0 = nsparse::inline_block_offsets(4, 8, nsparse::U32).end;
+    const uint64_t len1 = nsparse::inline_block_offsets(2, 4, nsparse::U32).end;
+    EXPECT_EQ(len0, 88U);
+    EXPECT_EQ(len1, 48U);
+
     // block0: page-aligned start, exact multi-page payload length.
     EXPECT_EQ(entries[0].byte_off, 32U);
-    EXPECT_EQ(entries[0].len, 4U + 4U * 20U);  // 84, > 2 pages
+    EXPECT_EQ(entries[0].len, len0);  // 88, > 2 pages
     EXPECT_GT(entries[0].len, 64U);
     // block1 begins at the next page boundary after block0's payload, which is
     // more than one page past block0's start.
@@ -484,7 +500,7 @@ TEST(InlineForwardIndex, MultiPageBlockSpansAndPadsCorrectly) {
     EXPECT_EQ(entries[1].byte_off, expected1);
     EXPECT_EQ(entries[1].byte_off % 32U, 0U);
     EXPECT_GT(entries[1].byte_off - entries[0].byte_off, 32U);
-    EXPECT_EQ(entries[1].len, 4U + 2U * 20U);  // 44
+    EXPECT_EQ(entries[1].len, len1);  // 48
 
     // Inter-block padding bytes are zero.
     expect_zero_range(bin.data(), entries[0].byte_off + entries[0].len,
@@ -514,9 +530,12 @@ TEST(InlineForwardIndex, ZeroNnzDocumentIsStored) {
     nsparse::InlineForwardIndexTrailer trailer{};
     auto entries = parse_dir(bin.data(), trailer);
     ASSERT_EQ(entries.size(), 1U);
-    // n_docs(4) + doc0[doc_id(4)+nnz(4)] +
-    // doc1[doc_id(4)+nnz(4)+comps(2)+val(4)]
-    EXPECT_EQ(entries[0].len, 4U + 8U + 14U);
+    // SoA: n_docs + doc_id[2] + off[3] + comps[1]=2B, pad 2B, vals[1]=4B.
+    // = 4 + 8 + 12 + 2 + 2 + 4 = 32.
+    EXPECT_EQ(entries[0].len, nsparse::inline_block_offsets(
+                                  /*n_docs=*/2, /*total_nnz=*/1, nsparse::U32)
+                                  .end);
+    EXPECT_EQ(entries[0].len, 32U);
     verify_block(bin.data(), entries[0], {0, 1}, vectors);
 }
 
@@ -554,7 +573,7 @@ TEST(InlineForwardIndex, RejectsOutOfRangeDocId) {
     EXPECT_THROW(writer.write(lists, vectors_small, &bin), std::out_of_range);
 }
 
-TEST(InlineForwardIndex, PackedLayoutHasNoPadding) {
+TEST(InlineForwardIndex, PackedLayoutMinimalAlignment) {
     auto vectors =
         create_float_vectors({{0, 3}, {1}, {2, 4, 6}, {0, 9}, {5}, {3, 7}},
                              {{1.0F, 2.0F},
@@ -574,22 +593,26 @@ TEST(InlineForwardIndex, PackedLayoutHasNoPadding) {
     nsparse::BufferedIOWriter bin;
     writer.write(lists, vectors, &bin);
 
-    // Effective alignment 1 is recorded in the header.
+    // Packed records the minimum block alignment as the effective alignment.
     const auto header = parse_header(bin.data());
-    EXPECT_EQ(header.page_size, 1U);
+    EXPECT_EQ(header.page_size, nsparse::kMinBlockAlign);
     EXPECT_EQ(header.n_blocks, 4U);
     nsparse::InlineForwardIndexTrailer trailer{};
     auto entries = parse_dir(bin.data(), trailer);
     ASSERT_EQ(entries.size(), 4U);
 
-    // Blocks are back-to-back: the first immediately follows the (unpadded)
-    // header and each subsequent block begins exactly where the previous ended.
+    // Blocks are back-to-back except for the minimal kMinBlockAlign padding:
+    // the first follows the header (rounded up) and each next begins where the
+    // previous ended, rounded up to kMinBlockAlign. Every block is aligned.
     uint64_t running = sizeof(nsparse::InlineForwardIndexHeader);
-    for (const auto& e : entries) {
-        EXPECT_EQ(e.byte_off, running);
-        running += e.len;
+    for (const auto& entry : entries) {
+        running = nsparse::inline_align_up(running, nsparse::kMinBlockAlign);
+        EXPECT_EQ(entry.byte_off, running);
+        EXPECT_EQ(entry.byte_off % nsparse::kMinBlockAlign, 0U);
+        running += entry.len;
     }
-    // The directory follows the last block with no padding, then the trailer.
+    // The directory follows the last (aligned) block, then the trailer.
+    running = nsparse::inline_align_up(running, nsparse::kMinBlockAlign);
     EXPECT_EQ(trailer.dir_offset, running);
     EXPECT_EQ(bin.data().size(), expected_file_size(trailer));
 
@@ -624,23 +647,26 @@ TEST(InlineForwardIndex, PackedLayoutParityAcrossWidthsAndEdges) {
 
     const auto header = parse_header(bin.data());
     EXPECT_EQ(header.element_size, nsparse::U8);
-    EXPECT_EQ(header.page_size, 1U);
+    EXPECT_EQ(header.page_size, nsparse::kMinBlockAlign);
     nsparse::InlineForwardIndexTrailer trailer{};
     auto entries = parse_dir(bin.data(), trailer);
     EXPECT_EQ(trailer.n_lists, 2U);
     ASSERT_EQ(entries.size(), 3U);
 
-    // Back-to-back from just after the header, no padding anywhere -- even with
-    // an empty block (len == 4) and a zero-nnz record in the mix.
+    // Back-to-back on the kMinBlockAlign grid -- even with an empty block and a
+    // zero-nnz doc in the mix.
     uint64_t running = sizeof(nsparse::InlineForwardIndexHeader);
-    for (const auto& e : entries) {
-        EXPECT_EQ(e.byte_off, running);
-        running += e.len;
+    for (const auto& entry : entries) {
+        running = nsparse::inline_align_up(running, nsparse::kMinBlockAlign);
+        EXPECT_EQ(entry.byte_off, running);
+        running += entry.len;
     }
+    running = nsparse::inline_align_up(running, nsparse::kMinBlockAlign);
     EXPECT_EQ(trailer.dir_offset, running);
     EXPECT_EQ(bin.data().size(), expected_file_size(trailer));
-    EXPECT_EQ(entries[1].n_docs, 0U);             // the empty block
-    EXPECT_EQ(entries[1].len, sizeof(uint32_t));  // just the n_docs prefix
+    EXPECT_EQ(entries[1].n_docs, 0U);  // the empty block
+    EXPECT_EQ(entries[1].len,
+              nsparse::inline_block_offsets(0, 0, nsparse::U8).end);
 
     verify_block(bin.data(), entries[0], {0, 1}, vectors);
     verify_block(bin.data(), entries[1], {}, vectors);

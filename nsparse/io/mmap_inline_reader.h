@@ -14,49 +14,47 @@
 #include <cstdint>
 
 #include "nsparse/inline_forward_index.h"
+#include "nsparse/types.h"
 #include "nsparse/utils/buf.h"
 #include "nsparse/utils/mmap_file.h"
 
-namespace nsparse {
+// Internal query-time machinery; not exposed to Python/JNI, hence detail.
+namespace nsparse::detail {
 
-// A read-only view of one block inside the mapping. `data` points at the
-// block's [n_docs] prefix; `data == nullptr` means the (pl, block) does not
-// exist.
+// A read-only, in-place view of one block's structure-of-arrays (a within-block
+// CSR). Every array points into the file mapping and is aligned for its element
+// type, so it can be read directly. `doc_ids == nullptr` means the (pl, block)
+// does not exist; a present block with n_docs == 0 has non-null (empty) arrays.
 struct BlockView {
-    const uint8_t* data = nullptr;
-    uint64_t len = 0;
     uint32_t n_docs = 0;
+    const uint32_t* doc_ids = nullptr;  // [n_docs] global doc ids
+    const uint32_t* offsets = nullptr;  // [n_docs + 1] within-block CSR offsets
+    const term_t* comps = nullptr;      // [offsets[n_docs]] component ids
+    const uint8_t* vals = nullptr;      // element_size bytes * offsets[n_docs]
 
-    // First document record (just past the n_docs prefix).
-    const uint8_t* records() const {
-        return data != nullptr ? data + sizeof(uint32_t) : nullptr;
+    bool absent() const { return doc_ids == nullptr; }
+
+    // Component count / component ids / value bytes of the i-th doc (i <
+    // n_docs).
+    uint32_t nnz(uint32_t i) const { return offsets[i + 1] - offsets[i]; }
+    const term_t* doc_comps(uint32_t i) const { return comps + offsets[i]; }
+    const uint8_t* doc_vals(uint32_t i, size_t element_size) const {
+        return vals + static_cast<size_t>(offsets[i]) * element_size;
     }
 };
-
-// One document record. comps/vals point into the mapping and are NOT naturally
-// aligned -- read them with unaligned/memcpy loads.
-struct InlineDocRecord {
-    uint32_t doc_id;
-    uint32_t nnz;
-    const uint8_t* comps;  // nnz x uint16_t
-    const uint8_t* vals;   // nnz x element_size bytes
-};
-
-// Parse the record at `cursor` and advance it past the record. `end` bounds the
-// block (data + len); throws std::runtime_error if the record would overrun it.
-InlineDocRecord read_inline_record(const uint8_t*& cursor, const uint8_t* end,
-                                   size_t element_size);
 
 // Query-time reader for the inline forward-index file (format in
 // inline_forward_index.h). Maps the file read-only through MmapFile and copies
 // the directory into RAM for O(1) (pl, block) lookup. Move-only.
 //
-// The constructor throws std::invalid_argument on a null path (a programming
-// error) and std::runtime_error on an unopenable or malformed file.
+// A block's sub-arrays are laid out and aligned so they are handed back as
+// typed pointers into the mapping (no copy); block() validates the block's
+// internal offsets against its recorded length before returning the view.
 //
-// Block payloads are compact, 2-byte-packed records read with unaligned loads,
-// so they are handed out as raw BlockView spans into the mapping rather than
-// borrowed through MmapCursor/io_align, which assume element-aligned arrays.
+// The constructor throws std::invalid_argument on a null path (a programming
+// error) and std::runtime_error on an unopenable or malformed file. block()
+// likewise throws std::runtime_error if a looked-up block's interior is corrupt
+// (fail-closed: it never returns an out-of-bounds view).
 class MmapInlineReader {
 public:
     explicit MmapInlineReader(const char* path);
@@ -82,7 +80,9 @@ public:
     BlockView block(uint32_t pl, uint32_t block) const;
 
 private:
-    void parse();  // validate header/trailer, load directory, build the index
+    void load_directory();  // validate header/trailer, load directory to RAM
+    // Validate a block's internal structure and build an in-place SoA view.
+    BlockView view_block(const InlineDirEntry& entry) const;
 
     MmapFile mapped_file_;  // read-only file mapping the blocks live in
     size_t element_size_ = 0;
@@ -91,6 +91,6 @@ private:
     Buf<uint64_t> list_offset_;    // start of each list in entries_
 };
 
-}  // namespace nsparse
+}  // namespace nsparse::detail
 
 #endif  // MMAP_INLINE_READER_H
