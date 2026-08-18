@@ -49,3 +49,6 @@ third_party/
 
 # build
 build/
+
+# claude
+.claude/settings.local.json
