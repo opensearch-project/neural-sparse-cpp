@@ -21,8 +21,7 @@ set(NSPARSE_SRC
     io/buffered_io.cpp
     io/file_io.cpp
     io/index_io.cpp
-    io/inline_forward_index_writer.cpp
-    io/mmap_inline_reader.cpp
+    io/inline_forward_index_io.cpp
     utils/csr_layout.cpp
 )
 
@@ -59,8 +58,7 @@ set(NSPARSE_HEADERS
     io/align.h
     io/buffered_io.h
     io/seismic_invlists_writer.h
-    io/inline_forward_index_writer.h
-    io/mmap_inline_reader.h
+    io/inline_forward_index_io.h
     io/file_io.h
     io/index_io.h
 )

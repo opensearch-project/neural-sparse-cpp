@@ -73,6 +73,34 @@ public:
         pos_ += bytes;
     }
 
+    // Absolute reposition. Unlike skip() it can move backward -- for a format
+    // whose footer/header records per-section offsets, so a section is
+    // reachable without walking everything before it. pos == size
+    // (one-past-end, remaining() == 0) stays legal, preserving the pos_ <=
+    // size_ invariant ensure() relies on.
+    void seek(size_t pos) {
+        if (pos > size_) {
+            throw std::runtime_error("mmap: seek past end of index file");
+        }
+        pos_ = pos;
+    }
+
+    // A fresh cursor bounded to [offset, offset + len) of this cursor's buffer,
+    // so a section parses -- and a corrupt length faults -- within its own
+    // window. `offset` is measured from the buffer base, independent of the
+    // current position. Does not touch this cursor (safe for concurrent
+    // per-section use).
+    [[nodiscard]] MmapCursor subcursor(size_t offset, size_t len) const {
+        if (offset > size_ || len > size_ - offset) {
+            throw std::runtime_error("mmap: subcursor out of range");
+        }
+        return MmapCursor(data_ + offset, len);
+    }
+
+    // Pointer at the current position, non-mutating: lets a caller record where
+    // a borrowed section begins before navigating within it.
+    [[nodiscard]] const uint8_t* current() const { return data_ + pos_; }
+
     [[nodiscard]] size_t pos() const { return pos_; }
     [[nodiscard]] size_t remaining() const { return size_ - pos_; }
 

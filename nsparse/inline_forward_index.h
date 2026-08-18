@@ -33,7 +33,7 @@ namespace nsparse {
  * Blocks start on a kMinBlockAlign (or page_size) boundary and each array is
  * laid out so it can be read in place as a typed array: doc_id/off are u32,
  * comps is u16, and vals is padded up to element_size. Field widths are exactly
- * what compute_similarity consumes. Writer: io/inline_forward_index_writer.h.
+ * what compute_similarity consumes. Component: io/inline_forward_index_io.h.
  */
 
 // Block placement: page-aligned (padded to page_size, mmap-friendly; default)
