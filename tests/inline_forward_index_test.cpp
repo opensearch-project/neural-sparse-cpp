@@ -30,7 +30,14 @@
 namespace {
 
 using nsparse::detail::BlockView;
+using nsparse::detail::inline_align_up;
+using nsparse::detail::inline_block_offsets;
+using nsparse::detail::InlineDirEntry;
 using nsparse::detail::InlineForwardIndex;
+using nsparse::detail::InlineForwardIndexHeader;
+using nsparse::detail::InlineForwardIndexTrailer;
+using nsparse::detail::InlineLayout;
+using nsparse::detail::kMinBlockAlign;
 
 constexpr float kAlpha = 0.5F;
 
@@ -103,7 +110,7 @@ std::vector<uint8_t> serialize_bytes(
     const std::vector<nsparse::InvertedListClusters>& lists,
     const nsparse::SparseVectors& vectors,
     uint64_t page = InlineForwardIndex::kDefaultPageSize,
-    nsparse::InlineLayout layout = nsparse::InlineLayout::kPageAligned) {
+    InlineLayout layout = InlineLayout::kPageAligned) {
     InlineForwardIndex writer(lists, vectors, page, layout);
     nsparse::BufferedIOWriter buffer;
     writer.serialize(&buffer);
@@ -120,23 +127,21 @@ InlineForwardIndex read_index(const std::vector<uint8_t>& bytes) {
     return index;
 }
 
-nsparse::InlineForwardIndexHeader parse_header(
-    const std::vector<uint8_t>& bin) {
-    return read_pod<nsparse::InlineForwardIndexHeader>(bin.data() + kLenPrefix);
+InlineForwardIndexHeader parse_header(const std::vector<uint8_t>& bin) {
+    return read_pod<InlineForwardIndexHeader>(bin.data() + kLenPrefix);
 }
 
-std::vector<nsparse::InlineDirEntry> parse_dir(
-    const std::vector<uint8_t>& bin,
-    nsparse::InlineForwardIndexTrailer& trailer_out) {
-    const size_t tsz = sizeof(nsparse::InlineForwardIndexTrailer);
+std::vector<InlineDirEntry> parse_dir(const std::vector<uint8_t>& bin,
+                                      InlineForwardIndexTrailer& trailer_out) {
+    const size_t tsz = sizeof(InlineForwardIndexTrailer);
     // The trailer is the last bytes of the body, i.e. of the whole buffer.
-    trailer_out = read_pod<nsparse::InlineForwardIndexTrailer>(
-        bin.data() + bin.size() - tsz);
-    std::vector<nsparse::InlineDirEntry> entries(trailer_out.n_entries);
+    trailer_out =
+        read_pod<InlineForwardIndexTrailer>(bin.data() + bin.size() - tsz);
+    std::vector<InlineDirEntry> entries(trailer_out.n_entries);
     for (uint64_t i = 0; i < trailer_out.n_entries; ++i) {
-        entries[i] = read_pod<nsparse::InlineDirEntry>(
-            bin.data() + kLenPrefix + trailer_out.dir_offset +
-            i * sizeof(nsparse::InlineDirEntry));
+        entries[i] = read_pod<InlineDirEntry>(bin.data() + kLenPrefix +
+                                              trailer_out.dir_offset +
+                                              i * sizeof(InlineDirEntry));
     }
     return entries;
 }
@@ -195,8 +200,7 @@ nsparse::SparseVectors sample_float_vectors() {
 // The file offset of the first packed block (right after the header, rounded
 // up to the block alignment).
 uint64_t packed_first_block_off() {
-    return nsparse::inline_align_up(sizeof(nsparse::InlineForwardIndexHeader),
-                                    nsparse::kMinBlockAlign);
+    return inline_align_up(sizeof(InlineForwardIndexHeader), kMinBlockAlign);
 }
 
 }  // namespace
@@ -214,7 +218,7 @@ TEST(InlineForwardIndex, SerializesHeaderTrailerAndDirectory) {
     EXPECT_EQ(header.n_blocks, 4U);
     EXPECT_EQ(header.page_size, page);
 
-    nsparse::InlineForwardIndexTrailer trailer{};
+    InlineForwardIndexTrailer trailer{};
     auto entries = parse_dir(bin, trailer);
     EXPECT_EQ(trailer.n_lists, 2U);
     ASSERT_EQ(entries.size(), 4U);
@@ -233,15 +237,15 @@ TEST(InlineForwardIndex, PackedLayoutMinimalAlignment) {
     auto lists = build_lists(kLayout, vectors);
     const auto packed =
         serialize_bytes(lists, vectors, InlineForwardIndex::kDefaultPageSize,
-                        nsparse::InlineLayout::kPacked);
+                        InlineLayout::kPacked);
     const auto padded = serialize_bytes(lists, vectors);  // page-aligned
 
-    EXPECT_EQ(parse_header(packed).page_size, nsparse::kMinBlockAlign);
-    nsparse::InlineForwardIndexTrailer trailer{};
+    EXPECT_EQ(parse_header(packed).page_size, kMinBlockAlign);
+    InlineForwardIndexTrailer trailer{};
     auto entries = parse_dir(packed, trailer);
-    uint64_t running = sizeof(nsparse::InlineForwardIndexHeader);
+    uint64_t running = sizeof(InlineForwardIndexHeader);
     for (const auto& entry : entries) {
-        running = nsparse::inline_align_up(running, nsparse::kMinBlockAlign);
+        running = inline_align_up(running, kMinBlockAlign);
         EXPECT_EQ(entry.byte_off, running);
         running += entry.len;
     }
@@ -319,9 +323,9 @@ TEST(InlineForwardIndex, RoundTripPacked) {
     auto lists = build_lists(kLayout, vectors);
     const auto bin =
         serialize_bytes(lists, vectors, InlineForwardIndex::kDefaultPageSize,
-                        nsparse::InlineLayout::kPacked);
+                        InlineLayout::kPacked);
     auto index = read_index(bin);
-    EXPECT_EQ(index.page_size(), nsparse::kMinBlockAlign);
+    EXPECT_EQ(index.page_size(), kMinBlockAlign);
     verify_block(index, index.block(0, 0), kLayout[0][0], vectors);
     verify_block(index, index.block(1, 1), kLayout[1][1], vectors);
 }
@@ -399,24 +403,30 @@ TEST(InlineForwardIndex, SparseListsEmptyBlocksAndAbsentLookups) {
     EXPECT_TRUE(index.block(9, 0).absent());  // posting list out of range
 }
 
-// The component leaves the cursor just past its section, using only its own
-// bytes -- data before and after it is untouched.
-TEST(InlineForwardIndex, ReadsAsComponentFromSharedCursor) {
+// Composes at an unaligned stream offset. A 4-byte leading component leaves
+// serialize() at pos 4, so its pad_to(kMinBlockAlign) has real work to do -- a
+// missing pad would put the section base off a boundary and make the block
+// sub-arrays unreadable. Everything goes through one writer (the real
+// composition path, not a manual splice), and reading back through one cursor
+// the reader skips that padding and lands exactly on the trailing marker, with
+// the leading marker untouched.
+TEST(InlineForwardIndex, ComposesAtAnUnalignedStreamOffset) {
     auto vectors = sample_float_vectors();
     auto lists = build_lists(kLayout, vectors);
-    const auto section = serialize_bytes(lists, vectors);
 
-    const size_t prefix = 16;  // multiple of 8, keeps the section base aligned
-    const uint32_t suffix_marker = 0xABCDEF01;
-    std::vector<uint8_t> stream(prefix, 0x5A);
-    stream.insert(stream.end(), section.begin(), section.end());
-    const uint8_t* mark = reinterpret_cast<const uint8_t*>(&suffix_marker);
-    stream.insert(stream.end(), mark, mark + sizeof(suffix_marker));
+    uint32_t lead_marker = 0x11223344;
+    uint32_t suffix_marker = 0xABCDEF01;
+    nsparse::BufferedIOWriter writer;
+    writer.write(&lead_marker, sizeof(uint32_t), 1);
+    ASSERT_EQ(writer.pos() % kMinBlockAlign, 4U);  // section starts unaligned
+    InlineForwardIndex(lists, vectors).serialize(&writer);
+    writer.write(&suffix_marker, sizeof(uint32_t), 1);
+    const auto stream = writer.data();
 
     nsparse::MmapCursor cursor(stream.data(), stream.size());
-    cursor.skip(prefix);
+    EXPECT_EQ(cursor.read_scalar<uint32_t>(), lead_marker);
     InlineForwardIndex index;
-    index.mmap_deserialize(&cursor);  // reads its own length; self-advances
+    index.mmap_deserialize(&cursor);  // skips pad, reads length, self-advances
 
     verify_block(index, index.block(0, 0), kLayout[0][0], vectors);
     EXPECT_EQ(cursor.read_scalar<uint32_t>(), suffix_marker);  // left just past
@@ -492,11 +502,11 @@ TEST(InlineForwardIndex, CorruptMisalignedBlockRejected) {
     auto vectors = sample_float_vectors();
     auto bin = serialize_bytes(build_lists(kLayout, vectors), vectors,
                                InlineForwardIndex::kDefaultPageSize,
-                               nsparse::InlineLayout::kPacked);
-    nsparse::InlineForwardIndexTrailer trailer{};
+                               InlineLayout::kPacked);
+    InlineForwardIndexTrailer trailer{};
     parse_dir(bin, trailer);
-    const size_t field = body_off(trailer.dir_offset +
-                                  offsetof(nsparse::InlineDirEntry, byte_off));
+    const size_t field =
+        body_off(trailer.dir_offset + offsetof(InlineDirEntry, byte_off));
     const uint64_t misaligned = packed_first_block_off() + 1;
     std::memcpy(bin.data() + field, &misaligned, sizeof(misaligned));
     nsparse::MmapCursor cursor(bin.data(), bin.size());
@@ -507,12 +517,11 @@ TEST(InlineForwardIndex, CorruptMisalignedBlockRejected) {
 TEST(InlineForwardIndex, CorruptDirectoryOrderRejected) {
     auto vectors = sample_float_vectors();
     auto bin = serialize_bytes(build_lists(kLayout, vectors), vectors);
-    nsparse::InlineForwardIndexTrailer trailer{};
+    InlineForwardIndexTrailer trailer{};
     parse_dir(bin, trailer);
     // entry[1] should be (pl0, block1); give it a gap block index.
-    const size_t field =
-        body_off(trailer.dir_offset + sizeof(nsparse::InlineDirEntry) +
-                 offsetof(nsparse::InlineDirEntry, block));
+    const size_t field = body_off(trailer.dir_offset + sizeof(InlineDirEntry) +
+                                  offsetof(InlineDirEntry, block));
     const uint32_t bad_block = 5;
     std::memcpy(bin.data() + field, &bad_block, sizeof(bad_block));
     nsparse::MmapCursor cursor(bin.data(), bin.size());
@@ -527,11 +536,11 @@ namespace {
 std::vector<uint8_t> two_doc_packed_bytes(const nsparse::SparseVectors& v) {
     return serialize_bytes(build_lists({{{0, 1}}}, v), v,
                            InlineForwardIndex::kDefaultPageSize,
-                           nsparse::InlineLayout::kPacked);
+                           InlineLayout::kPacked);
 }
 size_t off_field_pos(uint32_t i) {
     return body_off(packed_first_block_off() +
-                    nsparse::inline_block_offsets(2, 0, nsparse::U32).off +
+                    inline_block_offsets(2, 0, nsparse::U32).off +
                     i * sizeof(uint32_t));
 }
 }  // namespace
@@ -583,8 +592,7 @@ TEST(InlineForwardIndex, EmptyRoundTrip) {
     nsparse::SparseVectors vectors(
         {.element_size = nsparse::U32, .dimension = 4});
     std::vector<nsparse::InvertedListClusters> lists;  // no lists, no blocks
-    for (auto layout : {nsparse::InlineLayout::kPageAligned,
-                        nsparse::InlineLayout::kPacked}) {
+    for (auto layout : {InlineLayout::kPageAligned, InlineLayout::kPacked}) {
         const auto bin = serialize_bytes(
             lists, vectors, InlineForwardIndex::kDefaultPageSize, layout);
         auto index = read_index(bin);
@@ -601,7 +609,7 @@ TEST(InlineForwardIndex, CustomPageSizeRoundTrip) {
         {{1.0F, 2.0F}, {3.0F, 4.0F}, {5.0F, 6.0F}, {7.0F, 8.0F}}, 10);
     auto lists = build_lists({{{0, 1, 2, 3}}}, vectors);
     const auto bin = serialize_bytes(lists, vectors, 64);
-    nsparse::InlineForwardIndexTrailer trailer{};
+    InlineForwardIndexTrailer trailer{};
     auto entries = parse_dir(bin, trailer);
     ASSERT_EQ(entries.size(), 1U);
     EXPECT_EQ(entries[0].byte_off % 64U, 0U);

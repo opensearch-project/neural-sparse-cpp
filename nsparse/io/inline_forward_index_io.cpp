@@ -20,7 +20,7 @@
 
 #include "nsparse/cluster/inverted_list_clusters.h"
 #include "nsparse/inline_forward_index.h"
-#include "nsparse/io/buffered_io.h"
+#include "nsparse/io/align.h"
 #include "nsparse/io/io.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
@@ -29,7 +29,7 @@
 
 namespace nsparse::detail {
 
-// The record bounds math (nnz up to 2^32-1 times record width) assumes a
+// The record bounds math (nnz up to INT32_MAX times record width) assumes a
 // 64-bit size_t so it cannot overflow.
 static_assert(sizeof(size_t) >= 8, "InlineForwardIndex assumes 64-bit size_t");
 
@@ -96,23 +96,95 @@ InlineForwardIndex& InlineForwardIndex::operator=(
     return *this;
 }
 
+InlineForwardIndex::BlockCounts InlineForwardIndex::count_block(
+    std::span<const idx_t> docs, const idx_t* indptr, size_t num_vectors) {
+    // n_docs and the within-block offsets are u32 on the wire.
+    if (docs.size() > UINT32_MAX) {
+        throw std::length_error(
+            "InlineForwardIndex: block has more than 2^32 docs");
+    }
+    const uint32_t n_docs = static_cast<uint32_t>(docs.size());
+    uint64_t total_nnz = 0;
+    for (const idx_t doc_id : docs) {
+        if (doc_id < 0 || static_cast<size_t>(doc_id) >= num_vectors) {
+            throw std::out_of_range(
+                "InlineForwardIndex: block references doc id " +
+                std::to_string(doc_id) + " outside [0, " +
+                std::to_string(num_vectors) + ")");
+        }
+        total_nnz += static_cast<uint64_t>(indptr[doc_id + 1] - indptr[doc_id]);
+        // Capped at INT32_MAX (not the u32 max): off[] is uint32_t on the wire
+        // but must stay reinterpretable as idx_t (int32_t) on the search path,
+        // and a wrapped offset would also desync the block from its length.
+        if (total_nnz > static_cast<uint64_t>(INT32_MAX)) {
+            throw std::length_error(
+                "InlineForwardIndex: block total nnz exceeds INT32_MAX");
+        }
+    }
+    return {n_docs, total_nnz};
+}
+
+uint64_t InlineForwardIndex::section_length() const {
+    const std::vector<InvertedListClusters>& lists = *lists_;
+    const SparseVectors& vectors = *vectors_;
+    const size_t element_size = vectors.get_element_size();
+    if (element_size != 1 && element_size != 2 && element_size != 4) {
+        throw std::invalid_argument(
+            "InlineForwardIndex: element_size must be 1, 2, or 4, got " +
+            std::to_string(element_size));
+    }
+    const idx_t* indptr = vectors.indptr_data();
+    const size_t num_vectors = vectors.num_vectors();
+    const uint64_t align = write_alignment();
+
+    uint64_t n_blocks = 0;
+    for (const auto& list : lists) {
+        n_blocks += list.cluster_size();
+    }
+
+    // Mirror write_body's offset accounting exactly (both go through the shared
+    // inline_block_offsets/inline_align_up), touching no payload. serialize()
+    // asserts the streamed body matches this length, so any drift fails closed.
+    uint64_t cur_off = inline_align_up(sizeof(InlineForwardIndexHeader), align);
+    for (const auto& list : lists) {
+        const size_t n_clusters = list.cluster_size();
+        for (size_t block = 0; block < n_clusters; ++block) {
+            const BlockCounts counts =
+                count_block(list.get_docs(block), indptr, num_vectors);
+            cur_off += inline_block_offsets(counts.n_docs, counts.total_nnz,
+                                            element_size)
+                           .end;
+            cur_off = inline_align_up(cur_off, align);
+        }
+    }
+    const uint64_t dir_offset = cur_off;
+    return dir_offset + n_blocks * sizeof(InlineDirEntry) +
+           sizeof(InlineForwardIndexTrailer);
+}
+
 void InlineForwardIndex::serialize(IOWriter* writer) const {
     throw_if_null(writer, "writer cannot be null");
     if (lists_ == nullptr || vectors_ == nullptr) {
         throw std::logic_error(
             "InlineForwardIndex::serialize called on a read-mode index");
     }
-    // Prefix the section with its own byte length so it self-delimits: the
-    // reader reads the length, bounds a subcursor to the section, and advances
-    // the shared cursor past it -- like its sibling components, no external
-    // scoping needed.
-    BufferedIOWriter body;
-    write_body(&body);
-    const std::vector<uint8_t>& bytes = body.data();
-    uint64_t section_len = bytes.size();
+    // Self-delimiting and composable at any stream offset: pad to the block
+    // alignment so the section base is loadable wherever it lands, then write a
+    // u64 length prefix. mmap_deserialize() skips the same padding, reads the
+    // length, and advances the shared cursor exactly past the body. The length
+    // comes from a payload-free sizing pass, so the (corpus-sized) body streams
+    // straight to the writer rather than being buffered in RAM first.
+    io_align::pad_to(writer, kMinBlockAlign);
+    uint64_t section_len = section_length();
     writer->write(&section_len, sizeof(section_len), 1);
-    if (section_len > 0) {
-        writer->write(const_cast<uint8_t*>(bytes.data()), 1, section_len);
+    const size_t body_start = writer->pos();
+    write_body(writer);
+    // The prefix must equal what the body actually wrote, or a reader would
+    // trust a wrong length. Catches any sizing/emitting drift at the source.
+    if (writer->pos() - body_start != section_len) {
+        throw std::logic_error(
+            "InlineForwardIndex: serialized body length disagrees with the "
+            "computed section length");
     }
 }
 
@@ -166,37 +238,23 @@ void InlineForwardIndex::write_body(IOWriter* writer) const {
         for (size_t block = 0; block < n_clusters; ++block) {
             const std::span<const idx_t> docs = list.get_docs(block);
             const uint64_t block_off = cur_off;
-            // n_docs and the within-block offsets are u32 on the wire.
-            if (docs.size() > UINT32_MAX) {
-                throw std::length_error(
-                    "InlineForwardIndex: block has more than 2^32 docs");
-            }
-            const uint32_t n_docs = static_cast<uint32_t>(docs.size());
-
-            // First pass: validate doc ids and build doc_id[]/off[] (the CSR
-            // prefix sum). off[] is u32, so the running total must stay < 2^32
-            // or it would wrap and desync the block from its recorded length.
+            // Validate + count once (the same call section_length() used), then
+            // build doc_id[]/off[] (the within-block CSR prefix sum) from the
+            // now-safe docs. count_block keeps off[] within INT32_MAX, so the
+            // running total below cannot wrap or desync the recorded length.
+            const BlockCounts counts = count_block(docs, indptr, num_vectors);
+            const uint32_t n_docs = counts.n_docs;
+            const uint64_t total_nnz = counts.total_nnz;
             doc_ids.clear();
             offsets.assign(1, 0);
             doc_ids.reserve(n_docs);
             offsets.reserve(n_docs + 1);
-            uint64_t total_nnz = 0;
+            uint64_t running = 0;
             for (const idx_t doc_id : docs) {
-                if (doc_id < 0 || static_cast<size_t>(doc_id) >= num_vectors) {
-                    throw std::out_of_range(
-                        "InlineForwardIndex: block references doc id " +
-                        std::to_string(doc_id) + " outside [0, " +
-                        std::to_string(num_vectors) + ")");
-                }
-                total_nnz +=
+                running +=
                     static_cast<uint64_t>(indptr[doc_id + 1] - indptr[doc_id]);
-                if (total_nnz > UINT32_MAX) {
-                    throw std::length_error(
-                        "InlineForwardIndex: block total nnz exceeds the u32 "
-                        "offset range");
-                }
                 doc_ids.push_back(static_cast<uint32_t>(doc_id));
-                offsets.push_back(static_cast<uint32_t>(total_nnz));
+                offsets.push_back(static_cast<uint32_t>(running));
             }
             const InlineBlockOffsets layout =
                 inline_block_offsets(n_docs, total_nnz, element_size);
@@ -278,19 +336,24 @@ void InlineForwardIndex::deserialize(IOReader* /*reader*/) {
 
 void InlineForwardIndex::mmap_deserialize(MmapCursor* cursor) {
     throw_if_null(cursor, "cursor must not be null");
-    // Self-delimiting: read the section length, bound a subcursor to it (which
-    // rejects a corrupt length overrunning the mapping), parse, then advance
-    // the shared cursor past the whole component -- left just past, per the
-    // base contract.
+    // Mirror serialize(): consume the alignment padding, read the section
+    // length, reject one that overruns the mapping, then borrow the body in
+    // place and advance the shared cursor exactly past it (left just past, per
+    // the base contract).
+    io_align::skip_padding(cursor, kMinBlockAlign);
     const uint64_t section_len = cursor->read_scalar<uint64_t>();
-    MmapCursor body = cursor->subcursor(cursor->pos(), section_len);
-    index_section(body.current(), section_len);
-    block_base_ = body.current();
+    if (section_len > cursor->remaining()) {
+        throw std::runtime_error(
+            "InlineForwardIndex: section length overruns the mapping");
+    }
+    const uint8_t* base = cursor->current();
+    load_directory(base, section_len);
+    block_base_ = base;
     cursor->skip(section_len);
 }
 
-void InlineForwardIndex::index_section(const uint8_t* base,
-                                       size_t section_len) {
+void InlineForwardIndex::load_directory(const uint8_t* base,
+                                        size_t section_len) {
     if (section_len <
         sizeof(InlineForwardIndexHeader) + sizeof(InlineForwardIndexTrailer)) {
         throw std::runtime_error("InlineForwardIndex: section too small");
@@ -352,7 +415,7 @@ void InlineForwardIndex::index_section(const uint8_t* base,
     uint32_t prev_pl = 0;
     uint32_t prev_block = 0;
     for (const InlineDirEntry& entry : entries) {
-        if (entry.pl >= num_lists || entry.len < sizeof(uint32_t) ||
+        if (entry.pl >= num_lists || entry.len < kInlineBlockPrefixSize ||
             entry.byte_off % kMinBlockAlign != 0 ||
             entry.byte_off < sizeof(InlineForwardIndexHeader) ||
             entry.byte_off > trailer.dir_offset ||
@@ -395,7 +458,8 @@ BlockView InlineForwardIndex::view_block(const InlineDirEntry& entry) const {
     const uint64_t len = entry.len;
 
     uint32_t n_docs;
-    std::memcpy(&n_docs, base, sizeof(uint32_t));  // len >= 4 checked at load
+    // entry.len >= kInlineBlockPrefixSize was checked in load_directory.
+    std::memcpy(&n_docs, base, sizeof(uint32_t));
     if (n_docs != entry.n_docs) {
         throw std::runtime_error("InlineForwardIndex: block n_docs mismatch");
     }

@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include "nsparse/cluster/inverted_list_clusters.h"
@@ -33,9 +34,11 @@ namespace nsparse::detail {
 struct BlockView {
     uint32_t n_docs = 0;
     const uint32_t* doc_ids = nullptr;  // [n_docs] global doc ids
-    const uint32_t* offsets = nullptr;  // [n_docs + 1] within-block CSR offsets
-    const term_t* comps = nullptr;      // [offsets[n_docs]] component ids
-    const uint8_t* vals = nullptr;      // element_size bytes * offsets[n_docs]
+    // [n_docs + 1] within-block CSR offsets; u32 but capped at INT32_MAX by the
+    // writer, so they convert to idx_t losslessly for compute_similarity.
+    const uint32_t* offsets = nullptr;
+    const term_t* comps = nullptr;  // [offsets[n_docs]] component ids
+    const uint8_t* vals = nullptr;  // element_size bytes * offsets[n_docs]
 
     bool absent() const { return doc_ids == nullptr; }
 
@@ -54,18 +57,29 @@ struct BlockView {
 // into RAM and block payloads are borrowed in place, giving O(1) (pl, block)
 // lookup. Move-only.
 //
-// The serialized form is self-delimiting: serialize() prefixes the section with
-// its byte length, and mmap_deserialize() reads that length, so (like its
-// sibling components) it advances a shared cursor exactly past itself -- no
-// caller-scoped subcursor required. The mapping must outlive this object.
-// mmap_deserialize throws std::runtime_error on a malformed section
-// (fail-closed: block() never returns an out-of-bounds view).
+// The serialized form is self-delimiting: serialize() pads to kMinBlockAlign
+// (so the section base is readable wherever the enclosing stream places it) and
+// prefixes the section with its byte length; mmap_deserialize() skips the same
+// padding, reads the length, and advances a shared cursor exactly past itself
+// -- like its sibling components, no caller-scoped subcursor required. The
+// length is precomputed by a sizing pass, so serialize() streams the body
+// straight to the writer without buffering the whole (corpus-sized) section in
+// RAM. The mapping must outlive this object. mmap_deserialize throws
+// std::runtime_error on a malformed section (fail-closed: block() never returns
+// an out-of-bounds view).
 //
-// deserialize(IOReader*) is unsupported: the forward index is disk-resident, so
-// it is only read by borrowing from a mapping.
+// deserialize(IOReader*) is unsupported and throws: the forward index is
+// disk-resident, read only by borrowing from a mapping. This deliberately
+// narrows Serializable (a Liskov break), so any index that embeds this
+// component is mmap-only -- it can never be loaded in kInMemory residency.
+// Intended for a DiskSeismicIndex; state the constraint wherever such an index
+// is composed.
 class InlineForwardIndex : public MmapSerializable {
 public:
-    static constexpr uint64_t kDefaultPageSize = 4096;  // common OS page size
+    // Default block alignment. 4096 is the common OS page size, but this is
+    // just the alignment granularity, not a claim about the host page (a 16
+    // KB-page host gets sub-page block starts from this) -- caller-overridable.
+    static constexpr uint64_t kDefaultPageSize = 4096;
 
     InlineForwardIndex() = default;  // read mode; fill via mmap_deserialize
 
@@ -102,18 +116,31 @@ public:
     BlockView block(uint32_t pl, uint32_t block) const;
 
 private:
+    // n_docs and total_nnz of a block, from a validated doc-id span.
+    struct BlockCounts {
+        uint32_t n_docs;
+        uint64_t total_nnz;
+    };
     // page_size when page-aligned, else kMinBlockAlign (packed).
     uint64_t write_alignment() const {
         return write_layout_ == InlineLayout::kPageAligned ? write_page_size_
                                                            : kMinBlockAlign;
     }
-    // Serialize the section body (header, blocks, directory, trailer); the
-    // public serialize() wraps this with a length prefix.
+    // Validate a block's doc ids and return its counts; total_nnz is capped at
+    // INT32_MAX so off[] stays idx_t-convertible. Shared by section_length()
+    // (sizing) and write_body() (emitting) so their per-block math can't drift.
+    static BlockCounts count_block(std::span<const idx_t> docs,
+                                   const idx_t* indptr, size_t num_vectors);
+    // Byte length of the section body, from a payload-free sizing pass over
+    // lists + indptr. Lets serialize() write the length prefix without first
+    // rendering the body into a buffer.
+    uint64_t section_length() const;
+    // Stream the section body (header, blocks, directory, trailer) straight to
+    // the writer; serialize() precedes it with padding + the length prefix.
     void write_body(IOWriter* writer) const;
     // Validate the section at [base, base + section_len) and load its directory
-    // into RAM; sets
-    // element_size_/page_size_/entries_/list_offset_/block_base_.
-    void index_section(const uint8_t* base, size_t section_len);
+    // into RAM; sets element_size_/page_size_/entries_/list_offset_.
+    void load_directory(const uint8_t* base, size_t section_len);
     // Validate a block's interior and build an in-place SoA view.
     BlockView view_block(const InlineDirEntry& entry) const;
 

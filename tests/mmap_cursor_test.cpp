@@ -102,53 +102,6 @@ TEST(MmapCursor, AnEmptyArrayIsNullAndConsumesNothing) {
     EXPECT_EQ(cursor.pos(), 0U);
 }
 
-TEST(MmapCursor, SeekMovesForwardAndBackward) {
-    const auto buffer = make_buffer(8);  // 32 bytes, words 0..7
-    auto cursor = cursor_over(buffer);
-    cursor.read_scalar<uint32_t>();
-    EXPECT_EQ(cursor.pos(), 4U);
-
-    cursor.seek(16);  // word 4
-    EXPECT_EQ(cursor.read_scalar<uint32_t>(), 4U);
-    cursor.seek(0);  // back to the start
-    EXPECT_EQ(cursor.read_scalar<uint32_t>(), 0U);
-
-    cursor.seek(buffer.size() * sizeof(uint32_t));  // one-past-end is legal
-    EXPECT_EQ(cursor.remaining(), 0U);
-}
-
-TEST(MmapCursor, SeekPastEndThrows) {
-    const auto buffer = make_buffer(4);
-    auto cursor = cursor_over(buffer);
-    EXPECT_THROW(cursor.seek(buffer.size() * sizeof(uint32_t) + 1),
-                 std::runtime_error);
-}
-
-TEST(MmapCursor, SubcursorReadsWithinItsWindow) {
-    const auto buffer = make_buffer(8);  // 32 bytes, words 0..7
-    auto cursor = cursor_over(buffer);
-
-    auto sub = cursor.subcursor(16, 8);  // words 4 and 5
-    EXPECT_EQ(sub.read_scalar<uint32_t>(), 4U);
-    EXPECT_EQ(sub.read_scalar<uint32_t>(), 5U);
-    EXPECT_THROW(sub.read_scalar<uint32_t>(),
-                 std::runtime_error);  // past window
-    EXPECT_EQ(cursor.pos(), 0U);       // parent cursor untouched
-}
-
-TEST(MmapCursor, SubcursorRejectsAnOutOfRangeWindow) {
-    const auto buffer = make_buffer(4);  // 16 bytes
-    auto cursor = cursor_over(buffer);
-    EXPECT_THROW(cursor.subcursor(12, 8), std::runtime_error);  // 12 + 8 > 16
-    EXPECT_THROW(cursor.subcursor(17, 0), std::runtime_error);  // offset > size
-    // Overflow-safe: len / offset near SIZE_MAX must not wrap past the guard.
-    EXPECT_THROW(cursor.subcursor(8, std::numeric_limits<size_t>::max()),
-                 std::runtime_error);
-    EXPECT_THROW(cursor.subcursor(std::numeric_limits<size_t>::max(), 8),
-                 std::runtime_error);
-    EXPECT_NO_THROW(cursor.subcursor(16, 0));  // empty window at the end
-}
-
 TEST(MmapCursor, CurrentPointsAtThePosition) {
     const auto buffer = make_buffer(4);
     auto cursor = cursor_over(buffer);
@@ -157,7 +110,8 @@ TEST(MmapCursor, CurrentPointsAtThePosition) {
     EXPECT_EQ(cursor.current(), base);
     cursor.read_scalar<uint32_t>();
     EXPECT_EQ(cursor.current(), base + sizeof(uint32_t));
-    cursor.seek(size);  // one-past-end pointer is formed, never dereferenced
+    cursor.skip(cursor.remaining());  // one-past-end pointer is formed, never
+                                      // dereferenced
     EXPECT_EQ(cursor.current(), base + size);
 }
 

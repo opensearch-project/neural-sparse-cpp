@@ -13,7 +13,8 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace nsparse {
+// These are internal format details (not exposed to Python/JNI), hence detail.
+namespace nsparse::detail {
 
 /**
  * On-disk "inline" (block-contiguous) forward-index format: each doc's vector
@@ -32,8 +33,10 @@ namespace nsparse {
  *   [InlineForwardIndexTrailer]  (fixed size at EOF; locates the directory)
  * Blocks start on a kMinBlockAlign (or page_size) boundary and each array is
  * laid out so it can be read in place as a typed array: doc_id/off are u32,
- * comps is u16, and vals is padded up to element_size. Field widths are exactly
- * what compute_similarity consumes. Component: io/inline_forward_index_io.h.
+ * comps is u16, and vals is padded up to element_size. comps and vals match the
+ * element types compute_similarity consumes; off[] is a u32 within-block CSR
+ * offset, capped at INT32_MAX by the writer so it converts to idx_t losslessly.
+ * Component: io/inline_forward_index_io.h.
  */
 
 // Block placement: page-aligned (padded to page_size, mmap-friendly; default)
@@ -88,6 +91,11 @@ static_assert(std::is_trivially_copyable_v<InlineForwardIndexTrailer>);
 // this format header carries no dependency on types.h).
 inline constexpr uint64_t kInlineCompWidth = sizeof(uint16_t);
 
+// Size of a block's leading [u32 n_docs] field: the fixed prefix before the
+// doc_id[] array. Named so the layout math (inline_block_offsets) and the
+// directory validator (each block's len must be at least this) agree.
+inline constexpr uint64_t kInlineBlockPrefixSize = sizeof(uint32_t);
+
 // Round offset up to the next multiple of alignment (> 0).
 inline uint64_t inline_align_up(uint64_t offset, uint64_t alignment) {
     return ((offset + alignment - 1) / alignment) * alignment;
@@ -113,7 +121,7 @@ inline InlineBlockOffsets inline_block_offsets(uint64_t n_docs,
                                                uint64_t total_nnz,
                                                uint64_t element_size) {
     InlineBlockOffsets o{};
-    o.doc_ids = sizeof(uint32_t);  // just past the [u32 n_docs] prefix
+    o.doc_ids = kInlineBlockPrefixSize;  // just past the [u32 n_docs] prefix
     o.off = o.doc_ids + n_docs * sizeof(uint32_t);
     o.comps = o.off + (n_docs + 1) * sizeof(uint32_t);
     const uint64_t comps_end = o.comps + total_nnz * kInlineCompWidth;
@@ -122,6 +130,6 @@ inline InlineBlockOffsets inline_block_offsets(uint64_t n_docs,
     return o;
 }
 
-}  // namespace nsparse
+}  // namespace nsparse::detail
 
 #endif  // INLINE_FORWARD_INDEX_H
