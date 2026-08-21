@@ -14,14 +14,18 @@
 #include <memory>
 #include <vector>
 
+#include "nsparse/io/mmap_io.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
+#include "nsparse/utils/buf.h"
 
 namespace nsparse {
 
-class InvertedList {
+class InvertedList : public MmapSerializable {
 public:
     InvertedList(size_t element_size);
+    // Move-only, because Buf is: a Buf may borrow memory it does not own, and
+    // copying one would either alias the lender or silently deep-copy.
     InvertedList(const InvertedList&) = delete;
     InvertedList& operator=(const InvertedList&) = delete;
     InvertedList(InvertedList&& other) noexcept
@@ -30,8 +34,15 @@ public:
           codes_(std::move(other.codes_)) {}
 
     void add_entries(size_t n_entry, const idx_t* ids, const uint8_t* codes);
-    const std::vector<idx_t>& get_doc_ids() const { return doc_ids_; };
-    const std::vector<uint8_t>& get_codes() const { return codes_; };
+
+    // Replaces the contents, adopting the caller's buffers. The bulk path
+    // build_inverted_lists takes: an append has to round-trip both Bufs through
+    // a vector, which is not something to pay per posting.
+    void set_entries(std::vector<idx_t>&& doc_ids,
+                     std::vector<uint8_t>&& codes);
+
+    const Buf<idx_t>& get_doc_ids() const { return doc_ids_; };
+    const Buf<uint8_t>& get_codes() const { return codes_; };
 
     float get_value_float(size_t index) const;
 
@@ -40,10 +51,18 @@ public:
     float max_value() const;
     size_t size() const { return doc_ids_.size(); }
 
+    // Layout: the entry count, then the doc ids and the codes, each preceded by
+    // padding to its element's alignment so a mapped reader can borrow it in
+    // place (see io/align.h). The element width is not repeated per list; the
+    // enclosing ArrayInvertedLists writes it once.
+    void serialize(IOWriter* writer) const override;
+    void deserialize(IOReader* reader) override;
+    void mmap_deserialize(MmapCursor* cursor) override;
+
 private:
     size_t element_size_;
-    std::vector<idx_t> doc_ids_;
-    std::vector<uint8_t> codes_;
+    Buf<idx_t> doc_ids_;
+    Buf<uint8_t> codes_;
     std::atomic<uint8_t> lock_{0};  // 0 = unlocked, 1 = locked
 };
 
@@ -85,6 +104,25 @@ public:
 
     static std::unique_ptr<ArrayInvertedLists> build_inverted_lists(
         size_t n_term, size_t element_size, const SparseVectors* vectors);
+
+    // Layout: the term count and the element width, then each list in term
+    // order.
+    void serialize(IOWriter* writer) const;
+
+    // Factories rather than a deserialize() on an existing object: the term
+    // count comes from the file, and it is fixed at construction.
+    //
+    // `element_size` is the width the caller loads the codes at. A file
+    // declaring another is rejected before any list is walked: the width sets
+    // how many code bytes each list holds, so reading on would desynchronize
+    // and the following list sizes would be garbage.
+    static std::unique_ptr<ArrayInvertedLists> read(IOReader* reader,
+                                                    size_t element_size);
+
+    // Same layout read() walks, with every list borrowing from the mapping
+    // instead of copying it. The mapping must outlive the result.
+    static std::unique_ptr<ArrayInvertedLists> map(MmapCursor* cursor,
+                                                   size_t element_size);
 
 private:
     std::vector<InvertedList> lists_;

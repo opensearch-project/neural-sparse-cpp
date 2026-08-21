@@ -570,16 +570,20 @@ private:
 };
 }  // namespace
 
-// Only the seismic indexes have a mapped reader, so kUseMmap on any other type
-// has to fall back to the copying read rather than be honoured.
-TEST(IndexIO, UseMmapFlagIsIgnoredForOtherIndexTypes) {
+// IDMapIndex has no mapped reader of its own, so kUseMmap has to fall back to
+// the copying read for the id map while still reaching the delegate -- here an
+// InvertedIndex, whose posting lists then borrow from the file.
+TEST(IndexIO, UseMmapFlagMapsTheInvertedIndexDelegateOfAnIDMap) {
     TempIndexFile file("nsparse_index_io_inverted_mmap_flag.idx");
-    nsparse::InvertedIndex original(128);
+    auto* inverted = new nsparse::InvertedIndex(128);
+    nsparse::IDMapIndex original(inverted);
 
     std::vector<nsparse::idx_t> indptr = {0, 2, 4};
     std::vector<nsparse::term_t> indices = {0, 1, 2, 3};
     std::vector<float> values = {1.0F, 0.5F, 0.8F, 0.3F};
-    original.add(2, indptr.data(), indices.data(), values.data());
+    std::vector<nsparse::idx_t> ids = {100, 200};
+    original.add_with_ids(2, indptr.data(), indices.data(), values.data(),
+                          ids.data());
     original.build();
     nsparse::write_index(&original, file.c_str());
 
@@ -588,8 +592,9 @@ TEST(IndexIO, UseMmapFlagIsIgnoredForOtherIndexTypes) {
 
     ASSERT_NE(loaded, nullptr);
     ASSERT_EQ(loaded->id(), original.id());
-    // InvertedIndex consumes its vectors into the posting lists, so a search is
-    // what shows the postings themselves survived the roundtrip.
+    ASSERT_EQ(loaded->num_vectors(), 2);
+
+    // The id map still round-trips: search returns external ids, not internal.
     std::vector<nsparse::idx_t> q_indptr = {0, 1};
     std::vector<nsparse::term_t> q_indices = {0};
     std::vector<float> q_values = {1.0F};
@@ -597,7 +602,7 @@ TEST(IndexIO, UseMmapFlagIsIgnoredForOtherIndexTypes) {
     std::vector<float> distances(1, -1.0F);
     loaded->search(1, q_indptr.data(), q_indices.data(), q_values.data(), 1,
                    distances.data(), labels.data());
-    EXPECT_EQ(labels[0], 0);
+    EXPECT_EQ(labels[0], 100);
 }
 
 // The id map is serialized ahead of the delegate so that a mapped delegate read

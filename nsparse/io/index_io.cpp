@@ -80,6 +80,8 @@ Index* mmap_index_payload(uint32_t id, int dimension, const char* file_name,
         case SESQ:
             return SeismicScalarQuantizedIndex::mmap_index(dimension, file_name,
                                                            pos);
+        case INVT:
+            return InvertedIndex::mmap_index(dimension, file_name, pos);
         default:
             return nullptr;
     }

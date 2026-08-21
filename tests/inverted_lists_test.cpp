@@ -13,10 +13,24 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <memory>
+#include <stdexcept>
 #include <vector>
 
+#include "nsparse/io/buffered_io.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
+#include "nsparse/utils/mmap_cursor.h"
+
+namespace {
+// A list's doc ids, copied out: the stored buffer is read-only, and the callers
+// below sort what they get.
+std::vector<nsparse::idx_t> doc_ids_of(const nsparse::InvertedList& list) {
+    const auto& doc_ids = list.get_doc_ids();
+    return {doc_ids.begin(), doc_ids.end()};
+}
+}  // namespace
 
 // InvertedList tests
 TEST(InvertedList, constructor) {
@@ -421,7 +435,7 @@ TEST(ArrayInvertedLists, build_inverted_lists_multiple_docs_same_term) {
 
     // Term 1 should have all 3 docs
     ASSERT_EQ((*invlists)[1].get_doc_ids().size(), 3);
-    auto doc_ids = (*invlists)[1].get_doc_ids();
+    auto doc_ids = doc_ids_of((*invlists)[1]);
     std::ranges::sort(doc_ids);
     ASSERT_EQ(doc_ids[0], 0);
     ASSERT_EQ(doc_ids[1], 1);
@@ -470,14 +484,14 @@ TEST(ArrayInvertedLists, build_inverted_lists_multiple_docs_different_terms) {
 
     // Term 1: docs 0, 1
     ASSERT_EQ((*invlists)[1].get_doc_ids().size(), 2);
-    auto term1_docs = (*invlists)[1].get_doc_ids();
+    auto term1_docs = doc_ids_of((*invlists)[1]);
     std::ranges::sort(term1_docs);
     ASSERT_EQ(term1_docs[0], 0);
     ASSERT_EQ(term1_docs[1], 1);
 
     // Term 2: docs 1, 2
     ASSERT_EQ((*invlists)[2].get_doc_ids().size(), 2);
-    auto term2_docs = (*invlists)[2].get_doc_ids();
+    auto term2_docs = doc_ids_of((*invlists)[2]);
     std::ranges::sort(term2_docs);
     ASSERT_EQ(term2_docs[0], 1);
     ASSERT_EQ(term2_docs[1], 2);
@@ -616,4 +630,164 @@ TEST(InvertedList, size_returns_doc_count) {
 
     list.clear();
     EXPECT_EQ(list.size(), 0);
+}
+
+// ============== serialization ==============
+
+namespace {
+
+// A three-term, mixed-length set of lists: two populated (one of odd length, so
+// the codes that follow its doc ids need padding) and one empty.
+std::unique_ptr<nsparse::ArrayInvertedLists> lists_for_io() {
+    nsparse::SparseVectorsConfig config{.element_size = nsparse::U32,
+                                        .dimension = 3};
+    nsparse::SparseVectors vectors(config);
+    // doc0: {0: 1.5, 2: 2.5}, doc1: {0: 0.5}, doc2: {0: 3.5}
+    std::vector<nsparse::idx_t> indptr = {0, 2, 3, 4};
+    std::vector<nsparse::term_t> indices = {0, 2, 0, 0};
+    std::vector<float> values = {1.5F, 2.5F, 0.5F, 3.5F};
+    vectors.add_vectors(indptr.data(), indptr.size(), indices.data(),
+                        indices.size(),
+                        reinterpret_cast<const uint8_t*>(values.data()),
+                        values.size() * sizeof(float));
+    return nsparse::ArrayInvertedLists::build_inverted_lists(3, nsparse::U32,
+                                                             &vectors);
+}
+
+void expect_same_lists(const nsparse::ArrayInvertedLists& actual,
+                       const nsparse::ArrayInvertedLists& expected) {
+    ASSERT_EQ(actual.size(), expected.size());
+    ASSERT_EQ(actual.get_element_size(), expected.get_element_size());
+    for (size_t term = 0; term < expected.size(); ++term) {
+        const auto& want = expected[term];
+        const auto& got = actual[term];
+        ASSERT_EQ(got.size(), want.size()) << "term " << term;
+        for (size_t i = 0; i < want.size(); ++i) {
+            EXPECT_EQ(got.get_doc_ids()[i], want.get_doc_ids()[i])
+                << "term " << term << " entry " << i;
+            EXPECT_FLOAT_EQ(got.get_value_float(i), want.get_value_float(i))
+                << "term " << term << " entry " << i;
+        }
+    }
+}
+
+}  // namespace
+
+TEST(ArrayInvertedLists, read_matches_what_serialize_wrote) {
+    auto original = lists_for_io();
+
+    nsparse::BufferedIOWriter writer;
+    original->serialize(&writer);
+
+    nsparse::BufferedIOReader reader(writer.data());
+    auto loaded = nsparse::ArrayInvertedLists::read(&reader, nsparse::U32);
+
+    expect_same_lists(*loaded, *original);
+    // Copied out, so nothing points into the writer's buffer.
+    EXPECT_TRUE((*loaded)[0].get_doc_ids().owns());
+}
+
+// The point of the mapped path: the arrays point into the serialized bytes
+// rather than into fresh allocations.
+TEST(ArrayInvertedLists, map_borrows_from_the_serialized_bytes) {
+    auto original = lists_for_io();
+
+    nsparse::BufferedIOWriter writer;
+    original->serialize(&writer);
+    const auto& bytes = writer.data();
+
+    nsparse::MmapCursor cursor(bytes.data(), bytes.size());
+    auto mapped = nsparse::ArrayInvertedLists::map(&cursor, nsparse::U32);
+
+    expect_same_lists(*mapped, *original);
+    // Every array in the file has been consumed.
+    EXPECT_EQ(cursor.remaining(), 0);
+
+    const auto& doc_ids = (*mapped)[0].get_doc_ids();
+    const auto& codes = (*mapped)[0].get_codes();
+    EXPECT_FALSE(doc_ids.owns());
+    EXPECT_FALSE(codes.owns());
+    const auto* base = bytes.data();
+    const auto* end = base + bytes.size();
+    const auto* doc_ids_bytes =
+        reinterpret_cast<const uint8_t*>(doc_ids.data());
+    EXPECT_GE(doc_ids_bytes, base);
+    EXPECT_LT(doc_ids_bytes, end);
+    // A doc id array is 4-byte aligned and so are the codes, so the codes of a
+    // list follow its doc ids with no padding between them.
+    EXPECT_EQ(codes.data(), doc_ids_bytes + doc_ids.byte_size());
+}
+
+TEST(ArrayInvertedLists, map_rejects_a_truncated_buffer) {
+    auto original = lists_for_io();
+
+    nsparse::BufferedIOWriter writer;
+    original->serialize(&writer);
+    const auto& bytes = writer.data();
+
+    nsparse::MmapCursor cursor(bytes.data(), bytes.size() - sizeof(float));
+    ASSERT_THROW(nsparse::ArrayInvertedLists::map(&cursor, nsparse::U32),
+                 std::runtime_error);
+}
+
+// A term count the rest of the buffer cannot hold is rejected before it is
+// allocated, rather than after a multi-gigabyte reserve.
+TEST(ArrayInvertedLists, map_rejects_an_implausible_term_count) {
+    std::vector<uint8_t> bytes(2 * sizeof(size_t));
+    // size_t{1}, not 1UL: unsigned long is 32 bits on Windows, where the shift
+    // folded to a term count small enough for the guard to let through.
+    const size_t n_term = size_t{1} << 40;
+    const size_t element_size = nsparse::U32;
+    std::memcpy(bytes.data(), &n_term, sizeof(size_t));
+    std::memcpy(bytes.data() + sizeof(size_t), &element_size, sizeof(size_t));
+
+    nsparse::MmapCursor cursor(bytes.data(), bytes.size());
+    ASSERT_THROW(nsparse::ArrayInvertedLists::map(&cursor, nsparse::U32),
+                 std::runtime_error);
+}
+
+// The stored width sets how many code bytes each list holds, so reading at
+// another one desynchronizes at the first list. Both readers therefore reject
+// it up front rather than on the garbage that follows.
+TEST(ArrayInvertedLists, both_reads_reject_a_foreign_element_width) {
+    auto original = lists_for_io();
+
+    nsparse::BufferedIOWriter writer;
+    original->serialize(&writer);
+    const auto& bytes = writer.data();
+
+    nsparse::BufferedIOReader reader(bytes);
+    ASSERT_THROW(nsparse::ArrayInvertedLists::read(&reader, nsparse::U16),
+                 std::runtime_error);
+    // Nothing past the two header fields was consumed.
+    EXPECT_EQ(reader.pos(), 2 * sizeof(size_t));
+
+    nsparse::MmapCursor cursor(bytes.data(), bytes.size());
+    ASSERT_THROW(nsparse::ArrayInvertedLists::map(&cursor, nsparse::U16),
+                 std::runtime_error);
+    EXPECT_EQ(cursor.pos(), 2 * sizeof(size_t));
+}
+
+TEST(ArrayInvertedLists, mapped_lists_cannot_be_appended_to) {
+    auto original = lists_for_io();
+
+    nsparse::BufferedIOWriter writer;
+    original->serialize(&writer);
+    const auto& bytes = writer.data();
+
+    nsparse::MmapCursor cursor(bytes.data(), bytes.size());
+    auto mapped = nsparse::ArrayInvertedLists::map(&cursor, nsparse::U32);
+
+    nsparse::idx_t doc_id = 99;
+    float value = 1.0F;
+    ASSERT_THROW(mapped->add_entries(0, 1, &doc_id,
+                                     reinterpret_cast<const uint8_t*>(&value)),
+                 std::runtime_error);
+}
+
+TEST(InvertedList, set_entries_rejects_a_mismatched_code_count) {
+    nsparse::InvertedList list(nsparse::U32);
+    // Two doc ids but only one float's worth of codes.
+    ASSERT_THROW(list.set_entries({1, 2}, std::vector<uint8_t>(sizeof(float))),
+                 std::invalid_argument);
 }

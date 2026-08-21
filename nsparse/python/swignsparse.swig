@@ -86,6 +86,20 @@ import_array();
 %ignore nsparse::SparseVectors::mmap_deserialize;
 %ignore nsparse::SparseVectors::map_vectors;
 %include "nsparse/sparse_vectors.h"
+// Same reasons, for the posting lists: mmap_deserialize and map take an
+// MmapCursor, and read() hands back lists Python has no use for on their own.
+// Serialization is reached through write_index/read_index, never a list at a
+// time. get_doc_ids/get_codes hand out a Buf, which is both a borrow Python
+// cannot keep alive and a template this interface does not wrap -- left in,
+// SWIG emits it unqualified and the generated wrapper stops compiling.
+%ignore nsparse::InvertedList::get_doc_ids;
+%ignore nsparse::InvertedList::get_codes;
+%ignore nsparse::InvertedList::mmap_deserialize;
+%ignore nsparse::InvertedList::serialize;
+%ignore nsparse::InvertedList::deserialize;
+%ignore nsparse::ArrayInvertedLists::map;
+%ignore nsparse::ArrayInvertedLists::read;
+%ignore nsparse::ArrayInvertedLists::serialize;
 %include "nsparse/invlists/inverted_lists.h"
 %include "nsparse/utils/scalar_quantizer.h"
 
@@ -123,6 +137,7 @@ import_array();
 // SparseVectors mmap ignores above.
 %ignore nsparse::SeismicIndex::mmap_index;
 %ignore nsparse::SeismicScalarQuantizedIndex::mmap_index;
+%ignore nsparse::InvertedIndex::mmap_index;
 %ignore nsparse::InvertedListClusters::serialize;
 %ignore nsparse::InvertedListClusters::deserialize;
 
@@ -164,9 +179,9 @@ import_array();
 
 %include "nsparse/index.h"
 
-// SeismicIndex derives from MmapIndex, so SWIG has to be told that class exists:
-// without it the base is dropped and the Python SeismicIndex silently loses
-// everything Index declares -- search, num_vectors, read_csr.
+// The seismic indexes and InvertedIndex derive from MmapIndex, so SWIG has to be
+// told that class exists: without it the base is dropped and the Python classes
+// silently lose everything Index declares -- search, num_vectors, read_csr.
 %include "nsparse/mmap_index.h"
 
 %include "nsparse/brutal_index.h"

@@ -11,7 +11,14 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
+#include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "nsparse/id_selector.h"
@@ -19,6 +26,7 @@
 #include "nsparse/io/buffered_io.h"
 #include "nsparse/io/index_io.h"
 #include "nsparse/types.h"
+#include "nsparse/utils/csr_layout.h"
 
 namespace nsparse {
 namespace {
@@ -79,6 +87,18 @@ TEST(InvertedIndexAdd, add_counts_empty_vectors) {
     add_docs(index, {{{0, 1.0F}}, {}, {{2, 0.8F}}, {}});
     index.build();
     EXPECT_EQ(index.num_vectors(), 4);
+}
+
+// build() consumes the vectors, so a second call has nothing to work from --
+// and for a mapped index it would drop the file the posting lists borrow from.
+TEST(InvertedIndexAdd, build_without_vectors_is_a_no_op) {
+    InvertedIndex index(5);
+    ASSERT_NO_THROW(index.build());
+
+    add_docs(index, {{{0, 1.0F}}});
+    index.build();
+    ASSERT_NO_THROW(index.build());
+    EXPECT_EQ(index.num_vectors(), 1);
 }
 
 // ============== search() tests ==============
@@ -675,6 +695,291 @@ TEST(InvertedIndexSearch, search_with_id_selector_multi_window) {
         EXPECT_TRUE(selector.is_member(labels[i])) << "doc " << labels[i];
     }
     EXPECT_EQ(found, static_cast<int>(allowed_ids.size()));
+}
+
+// A term past the index's dimension has no posting list. It used to be indexed
+// into the list vector regardless, reading out of bounds.
+TEST(InvertedIndexSearch, search_ignores_query_terms_beyond_the_dimension) {
+    InvertedIndex index(3);
+    Index* idx = &index;
+
+    add_docs(index, {{{0, 1.0F}}, {{0, 0.5F}}});
+    index.build();
+
+    // Term 0 exists; term 9 is past the dimension entirely.
+    std::vector<idx_t> query_indptr = {0, 2};
+    std::vector<term_t> query_indices = {0, 9};
+    std::vector<float> query_values = {1.0F, 1.0F};
+    std::vector<idx_t> labels(2, -1);
+    std::vector<float> distances(2, -1.0F);
+
+    idx->search(1, query_indptr.data(), query_indices.data(),
+                query_values.data(), 2, distances.data(), labels.data());
+
+    EXPECT_EQ(labels[0], 0);
+    EXPECT_EQ(labels[1], 1);
+    EXPECT_FLOAT_EQ(distances[0], 1.0F);
+    EXPECT_FLOAT_EQ(distances[1], 0.5F);
+}
+
+// ============== mapped (mmap) read tests ==============
+
+namespace {
+
+// Index file removed on destruction. read_index/write_index take char*, not
+// const char*, hence the owned string.
+class TempIndexFile {
+public:
+    explicit TempIndexFile(const std::string& name)
+        : path_(std::filesystem::temp_directory_path() / name) {
+        std::filesystem::remove(path_);
+    }
+
+    // A destructor cannot forward an exception, and Windows refuses to delete a
+    // file while a mapping over it is still open.
+    ~TempIndexFile() {
+        std::error_code ignored;
+        std::filesystem::remove(path_, ignored);
+    }
+
+    TempIndexFile(const TempIndexFile&) = delete;
+    TempIndexFile& operator=(const TempIndexFile&) = delete;
+
+    char* c_str() { return path_str_.data(); }
+
+private:
+    std::filesystem::path path_;
+    std::string path_str_ = path_.string();
+};
+
+std::unique_ptr<InvertedIndex> built_index() {
+    auto index = std::make_unique<InvertedIndex>(4);
+    // doc0: term0=1.0, term1=0.5
+    // doc1: term0=0.8, term2=0.6
+    // doc2: term1=0.9, term3=0.7
+    add_docs(*index, {{{0, 1.0F}, {1, 0.5F}},
+                      {{0, 0.8F}, {2, 0.6F}},
+                      {{1, 0.9F}, {3, 0.7F}}});
+    index->build();
+    return index;
+}
+
+// (scores, labels) for one query, so two residencies can be compared outright.
+pair_of_score_id_vector_t search_one(Index* index,
+                                     const std::vector<term_t>& terms,
+                                     const std::vector<float>& weights, int k) {
+    std::vector<idx_t> indptr = {0, static_cast<idx_t>(terms.size())};
+    std::vector<float> distances(k, -1.0F);
+    std::vector<idx_t> labels(k, detail::INVALID_IDX);
+    index->search(1, indptr.data(), terms.data(), weights.data(), k,
+                  distances.data(), labels.data());
+    return {distances, labels};
+}
+
+// The stored element width, counting past the fourcc and dimension read_index
+// consumes, and past the document count and term count write_index puts ahead
+// of it.
+constexpr size_t kElementSizeOffset =
+    sizeof(uint32_t) + sizeof(int) + (2 * sizeof(size_t));
+
+template <class T>
+T read_field(const std::string& path, size_t offset) {
+    std::ifstream in(path, std::ios::binary);
+    in.seekg(static_cast<std::streamoff>(offset));
+    T value{};
+    in.read(reinterpret_cast<char*>(&value), sizeof(T));
+    return value;
+}
+
+// The load-time guard rejects what the writer cannot produce, so the only way
+// to reach it is to overwrite a field of an otherwise valid file in place.
+template <class T>
+void patch_field(const std::string& path, size_t offset, T value) {
+    std::fstream out(path, std::ios::binary | std::ios::in | std::ios::out);
+    out.seekp(static_cast<std::streamoff>(offset));
+    out.write(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+}  // namespace
+
+TEST(InvertedIndexMmapIO, mapped_read_matches_the_copying_read) {
+    TempIndexFile file("nsparse_invt_mapped.idx");
+
+    auto source = built_index();
+    write_index(source.get(), file.c_str());
+
+    // One file, read both ways: kUseMmap is all that separates the residencies.
+    std::unique_ptr<Index> mapped(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+    std::unique_ptr<Index> copied(read_index(file.c_str()));
+
+    ASSERT_NE(mapped, nullptr);
+    ASSERT_NE(copied, nullptr);
+    EXPECT_EQ(mapped->num_vectors(), source->num_vectors());
+    EXPECT_EQ(copied->num_vectors(), source->num_vectors());
+
+    // Single-term queries, then a multi-term one that exercises the pruning
+    // bound off the borrowed per-term maxima.
+    for (term_t term = 0; term < 4; ++term) {
+        EXPECT_EQ(search_one(mapped.get(), {term}, {1.0F}, 3),
+                  search_one(copied.get(), {term}, {1.0F}, 3))
+            << "term " << term;
+    }
+    EXPECT_EQ(search_one(mapped.get(), {0, 1}, {1.0F, 0.8F}, 3),
+              search_one(copied.get(), {0, 1}, {1.0F, 0.8F}, 3));
+    EXPECT_EQ(search_one(mapped.get(), {0, 1}, {1.0F, 0.8F}, 3),
+              search_one(source.get(), {0, 1}, {1.0F, 0.8F}, 3));
+}
+
+// Posting lists span several scoring windows here, so the mapped arrays are
+// walked well past their first page.
+TEST(InvertedIndexMmapIO, mapped_read_matches_across_scoring_windows) {
+    constexpr int kNumDocs = 6000;  // > kScoreWindowSize (4096)
+    TempIndexFile file("nsparse_invt_mapped_windows.idx");
+
+    InvertedIndex source(2);
+    std::vector<std::map<int, float>> docs;
+    docs.reserve(kNumDocs);
+    for (int i = 0; i < kNumDocs; ++i) {
+        std::map<int, float> doc;
+        doc[0] = 0.1F + static_cast<float>(i % 10) * 0.01F;
+        if (i % 3 == 0) {
+            doc[1] = 0.5F + static_cast<float>(i % 7) * 0.05F;
+        }
+        docs.push_back(doc);
+    }
+    add_docs(source, docs);
+    source.build();
+    write_index(&source, file.c_str());
+
+    std::unique_ptr<Index> mapped(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+
+    ASSERT_NE(mapped, nullptr);
+    EXPECT_EQ(mapped->num_vectors(), static_cast<size_t>(kNumDocs));
+    EXPECT_EQ(search_one(mapped.get(), {0, 1}, {1.0F, 1.0F}, 10),
+              search_one(&source, {0, 1}, {1.0F, 1.0F}, 10));
+}
+
+// A stream has no file to map, so the flag alone must not send read_index down
+// the mapped path.
+TEST(InvertedIndexMmapIO, buffered_read_copies_even_when_the_flag_is_set) {
+    auto source = built_index();
+
+    BufferedIOWriter writer;
+    write_index(source.get(), &writer);
+
+    BufferedIOReader reader(writer.data());
+    std::unique_ptr<Index> loaded(read_index(&reader, IndexIoFlag::kUseMmap));
+
+    ASSERT_NE(loaded, nullptr);
+    EXPECT_EQ(loaded->num_vectors(), source->num_vectors());
+    EXPECT_EQ(search_one(loaded.get(), {0}, {1.0F}, 3),
+              search_one(source.get(), {0}, {1.0F}, 3));
+}
+
+TEST(InvertedIndexMmapIO, mapped_read_of_an_index_written_before_build) {
+    TempIndexFile file("nsparse_invt_empty_mapped.idx");
+    InvertedIndex source(5);
+    write_index(&source, file.c_str());
+
+    std::unique_ptr<Index> loaded(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+
+    ASSERT_NE(loaded, nullptr);
+    EXPECT_EQ(loaded->get_dimension(), 5);
+    EXPECT_EQ(loaded->num_vectors(), 0);
+    // No posting lists, so every query comes back empty rather than crashing.
+    const auto [distances, labels] = search_one(loaded.get(), {0}, {1.0F}, 2);
+    EXPECT_EQ(labels[0], detail::INVALID_IDX);
+}
+
+// The values are read back as float, at the width add() encoded them with, so a
+// file declaring another width would be strided halfway into each value. Only a
+// corrupt file can say so, and both readers take the field from the file
+// themselves.
+TEST(InvertedIndexMmapIO, both_reads_reject_a_foreign_stored_element_width) {
+    TempIndexFile file("nsparse_invt_element_width.idx");
+    auto source = built_index();
+    write_index(source.get(), file.c_str());
+    const std::string path = file.c_str();
+
+    // Fails loudly if the layout moves, rather than patching some other field.
+    ASSERT_EQ(read_field<size_t>(path, kElementSizeOffset), size_t{U32});
+    patch_field(path, kElementSizeOffset, size_t{U16});
+
+    for (const int flags : {0, static_cast<int>(IndexIoFlag::kUseMmap)}) {
+        try {
+            std::unique_ptr<Index> loaded(read_index(file.c_str(), flags));
+            ADD_FAILURE() << "accepted the file, flags " << flags;
+        } catch (const std::runtime_error& error) {
+            // The message is checked, not just the type: reading on past a
+            // guard that was dropped throws too, somewhere downstream, and that
+            // must not read as a pass.
+            EXPECT_NE(
+                std::string(error.what()).find("stored posting element width"),
+                std::string::npos)
+                << "flags " << flags << ": " << error.what();
+        }
+    }
+}
+
+// The other mmap entry point: read_csr borrows a native-layout CSR instead of
+// copying it in through add(), and build() then owns the postings it derives.
+TEST(InvertedIndexMmapIO, build_from_a_mapped_csr_matches_an_added_index) {
+    TempIndexFile interchange("nsparse_invt_source.csr");
+    TempIndexFile native("nsparse_invt_source.csr.mcsr");
+
+    // The same three documents built_index() adds.
+    const std::vector<int64_t> header = {3, 4, 6};
+    const std::vector<int64_t> indptr = {0, 2, 4, 6};
+    const std::vector<int32_t> indices = {0, 1, 0, 2, 1, 3};
+    const std::vector<float> values = {1.0F, 0.5F, 0.8F, 0.6F, 0.9F, 0.7F};
+    {
+        std::ofstream out(interchange.c_str(), std::ios::binary);
+        const auto write_all = [&out](const void* data, size_t bytes) {
+            out.write(static_cast<const char*>(data),
+                      static_cast<std::streamsize>(bytes));
+        };
+        write_all(header.data(), header.size() * sizeof(int64_t));
+        write_all(indptr.data(), indptr.size() * sizeof(int64_t));
+        write_all(indices.data(), indices.size() * sizeof(int32_t));
+        write_all(values.data(), values.size() * sizeof(float));
+    }
+    csr_layout::convert(interchange.c_str(), native.c_str());
+
+    InvertedIndex mapped_source(4);
+    mapped_source.read_csr(native.c_str(), Residency::kMmap);
+    mapped_source.build();
+
+    // read_csr's mapped residency never goes through add(), so the count has to
+    // come off the vectors at build time.
+    EXPECT_EQ(mapped_source.num_vectors(), 3);
+
+    auto added = built_index();
+    for (term_t term = 0; term < 4; ++term) {
+        EXPECT_EQ(search_one(&mapped_source, {term}, {1.0F}, 3),
+                  search_one(added.get(), {term}, {1.0F}, 3))
+            << "term " << term;
+    }
+    EXPECT_EQ(search_one(&mapped_source, {0, 1}, {1.0F, 0.8F}, 3),
+              search_one(added.get(), {0, 1}, {1.0F, 0.8F}, 3));
+}
+
+// The mapped path parses before it commits, so a file cut short leaves nothing
+// behind rather than an index pointing past the mapping.
+TEST(InvertedIndexMmapIO, mapped_read_rejects_a_truncated_file) {
+    TempIndexFile file("nsparse_invt_truncated.idx");
+    auto source = built_index();
+    write_index(source.get(), file.c_str());
+
+    const std::string path = file.c_str();
+    const auto full_size = std::filesystem::file_size(path);
+    std::filesystem::resize_file(path, full_size - sizeof(float));
+
+    ASSERT_THROW(
+        std::unique_ptr<Index>(read_index(file.c_str(), IndexIoFlag::kUseMmap)),
+        std::runtime_error);
 }
 
 }  // namespace

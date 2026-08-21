@@ -19,11 +19,15 @@
 #include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
+#include "nsparse/io/align.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
+#include "nsparse/utils/buf.h"
 #include "nsparse/utils/checks.h"
+#include "nsparse/utils/mmap_file.h"
 #include "nsparse/utils/ranker.h"
 
 namespace nsparse {
@@ -31,6 +35,19 @@ namespace {
 constexpr int kScoreWindowSize = 1 << 12;
 constexpr int kElementSize = U32;
 constexpr idx_t kNoMoreDocs = std::numeric_limits<idx_t>::max();
+
+// The search bound needs every term's maximum, so a file carrying fewer is one
+// the search would read past. Only a corrupt file can disagree, and each reader
+// checks for itself. (The stored element width is checked earlier, by the
+// posting-list reader that has to know it.)
+void throw_if_scores_are_incomplete(const ArrayInvertedLists& lists,
+                                    size_t scores_size) {
+    if (scores_size != lists.size()) {
+        throw std::runtime_error(
+            "inverted index file's per-term score count does not match its "
+            "term count");
+    }
+}
 
 // Lightweight non-virtual scorer that operates directly on raw arrays.
 // Eliminates virtual dispatch, heap allocation, and branch-on-element-size
@@ -87,13 +104,26 @@ struct DirectTermScorer {
 
 void build_scorers(const term_t* indices, const float* values, int size,
                    const ArrayInvertedLists& inverted_lists,
-                   const std::vector<float>& max_term_scores,
+                   const Buf<float>& max_term_scores,
                    std::vector<DirectTermScorer>& scorers,
                    std::vector<float>& max_score_prefix) {
     // Build DirectTermScorers: no heap allocation, no virtual dispatch.
     // Operates directly on raw arrays from InvertedList.
+    const size_t n_terms = inverted_lists.size();
     for (int i = 0; i < size; ++i) {
         term_t term_id = indices[i];
+        if (term_id >= n_terms) {
+            // A query term past the index's dimension has no list to score
+            // against. Stood in for as an exhausted scorer rather than dropped,
+            // so the prefix sums below stay aligned with `indices`.
+            scorers[i].doc_ids = nullptr;
+            scorers[i].values = nullptr;
+            scorers[i].list_size = 0;
+            scorers[i].current_index = 0;  // == list_size, i.e. exhausted
+            scorers[i].query_weight = values[i];
+            scorers[i].max_score = 0.0F;
+            continue;
+        }
         const auto& list = inverted_lists[term_id];
         const auto& doc_ids_vec = list.get_doc_ids();
         const auto& codes = list.get_codes();
@@ -213,7 +243,7 @@ void evaluate_window_candidates(std::vector<DirectTermScorer>& scorers,
 
 }  // namespace
 
-InvertedIndex::InvertedIndex(int dim) : Index(dim) {}
+InvertedIndex::InvertedIndex(int dim) : MmapIndex(dim) {}
 
 void InvertedIndex::add(idx_t n, const idx_t* indptr, const term_t* indices,
                         const float* values) {
@@ -234,21 +264,34 @@ void InvertedIndex::add(idx_t n, const idx_t* indptr, const term_t* indices,
 }
 
 void InvertedIndex::build() {
+    if (vectors_ == nullptr) {
+        // Nothing was added, or the posting lists came from a file: either way
+        // there is nothing to build, and rebuilding would drop a mapping the
+        // lists borrow from.
+        return;
+    }
+    // Counted here as well as in add(), because read_csr's mapped residency
+    // borrows the vectors instead of adding them.
+    num_vectors_ = vectors_->num_vectors();
     inverted_lists_ = ArrayInvertedLists::build_inverted_lists(
         get_dimension(), kElementSize, vectors_.get());
     vectors_.reset();
+    // The posting lists own their entries, so nothing borrows from a mapped CSR
+    // once the vectors are gone.
+    mapped_file_.close();
 
     // Posting lists are already sorted by doc_id because
     // build_inverted_lists iterates documents in ascending order.
     // Precompute max values per term.
     size_t n_terms = inverted_lists_->size();
-    max_term_scores_.resize(n_terms, 0.0F);
+    std::vector<float> max_term_scores(n_terms, 0.0F);
     for (size_t t = 0; t < n_terms; ++t) {
         auto& list = (*inverted_lists_)[t];
         assert(std::is_sorted(list.get_doc_ids().begin(),
                               list.get_doc_ids().end()));
-        max_term_scores_[t] = list.max_value();
+        max_term_scores[t] = list.max_value();
     }
+    max_term_scores_ = Buf<float>::own(std::move(max_term_scores));
 }
 
 auto InvertedIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,
@@ -371,79 +414,71 @@ void InvertedIndex::write_index(IOWriter* io_writer) {
     size_t num_vectors = num_vectors_;
     io_writer->write(&num_vectors, sizeof(size_t), 1);
 
-    // Write inverted lists
-    size_t n_terms = inverted_lists_ ? inverted_lists_->size() : 0;
-    io_writer->write(&n_terms, sizeof(size_t), 1);
-    size_t element_size = kElementSize;
-    io_writer->write(&element_size, sizeof(size_t), 1);
-
-    for (size_t i = 0; i < n_terms; ++i) {
-        const auto& list = (*inverted_lists_)[i];
-        const auto& doc_ids = list.get_doc_ids();
-        const auto& codes = list.get_codes();
-
-        size_t list_size = doc_ids.size();
-        io_writer->write(&list_size, sizeof(size_t), 1);
-        if (list_size > 0) {
-            io_writer->write(const_cast<idx_t*>(doc_ids.data()), sizeof(idx_t),
-                             list_size);
-            size_t codes_size = codes.size();
-            io_writer->write(const_cast<uint8_t*>(codes.data()),
-                             sizeof(uint8_t), codes_size);
-        }
+    if (inverted_lists_ == nullptr) {
+        ArrayInvertedLists(0, kElementSize).serialize(io_writer);
+    } else {
+        inverted_lists_->serialize(io_writer);
     }
 
-    // Write max_term_scores
+    // Padded like the arrays inside the posting lists, so a mapped reader can
+    // borrow these in place too.
     size_t scores_size = max_term_scores_.size();
     io_writer->write(&scores_size, sizeof(size_t), 1);
-    if (scores_size > 0) {
-        io_writer->write(max_term_scores_.data(), sizeof(float), scores_size);
-    }
+    io_align::write_padded(io_writer, max_term_scores_.data(), scores_size);
 }
 
 void InvertedIndex::read_index(IOReader* io_reader, int io_flags) {
-    io_reader->read(&num_vectors_, sizeof(size_t), 1);
+    size_t num_vectors = 0;
+    io_reader->read(&num_vectors, sizeof(size_t), 1);
 
-    // Read inverted lists
-    size_t n_terms = 0;
-    io_reader->read(&n_terms, sizeof(size_t), 1);
-    size_t element_size = 0;
-    io_reader->read(&element_size, sizeof(size_t), 1);
-    // write_index only ever writes kElementSize, so another width means a file
-    // this reader cannot parse -- in particular one written before the document
-    // count above, whose fields all land one slot early. The width also sets
-    // how many code bytes each list holds, so reading on desynchronizes the
-    // stream instead of failing.
-    if (element_size != kElementSize) {
-        throw std::runtime_error(
-            "inverted index file declares an unsupported element width");
-    }
+    // The element width is checked against kElementSize inside read(), which
+    // also catches a file written before the count above: its fields all land
+    // one slot early, and the width read is then the first list's size.
+    auto lists = ArrayInvertedLists::read(io_reader, kElementSize);
 
-    if (n_terms > 0) {
-        inverted_lists_ =
-            std::make_unique<ArrayInvertedLists>(n_terms, element_size);
-        for (size_t i = 0; i < n_terms; ++i) {
-            size_t list_size = 0;
-            io_reader->read(&list_size, sizeof(size_t), 1);
-            if (list_size > 0) {
-                std::vector<idx_t> doc_ids(list_size);
-                io_reader->read(doc_ids.data(), sizeof(idx_t), list_size);
-                size_t codes_size = list_size * element_size;
-                std::vector<uint8_t> codes(codes_size);
-                io_reader->read(codes.data(), sizeof(uint8_t), codes_size);
-                inverted_lists_->add_entries(static_cast<term_t>(i), list_size,
-                                             doc_ids.data(), codes.data());
-            }
-        }
-    }
-
-    // Read max_term_scores
     size_t scores_size = 0;
     io_reader->read(&scores_size, sizeof(size_t), 1);
-    if (scores_size > 0) {
-        max_term_scores_.resize(scores_size);
-        io_reader->read(max_term_scores_.data(), sizeof(float), scores_size);
+    Buf<float> scores = io_align::read_padded<float>(io_reader, scores_size);
+
+    throw_if_scores_are_incomplete(*lists, scores_size);
+    num_vectors_ = num_vectors;
+    max_term_scores_ = std::move(scores);
+    if (lists->size() > 0) {
+        // An index written before build() has no lists, and search() takes the
+        // null to mean exactly that.
+        inverted_lists_ = std::move(lists);
     }
+}
+
+InvertedIndex* InvertedIndex::mmap_index(int dimension, const char* index_file,
+                                         size_t pos) {
+    throw_if_null(index_file, "index_file must not be null");
+    auto index = std::make_unique<InvertedIndex>(dimension);
+
+    MmapFile mmap_file(std::string{index_file});
+    // `pos` is where write_index's payload begins, past the header read_header
+    // consumed. Absolute file offsets are what serialize() padded against, so
+    // the cursor has to start at 0 and skip rather than map from `pos`.
+    MmapCursor cursor(mmap_file.data(), mmap_file.size());
+    cursor.skip(pos);
+
+    // Same order write_index wrote them.
+    const auto num_vectors = cursor.read_scalar<size_t>();
+    auto lists = ArrayInvertedLists::map(&cursor, kElementSize);
+    const auto scores_size = cursor.read_scalar<size_t>();
+    Buf<float> scores = io_align::borrow_padded<float>(&cursor, scores_size);
+    throw_if_scores_are_incomplete(*lists, scores_size);
+
+    // Committed only once everything parsed, so a corrupt file cannot leave a
+    // half-mapped index behind. mapped_file_ last: the arrays above borrow from
+    // it, and moving it does not move the mapping itself.
+    index->num_vectors_ = num_vectors;
+    index->max_term_scores_ = std::move(scores);
+    if (lists->size() > 0) {
+        index->inverted_lists_ = std::move(lists);
+    }
+    index->mapped_file_ = std::move(mmap_file);
+    return index.release();
 }
 
 }  // namespace nsparse

@@ -45,6 +45,7 @@ def test_happy_case(residency, corpus, queries, oracle, tmp_path):
 
     if residency == "mmap":
         index = roundtrip(index, tmp_path / "inverted.idx", nsparse.kUseMmap)
+        assert index.num_vectors() == corpus.n
 
     dists, labels = search(index, queries)
     assert labels.shape == (queries.n, K)
