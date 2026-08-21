@@ -10,6 +10,7 @@ set(NSPARSE_SRC
     brutal_index.cpp
     seismic_index.cpp
     seismic_scalar_quantized_index.cpp
+    disk_seismic_index.cpp
     sparse_vectors.cpp
     index_factory.cpp
     id_map_index.cpp
