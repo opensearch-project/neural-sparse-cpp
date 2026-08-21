@@ -25,6 +25,7 @@
 #include "nsparse/seismic_common.h"
 #include "nsparse/seismic_index.h"
 #include "nsparse/seismic_scalar_quantized_index.h"
+#include "nsparse/disk_seismic_index.h"
 #include "nsparse/id_map_index.h"
 #include "nsparse/utils/scalar_quantizer.h"
 #include "nsparse/cluster/random_kmeans.h"
@@ -123,6 +124,7 @@ import_array();
 // SparseVectors mmap ignores above.
 %ignore nsparse::SeismicIndex::mmap_index;
 %ignore nsparse::SeismicScalarQuantizedIndex::mmap_index;
+%ignore nsparse::DiskSeismicIndex::mmap_index;
 %ignore nsparse::InvertedListClusters::serialize;
 %ignore nsparse::InvertedListClusters::deserialize;
 
@@ -173,6 +175,7 @@ import_array();
 %include "nsparse/seismic_common.h"
 %include "nsparse/seismic_index.h"
 %include "nsparse/seismic_scalar_quantized_index.h"
+%include "nsparse/disk_seismic_index.h"
 %include "nsparse/inverted_index.h"
 %include "nsparse/id_map_index.h"
 %include "nsparse/cluster/random_kmeans.h"
