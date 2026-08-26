@@ -86,12 +86,14 @@ void score_block(const detail::InlineForwardIndex* fwd,
         }
     } else if (vectors != nullptr) {
         const auto data = vectors->get_all_data();
+        const idx_t* const indptr = data.indptr_data;
+        const term_t* const indices = data.indices_data;
+        const float* const values = data.values_data;
         for (const idx_t doc_id : clusters[pl].get_docs(cid)) {
-            const idx_t start = data.indptr_data[doc_id];
-            const size_t len = data.indptr_data[doc_id + 1] - start;
-            score_doc(doc_id, data.indices_data + start,
-                      data.values_data + start, len, dense, id_selector, heap,
-                      visited);
+            const idx_t start = indptr[doc_id];
+            const size_t len = indptr[doc_id + 1] - start;
+            score_doc(doc_id, indices + start, values + start, len, dense,
+                      id_selector, heap, visited);
         }
     }
 }
@@ -111,6 +113,9 @@ void DiskSeismicIndex::add(idx_t n, const idx_t* indptr, const term_t* indices,
     const size_t indptr_size = n + 1;
     const size_t nnz = indptr[n];
     if (vectors_ == nullptr) {
+        // Fresh container: start the count at 0 so a stale num_vectors_ (e.g.
+        // left by a prior mmap load, which has no vectors_) cannot accumulate.
+        num_vectors_ = 0;
         vectors_ = std::make_unique<SparseVectors>(
             SparseVectorsConfig{.element_size = kElementSize,
                                 .dimension = static_cast<size_t>(dimension_)});
@@ -133,9 +138,15 @@ auto DiskSeismicIndex::search(idx_t n, const idx_t* indptr,
                               const term_t* indices, const float* values, int k,
                               SearchParameters* search_parameters)
     -> pair_of_score_id_vectors_t {
-    if (num_vectors_ == 0 || n == 0) {
-        return {std::vector<std::vector<float>>(n),
-                std::vector<std::vector<idx_t>>(n)};
+    // Quit early when there is nothing to score: no vectors, no queries, or no
+    // forward-vector source (fwd_ empty and vectors_ null — a corrupt or
+    // uninitialized index).
+    if (num_vectors_ == 0 || n == 0 ||
+        (fwd_.num_blocks() == 0 && vectors_ == nullptr)) {
+        return {
+            std::vector<std::vector<float>>(n, std::vector<float>(k, -1.0F)),
+            std::vector<std::vector<idx_t>>(
+                n, std::vector<idx_t>(k, detail::INVALID_IDX))};
     }
 
     // Resolve `cut` and `k_prime`. A DiskSeismicSearchParameters carries
@@ -156,13 +167,21 @@ auto DiskSeismicIndex::search(idx_t n, const idx_t* indptr,
                        search_parameters)) {
         cut = seismic_parameters->cut;
     }
+    // else: search_parameters is null or an unrelated SearchParameters subtype,
+    // so cut and k_prime keep the defaults initialized above.
+
+    // k_prime is a block budget, not a document count: a block holds many docs,
+    // so k_prime < k is valid (a few blocks can still fill k, and a short-fall
+    // is padded like any under-budget search). Only a non-positive budget is
+    // rejected.
     if (k_prime <= 0) {
         throw std::invalid_argument(
             "DiskSeismicIndex: k_prime (block budget) must be positive");
     }
 
-    std::vector<std::vector<float>> result_distances(n);
-    std::vector<std::vector<idx_t>> result_labels(n);
+    std::vector<std::vector<float>> result_distances(n, std::vector<float>(k, -1.0F));
+    std::vector<std::vector<idx_t>> result_labels(
+        n, std::vector<idx_t>(k, detail::INVALID_IDX));
     const size_t dim = static_cast<size_t>(dimension_);
 
 #pragma omp parallel
@@ -262,6 +281,10 @@ auto DiskSeismicIndex::single_query(
                     visited);
     }
 
+    // Reset only the query's own positions (q_len is small) instead of
+    // memset-ing the whole dim-sized table; mirrors the scatter at entry. The
+    // scattered writes are bounded by q_len and negligible next to the block
+    // reads/scoring that dominate the query.
     for (size_t i = 0; i < q_len; ++i) {
         dense[q_indices[i]] = 0.0F;
     }
