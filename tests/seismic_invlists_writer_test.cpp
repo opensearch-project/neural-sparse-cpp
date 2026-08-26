@@ -135,6 +135,56 @@ TEST(SeismicInvertedListsWriter, serialize_deserialize_with_summaries) {
     ASSERT_EQ(result[0].cluster_size(), 2);
 }
 
+// summaries_only omits the doc-id membership: the stream must be smaller yet
+// still round-trip through the unchanged reader with the summaries intact.
+TEST(SeismicInvertedListsWriter, summaries_only_drops_membership_keeps_summaries) {
+    std::vector<std::vector<nsparse::idx_t>> docs = {{0, 1}, {2}};
+    nsparse::InvertedListClusters clusters(docs);
+    auto vectors = create_float_vectors(
+        {{0, 1}, {0, 2}, {1, 2}}, {{1.0F, 2.0F}, {1.5F, 1.0F}, {3.0F, 2.0F}});
+    clusters.summarize(&vectors, 1.0F);
+    std::vector<nsparse::InvertedListClusters> original;
+    original.push_back(std::move(clusters));
+
+    nsparse::BufferedIOWriter full_writer;
+    nsparse::SeismicInvertedListsWriter(original).serialize(&full_writer);
+    nsparse::BufferedIOWriter summaries_writer;
+    nsparse::SeismicInvertedListsWriter(original, /*summaries_only=*/true)
+        .serialize(&summaries_writer);
+
+    // Dropping docs_/offsets_ makes the summaries-only stream strictly smaller.
+    EXPECT_LT(summaries_writer.size(), full_writer.size());
+
+    // Both streams round-trip through the same (unchanged) reader.
+    nsparse::BufferedIOReader full_reader(full_writer.data());
+    nsparse::SeismicInvertedListsWriter full_rt;
+    full_rt.deserialize(&full_reader);
+    auto full_lists = full_rt.release();
+
+    nsparse::BufferedIOReader summaries_reader(summaries_writer.data());
+    nsparse::SeismicInvertedListsWriter summaries_rt;
+    summaries_rt.deserialize(&summaries_reader);
+    auto summaries_lists = summaries_rt.release();
+
+    ASSERT_EQ(full_lists.size(), 1U);
+    ASSERT_EQ(summaries_lists.size(), 1U);
+    // The cluster count (a stored scalar) survives; only membership was dropped.
+    EXPECT_EQ(summaries_lists[0].cluster_size(), full_lists[0].cluster_size());
+
+    // Summaries are byte-preserved: the same query scores both identically.
+    std::vector<nsparse::term_t> q_idx = {0, 1, 2};
+    std::vector<float> q_val = {1.0F, 1.0F, 1.0F};
+    std::vector<float> full_scores;
+    std::vector<float> summaries_scores;
+    full_lists[0].score_summaries_transposed(
+        q_idx.data(), reinterpret_cast<const uint8_t*>(q_val.data()),
+        q_idx.size(), full_scores);
+    summaries_lists[0].score_summaries_transposed(
+        q_idx.data(), reinterpret_cast<const uint8_t*>(q_val.data()),
+        q_idx.size(), summaries_scores);
+    EXPECT_EQ(summaries_scores, full_scores);
+}
+
 // release() hands over what deserialize() read; it is not a way to take back a
 // vector handed in for writing, which the writer only borrows.
 TEST(SeismicInvertedListsWriter, release_moves_deserialized_data) {

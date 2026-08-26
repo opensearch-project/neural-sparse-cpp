@@ -47,8 +47,13 @@ venv/
 # third_party
 third_party/
 
-# build
+# build (and out-of-tree build directories)
 build/
+build-*/
+
+# SWIG copies the base interface into these per-SIMD files at build time
+# (configure_file COPYONLY); they are generated, not source.
+nsparse/python/swignsparse_*.swig
 
 # claude
 .claude/settings.local.json

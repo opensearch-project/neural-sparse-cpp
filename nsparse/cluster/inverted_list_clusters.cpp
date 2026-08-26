@@ -208,6 +208,11 @@ InvertedListClusters::InvertedListClusters(
 }
 
 auto InvertedListClusters::get_docs(idx_t idx) const -> std::span<const idx_t> {
+    // A summaries-only load leaves offsets_ empty; return an empty span rather
+    // than indexing it out of bounds. Populated lists are unaffected.
+    if (offsets_.size() < static_cast<size_t>(idx) + 2) {
+        return {};
+    }
     return {docs_.data() + offsets_[idx],
             static_cast<size_t>(offsets_[idx + 1] - offsets_[idx])};
 }
@@ -340,6 +345,23 @@ void InvertedListClusters::serialize(IOWriter* writer) const {
     writer->write(&n_offsets, sizeof(size_t), 1);
     io_align::write_padded(writer, offsets_.data(), n_offsets);
 
+    serialize_summary_store(writer);
+}
+
+void InvertedListClusters::serialize_summaries_only(IOWriter* writer) const {
+    // docs_/offsets_ emitted as count-0 arrays: the membership is redundant
+    // with the inline forward index and unread on the mmap path. Count-0 keeps
+    // the byte layout identical (io/align.h), so the reader is unchanged.
+    size_t zero = 0;
+    writer->write(&zero, sizeof(size_t), 1);
+    io_align::write_padded<idx_t>(writer, nullptr, 0);
+    writer->write(&zero, sizeof(size_t), 1);
+    io_align::write_padded<idx_t>(writer, nullptr, 0);
+
+    serialize_summary_store(writer);
+}
+
+void InvertedListClusters::serialize_summary_store(IOWriter* writer) const {
     // Transposed (CSC) summary store.
     size_t n_clusters = n_clusters_;
     writer->write(&n_clusters, sizeof(size_t), 1);

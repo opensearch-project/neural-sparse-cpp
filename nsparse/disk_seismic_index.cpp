@@ -297,7 +297,10 @@ auto DiskSeismicIndex::single_query(
 void DiskSeismicIndex::write_index(IOWriter* io_writer) {
     const uint64_t nv = num_vectors_;
     io_writer->write(const_cast<uint64_t*>(&nv), sizeof(uint64_t), 1);
-    SeismicInvertedListsWriter inv_list_writer(clustered_inverted_lists);
+    // Summaries only: the doc-id membership is already in the inline forward
+    // index below, so writing it in the posting lists too would duplicate it.
+    SeismicInvertedListsWriter inv_list_writer(clustered_inverted_lists,
+                                               /*summaries_only=*/true);
     inv_list_writer.serialize(io_writer);
     // Inline forward index, built from the same clusters + vectors. An empty
     // corpus uses a correctly-typed empty SparseVectors (element_size must be a

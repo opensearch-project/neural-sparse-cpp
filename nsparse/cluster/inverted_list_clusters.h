@@ -40,6 +40,10 @@ public:
     size_t cluster_size() const { return n_clusters_; }
 
     void serialize(IOWriter* writer) const override;
+    // Like serialize() but emits the doc-id membership empty, for indexes that
+    // keep it elsewhere (DiskSeismic's inline forward index). Read back by the
+    // regular deserialize()/mmap_deserialize().
+    void serialize_summaries_only(IOWriter* writer) const;
     void deserialize(IOReader* reader) override;
     void mmap_deserialize(MmapCursor* cursor) override;
 
@@ -54,6 +58,10 @@ public:
                                     std::vector<float>& out) const;
 
 private:
+    // Writes the transposed (CSC) summary store — the tail shared by serialize()
+    // and serialize_summaries_only().
+    void serialize_summary_store(IOWriter* writer) const;
+
     // Build the term-major (CSC) transpose from a per-cluster CSR summary. The
     // CSR summary is transient; only the transpose is retained.
     void build_transpose(const SparseVectors& summaries);

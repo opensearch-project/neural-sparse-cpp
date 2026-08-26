@@ -26,9 +26,13 @@ namespace nsparse {
 class SeismicInvertedListsWriter : public MmapSerializable {
 public:
     // For writing. `clustered_inverted_lists` must outlive this writer.
+    // `summaries_only` writes each list's doc-id membership empty (see
+    // InvertedListClusters::serialize_summaries_only).
     explicit SeismicInvertedListsWriter(
-        const std::vector<InvertedListClusters>& clustered_inverted_lists)
-        : borrowed_(&clustered_inverted_lists) {}
+        const std::vector<InvertedListClusters>& clustered_inverted_lists,
+        bool summaries_only = false)
+        : borrowed_(&clustered_inverted_lists),
+          summaries_only_(summaries_only) {}
 
     // For reading; deserialize() fills the internal store.
     SeismicInvertedListsWriter() = default;
@@ -38,7 +42,11 @@ public:
         size_t size = lists.size();
         writer->write(&size, sizeof(size), 1);
         for (const auto& clusters : lists) {
-            clusters.serialize(writer);
+            if (summaries_only_) {
+                clusters.serialize_summaries_only(writer);
+            } else {
+                clusters.serialize(writer);
+            }
         }
     }
     void deserialize(IOReader* reader) override {
@@ -67,6 +75,8 @@ private:
     // when default-constructed and filled by deserialize().
     const std::vector<InvertedListClusters>* borrowed_ = nullptr;
     std::vector<InvertedListClusters> owned_;
+    // Write-side only: omit the doc-id membership (reader is agnostic).
+    bool summaries_only_ = false;
 };
 }  // namespace nsparse
 
