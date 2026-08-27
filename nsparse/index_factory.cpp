@@ -51,6 +51,41 @@ std::string trim(const std::string& str) {
     return str.substr(first, last - first + 1);
 }
 
+// The cluster knobs shared by every seismic-family index. `get_param` is the
+// (key, default) -> value lookup over the parsed description.
+template <class GetParam>
+SeismicClusterParameters parse_cluster_params(const GetParam& get_param) {
+    return {.lambda = std::stoi(get_param("lambda", "10")),
+            .beta = std::stoi(get_param("beta", "5")),
+            .alpha = std::stof(get_param("alpha", "0.5")),
+            .seed = std::stoi(get_param("seed", std::to_string(kRandomSeed)))};
+}
+
+struct QuantizerConfig {
+    QuantizerType type;
+    float vmin;
+    float vmax;
+};
+
+// The quantizer knobs shared by seismic_sq and disk_seismic_sq. An unrecognized
+// quantizer= is rejected rather than silently falling back to a width.
+template <class GetParam>
+QuantizerConfig parse_quantizer_config(const GetParam& get_param) {
+    const std::string quantizer_str = get_param("quantizer", "8bit");
+    QuantizerType type = QuantizerType::QT_8bit;
+    if (quantizer_str == "8bit") {
+        type = QuantizerType::QT_8bit;
+    } else if (quantizer_str == "16bit") {
+        type = QuantizerType::QT_16bit;
+    } else {
+        throw std::invalid_argument("unknown quantizer '" + quantizer_str +
+                                    "'; expected '8bit' or '16bit'");
+    }
+    return {.type = type,
+            .vmin = std::stof(get_param("vmin", "0.0")),
+            .vmax = std::stof(get_param("vmax", "1.0"))};
+}
+
 }  // namespace
 
 // description is segmented by ,
@@ -103,62 +138,23 @@ Index* index_factory(int dimension, const char* description) {
     }
 
     if (index_type == "seismic") {
-        int lambda = std::stoi(get_param("lambda", "10"));
-        int beta = std::stoi(get_param("beta", "5"));
-        float alpha = std::stof(get_param("alpha", "0.5"));
-        int seed = std::stoi(get_param("seed", std::to_string(kRandomSeed)));
-        return new SeismicIndex(dimension, {.lambda = lambda = lambda,
-                                            .beta = beta = beta,
-                                            .alpha = alpha = alpha,
-                                            .seed = seed});
+        return new SeismicIndex(dimension, parse_cluster_params(get_param));
     }
 
     if (index_type == "disk_seismic") {
-        int lambda = std::stoi(get_param("lambda", "10"));
-        int beta = std::stoi(get_param("beta", "5"));
-        float alpha = std::stof(get_param("alpha", "0.5"));
-        int seed = std::stoi(get_param("seed", std::to_string(kRandomSeed)));
-        return new DiskSeismicIndex(
-            dimension,
-            {.lambda = lambda, .beta = beta, .alpha = alpha, .seed = seed});
+        return new DiskSeismicIndex(dimension, parse_cluster_params(get_param));
     }
 
     if (index_type == "disk_seismic_sq") {
-        std::string quantizer_str = get_param("quantizer", "8bit");
-        QuantizerType quantizer_type = QuantizerType::QT_8bit;
-        if (quantizer_str == "16bit") {
-            quantizer_type = QuantizerType::QT_16bit;
-        }
-        float vmin = std::stof(get_param("vmin", "0.0"));
-        float vmax = std::stof(get_param("vmax", "1.0"));
-        int lambda = std::stoi(get_param("lambda", "10"));
-        int beta = std::stoi(get_param("beta", "5"));
-        float alpha = std::stof(get_param("alpha", "0.5"));
-        int seed = std::stoi(get_param("seed", std::to_string(kRandomSeed)));
+        const QuantizerConfig q = parse_quantizer_config(get_param);
         return new DiskSeismicScalarQuantizedIndex(
-            quantizer_type, vmin, vmax,
-            {.lambda = lambda, .beta = beta, .alpha = alpha, .seed = seed},
-            dimension);
+            q.type, q.vmin, q.vmax, parse_cluster_params(get_param), dimension);
     }
 
     if (index_type == "seismic_sq") {
-        std::string quantizer_str = get_param("quantizer", "8bit");
-        QuantizerType quantizer_type = QuantizerType::QT_8bit;
-        if (quantizer_str == "16bit") {
-            quantizer_type = QuantizerType::QT_16bit;
-        }
-        float vmin = std::stof(get_param("vmin", "0.0"));
-        float vmax = std::stof(get_param("vmax", "1.0"));
-        int lambda = std::stoi(get_param("lambda", "10"));
-        int beta = std::stoi(get_param("beta", "5"));
-        float alpha = std::stof(get_param("alpha", "0.5"));
-        int seed = std::stoi(get_param("seed", std::to_string(kRandomSeed)));
-        return new SeismicScalarQuantizedIndex(quantizer_type, vmin, vmax,
-                                               {.lambda = lambda = lambda,
-                                                .beta = beta = beta,
-                                                .alpha = alpha = alpha,
-                                                .seed = seed},
-                                               dimension);
+        const QuantizerConfig q = parse_quantizer_config(get_param);
+        return new SeismicScalarQuantizedIndex(
+            q.type, q.vmin, q.vmax, parse_cluster_params(get_param), dimension);
     }
 
     if (index_type == "idmap") {

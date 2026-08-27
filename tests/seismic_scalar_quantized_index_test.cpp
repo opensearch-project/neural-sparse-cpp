@@ -998,7 +998,7 @@ private:
 #endif
 
 // Where read_index leaves off before the payload. SESQ's payload opens with the
-// quantizer header write_quantizer_header wrote.
+// quantization header write_quantization_header wrote.
 constexpr size_t kQuantizerTypeOffset = kIndexHeaderSize;
 constexpr size_t kVminOffset = kQuantizerTypeOffset + sizeof(QuantizerType);
 

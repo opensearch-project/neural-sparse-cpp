@@ -357,7 +357,7 @@ auto SeismicScalarQuantizedIndex::single_query(
 }
 
 void SeismicScalarQuantizedIndex::write_index(IOWriter* io_writer) {
-    write_quantizer_header(io_writer);
+    write_quantization_header(io_writer);
     // write vectors
     if (vectors_ == nullptr) {
         empty_sparse_vectors.serialize(io_writer);
@@ -371,7 +371,7 @@ void SeismicScalarQuantizedIndex::write_index(IOWriter* io_writer) {
 void SeismicScalarQuantizedIndex::read_index(IOReader* io_reader,
                                              const IndexHeader& header,
                                              int io_flags) {
-    read_quantizer_header(io_reader);
+    read_quantization_header(io_reader);
     SparseVectors tmp_vectors;
     tmp_vectors.deserialize(io_reader);
     throw_if_element_size_mismatch(tmp_vectors, sq_);
@@ -421,7 +421,8 @@ SeismicScalarQuantizedIndex* SeismicScalarQuantizedIndex::mmap_index(
     return index.release();
 }
 
-void SeismicScalarQuantizedIndex::write_quantizer_header(IOWriter* io_writer) {
+void SeismicScalarQuantizedIndex::write_quantization_header(
+    IOWriter* io_writer) {
     auto sq_type = sq_.get_quantizer_type();
     io_writer->write(&sq_type, sizeof(QuantizerType), 1);
     auto vmin = sq_.get_min();
@@ -430,7 +431,7 @@ void SeismicScalarQuantizedIndex::write_quantizer_header(IOWriter* io_writer) {
     io_writer->write(&vmax, sizeof(float), 1);
 }
 
-void SeismicScalarQuantizedIndex::read_quantizer_header(IOReader* io_reader) {
+void SeismicScalarQuantizedIndex::read_quantization_header(IOReader* io_reader) {
     QuantizerType sq_type = QuantizerType::QT_8bit;
     float vmin = 0.0F;
     float vmax = 1.0F;

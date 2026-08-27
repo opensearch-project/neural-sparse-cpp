@@ -11,12 +11,11 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <fstream>
+#include <ios>
 #include <memory>
-#include <random>
-#include <set>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -27,75 +26,11 @@
 #include "nsparse/io/index_io.h"
 #include "nsparse/types.h"
 #include "nsparse/utils/scalar_quantizer.h"
+#include "tests/disk_seismic_test_util.h"
 
 namespace nsparse {
+using namespace disk_seismic_test;  // NOLINT(build/namespaces)
 namespace {
-
-// Fixed cluster params + seed so builds are reproducible and the quantized and
-// float indexes select the same candidate blocks.
-constexpr int kLambda = 32;
-constexpr int kBeta = 8;
-constexpr float kAlpha = 0.4F;
-constexpr int kSeed = 42;
-constexpr int kDim = 400;
-
-SeismicClusterParameters cluster_params() {
-    return {.lambda = kLambda, .beta = kBeta, .alpha = kAlpha, .seed = kSeed};
-}
-
-struct CSR {
-    std::vector<idx_t> indptr;
-    std::vector<term_t> indices;
-    std::vector<float> values;
-    idx_t n = 0;
-};
-
-// A reproducible random sparse corpus: each row has a random number of distinct
-// terms (sorted ascending, CSR convention) with values in (0, 1] -- so the
-// default quantizer range [0, 1] covers them without clipping.
-CSR make_corpus(idx_t rows, unsigned seed) {
-    std::mt19937 rng(seed);
-    std::uniform_int_distribution<int> nnz_dist(5, 25);
-    std::uniform_int_distribution<int> term_dist(0, kDim - 1);
-    std::uniform_real_distribution<float> val_dist(0.05F, 1.0F);
-    CSR c;
-    c.n = rows;
-    c.indptr.push_back(0);
-    for (idx_t r = 0; r < rows; ++r) {
-        std::set<int> terms;
-        const int nnz = nnz_dist(rng);
-        while (static_cast<int>(terms.size()) < nnz)
-            terms.insert(term_dist(rng));
-        for (const int t : terms) {
-            c.indices.push_back(static_cast<term_t>(t));
-            c.values.push_back(val_dist(rng));
-        }
-        c.indptr.push_back(static_cast<idx_t>(c.indices.size()));
-    }
-    return c;
-}
-
-void add_corpus(Index& index, const CSR& c) {
-    index.add(c.n, c.indptr.data(), c.indices.data(), c.values.data());
-}
-
-// Index file removed on destruction. write_index/read_index take char*.
-class TempIndexFile {
-public:
-    explicit TempIndexFile(const std::string& name)
-        : path_(std::filesystem::temp_directory_path() / name) {
-        std::filesystem::remove(path_);
-    }
-    ~TempIndexFile() { std::filesystem::remove(path_); }
-    TempIndexFile(const TempIndexFile&) = delete;
-    TempIndexFile& operator=(const TempIndexFile&) = delete;
-    char* c_str() { return path_str_.data(); }
-    std::uintmax_t size() const { return std::filesystem::file_size(path_); }
-
-private:
-    std::filesystem::path path_{};
-    std::string path_str_ = path_.string();
-};
 
 // The quantizer header (type u8 + vmin f32 + vmax f32) is the first thing
 // write_index writes after the common IndexHeader, so the type byte sits right
@@ -131,43 +66,6 @@ void expect_mmap_read_rejected(char* path, const char* fragment) {
     } catch (const std::runtime_error& error) {
         EXPECT_NE(std::string(error.what()).find(fragment), std::string::npos)
             << error.what();
-    }
-}
-
-using ScoreIds =
-    std::pair<std::vector<std::vector<float>>, std::vector<std::vector<idx_t>>>;
-
-// K' large enough to select every candidate block (saturates the budget).
-constexpr int kAllBlocks = 1'000'000;
-
-ScoreIds search_all(Index& index, const CSR& queries, int k,
-                    SearchParameters* params) {
-    std::vector<float> distances(static_cast<size_t>(queries.n) * k);
-    std::vector<idx_t> labels(static_cast<size_t>(queries.n) * k);
-    index.search(queries.n, queries.indptr.data(), queries.indices.data(),
-                 queries.values.data(), k, distances.data(), labels.data(),
-                 params);
-    ScoreIds out;
-    out.first.resize(queries.n);
-    out.second.resize(queries.n);
-    for (idx_t q = 0; q < queries.n; ++q) {
-        for (int j = 0; j < k; ++j) {
-            out.first[q].push_back(distances[static_cast<size_t>(q) * k + j]);
-            out.second[q].push_back(labels[static_cast<size_t>(q) * k + j]);
-        }
-    }
-    return out;
-}
-
-void expect_same_results(const ScoreIds& a, const ScoreIds& b) {
-    ASSERT_EQ(a.second.size(), b.second.size());
-    for (size_t q = 0; q < a.second.size(); ++q) {
-        EXPECT_EQ(a.second[q], b.second[q]) << "labels differ at query " << q;
-        ASSERT_EQ(a.first[q].size(), b.first[q].size());
-        for (size_t j = 0; j < a.first[q].size(); ++j) {
-            EXPECT_FLOAT_EQ(a.first[q][j], b.first[q][j])
-                << "score differs at query " << q << " rank " << j;
-        }
     }
 }
 

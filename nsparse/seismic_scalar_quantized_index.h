@@ -79,8 +79,8 @@ private:
                     int io_flags = 0) override;
     // The quantizer parameters that open this index's payload -- distinct from
     // the IndexHeader the file itself starts with.
-    void write_quantizer_header(IOWriter* io_writer);
-    void read_quantizer_header(IOReader* io_reader);
+    void write_quantization_header(IOWriter* io_writer);
+    void read_quantization_header(IOReader* io_reader);
 
     // Null `search_parameters` searches with the defaults, as it does for
     // SeismicIndex and as the base signature's default argument implies. This

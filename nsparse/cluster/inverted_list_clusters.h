@@ -39,6 +39,11 @@ public:
 
     size_t cluster_size() const { return n_clusters_; }
 
+    // Width (bytes) of each stored summary value: the dispatch
+    // score_summaries_transposed uses, so a reader can check it against the
+    // width its query is encoded at.
+    [[nodiscard]] size_t element_size() const { return element_size_; }
+
     void serialize(IOWriter* writer) const override;
     // Like serialize() but emits the doc-id membership empty, for indexes that
     // keep it elsewhere (DiskSeismic's inline forward index). Read back by the

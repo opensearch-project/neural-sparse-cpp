@@ -25,6 +25,7 @@
 #include "nsparse/seismic_common.h"
 #include "nsparse/seismic_index.h"
 #include "nsparse/seismic_scalar_quantized_index.h"
+#include "nsparse/disk_seismic_index_base.h"
 #include "nsparse/disk_seismic_index.h"
 #include "nsparse/disk_seismic_scalar_quantized_index.h"
 #include "nsparse/id_map_index.h"
@@ -192,6 +193,10 @@ import_array();
 %include "nsparse/seismic_common.h"
 %include "nsparse/seismic_index.h"
 %include "nsparse/seismic_scalar_quantized_index.h"
+// The disk-resident indexes derive from DiskSeismicIndexBase (itself a
+// MmapIndex), so SWIG needs the base first or the Python classes lose their
+// inherited search / num_vectors / add.
+%include "nsparse/disk_seismic_index_base.h"
 %include "nsparse/disk_seismic_index.h"
 %include "nsparse/disk_seismic_scalar_quantized_index.h"
 %include "nsparse/inverted_index.h"
@@ -201,10 +206,10 @@ import_array();
 // index_factory returns a new object - Python takes ownership
 // Use %factory to enable proper downcasting based on runtime type
 %newobject nsparse::index_factory;
-%factory(nsparse::Index* nsparse::index_factory, nsparse::BrutalIndex, nsparse::SeismicIndex, nsparse::SeismicScalarQuantizedIndex, nsparse::DiskSeismicScalarQuantizedIndex, nsparse::IDMapIndex, nsparse::InvertedIndex);
+%factory(nsparse::Index* nsparse::index_factory, nsparse::BrutalIndex, nsparse::SeismicIndex, nsparse::SeismicScalarQuantizedIndex, nsparse::DiskSeismicIndex, nsparse::DiskSeismicScalarQuantizedIndex, nsparse::IDMapIndex, nsparse::InvertedIndex);
 %include "nsparse/index_factory.h"
 
 // read_index returns a new object - Python takes ownership
 %newobject nsparse::read_index;
-%factory(nsparse::Index* nsparse::read_index, nsparse::BrutalIndex, nsparse::SeismicIndex, nsparse::SeismicScalarQuantizedIndex, nsparse::DiskSeismicScalarQuantizedIndex, nsparse::IDMapIndex, nsparse::InvertedIndex);
+%factory(nsparse::Index* nsparse::read_index, nsparse::BrutalIndex, nsparse::SeismicIndex, nsparse::SeismicScalarQuantizedIndex, nsparse::DiskSeismicIndex, nsparse::DiskSeismicScalarQuantizedIndex, nsparse::IDMapIndex, nsparse::InvertedIndex);
 %include "nsparse/io/index_io.h"

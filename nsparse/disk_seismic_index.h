@@ -14,12 +14,8 @@
 #include <cstdint>
 #include <vector>
 
-#include "absl/container/flat_hash_set.h"
-#include "nsparse/cluster/inverted_list_clusters.h"
-#include "nsparse/io/inline_forward_index_io.h"
+#include "nsparse/disk_seismic_index_base.h"
 #include "nsparse/io/io.h"
-#include "nsparse/mmap_index.h"
-#include "nsparse/seismic_common.h"
 #include "nsparse/seismic_index.h"  // SeismicSearchParameters
 #include "nsparse/types.h"
 
@@ -30,7 +26,7 @@ inline constexpr int kDefaultBlockBudget = 50;
 
 // `cut` (inherited) bounds which posting lists' summaries are scored; `k_prime`
 // caps how many blocks are read (the k_prime highest-scoring ones). Replaces
-// the inherited heap_factor, which DiskSeismicIndex ignores.
+// the inherited heap_factor, which the disk-resident indexes ignore.
 struct DiskSeismicSearchParameters : public SeismicSearchParameters {
     int k_prime = kDefaultBlockBudget;
     DiskSeismicSearchParameters() = default;
@@ -39,18 +35,13 @@ struct DiskSeismicSearchParameters : public SeismicSearchParameters {
           k_prime(k_prime) {}
 };
 
-// A seismic index whose per-document forward vectors live on disk in the
-// block-contiguous (inline) layout of io/inline_forward_index_io.h, borrowed
-// via mmap at search time; the cluster summaries stay in RAM. Search scores
-// every candidate block's summary across the `cut` posting lists, selects the
-// global top-k_prime blocks, and reads and scores only those. Pass a
-// DiskSeismicSearchParameters to set k_prime, else kDefaultBlockBudget is used.
-//
-// A block's vectors come from fwd_.block() (the mapping) once loaded, else from
-// the in-RAM SparseVectors of a fresh build.
+// A SEISMIC index whose per-document forward vectors live on disk as float, in
+// the block-contiguous (inline) layout, borrowed via mmap at search time; the
+// cluster summaries stay in RAM. The disk-resident search and serialization
+// live in DiskSeismicIndexBase; this type only pins the value width to float.
 //
 // mmap-only: load with read_index(file, kUseMmap); the copying read throws.
-class DiskSeismicIndex : public MmapIndex, public IndexIO {
+class DiskSeismicIndex : public DiskSeismicIndexBase {
 public:
     static constexpr std::array<char, 4> name = {'D', 'S', 'E', 'I'};
     // Bump whenever write_index's payload layout changes.
@@ -64,51 +55,22 @@ public:
     DiskSeismicIndex(const DiskSeismicIndex&) = delete;
     DiskSeismicIndex& operator=(const DiskSeismicIndex&) = delete;
 
-    void add(idx_t n, const idx_t* indptr, const term_t* indices,
-             const float* values) override;
-    void build() override;
-
-    // Persisted, since a mapped index has no in-RAM vectors_ to derive it from.
-    size_t num_vectors() const override { return num_vectors_; }
-
     // Borrows a serialized index from a file mapping. `pos` is where the
     // payload begins.
     static DiskSeismicIndex* mmap_index(const IndexHeader& header,
                                         const char* index_file, size_t pos);
 
-protected:
-    std::vector<InvertedListClusters> clustered_inverted_lists;
-
 private:
     [[nodiscard]] uint32_t format_version() const override {
         return kFormatVersion;
     }
-    void write_index(IOWriter* io_writer) override;
-    // Unsupported: the inline forward index is mmap-only. Throws.
-    void read_index(IOReader* io_reader, const IndexHeader& header,
-                    int io_flags = 0) override;
-
-    auto search(idx_t n, const idx_t* indptr, const term_t* indices,
-                const float* values, int k,
-                SearchParameters* search_parameters = nullptr)
-        -> pair_of_score_id_vectors_t override;
-
-    // Selects the global top-k_prime blocks across `cuts` by summary score and
-    // scores their docs. `dense` is per-thread scratch, zero on entry and
-    // restored on exit; `visited` is cleared on entry.
-    auto single_query(std::vector<float>& dense,
-                      absl::flat_hash_set<idx_t>& visited,
-                      const term_t* q_indices, const float* q_values,
-                      size_t q_len, const std::vector<term_t>& cuts, int k,
-                      int k_prime, SearchParameters* search_parameters)
-        -> pair_of_score_id_vector_t;
-
-    SeismicClusterParameters cluster_parameter_;
-    // Borrows from the base's mapped_file_, so it is declared here (destroyed
-    // before the mapping). Empty after a fresh build (search uses vectors_
-    // then).
-    detail::InlineForwardIndex fwd_;
-    size_t num_vectors_ = 0;
+    [[nodiscard]] size_t code_element_size() const override;
+    const uint8_t* encode_values(const float* values, size_t nnz,
+                                 std::vector<uint8_t>& scratch) const override;
+    const uint8_t* encode_query(
+        const float* values, size_t nnz,
+        const SearchParameters* search_parameters,
+        std::vector<uint8_t>& scratch) const override;
 };
 }  // namespace nsparse
 
