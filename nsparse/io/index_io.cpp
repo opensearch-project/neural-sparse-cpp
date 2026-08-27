@@ -17,6 +17,7 @@
 
 #include "nsparse/brutal_index.h"
 #include "nsparse/disk_seismic_index.h"
+#include "nsparse/disk_seismic_scalar_quantized_index.h"
 #include "nsparse/id_map_index.h"
 #include "nsparse/inverted_index.h"
 #include "nsparse/io/file_io.h"
@@ -34,6 +35,7 @@ constexpr uint32_t SESQ = fourcc(SeismicScalarQuantizedIndex::name);
 constexpr uint32_t IDMP = fourcc(IDMapIndex::name);
 constexpr uint32_t INVT = fourcc(InvertedIndex::name);
 constexpr uint32_t DSEI = fourcc(DiskSeismicIndex::name);
+constexpr uint32_t DSSQ = fourcc(DiskSeismicScalarQuantizedIndex::name);
 
 // Closes a stream once, on whichever path leaves the scope.
 //
@@ -90,6 +92,9 @@ Index* mmap_index_payload(const IndexHeader& header, const char* file_name,
             return InvertedIndex::mmap_index(header, file_name, pos);
         case DSEI:
             return DiskSeismicIndex::mmap_index(header, file_name, pos);
+        case DSSQ:
+            return DiskSeismicScalarQuantizedIndex::mmap_index(header,
+                                                               file_name, pos);
         default:
             return nullptr;
     }
@@ -138,6 +143,8 @@ Index* make_index(const IndexHeader& header) {
             return new SeismicScalarQuantizedIndex(header.dimension);
         case DSEI:
             return new DiskSeismicIndex(header.dimension);
+        case DSSQ:
+            return new DiskSeismicScalarQuantizedIndex(header.dimension);
         case IDMP:
             return new IDMapIndex();
         case INVT:

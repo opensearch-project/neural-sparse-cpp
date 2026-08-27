@@ -17,6 +17,7 @@
 
 #include "nsparse/brutal_index.h"
 #include "nsparse/disk_seismic_index.h"
+#include "nsparse/disk_seismic_scalar_quantized_index.h"
 #include "nsparse/id_map_index.h"
 #include "nsparse/index.h"
 #include "nsparse/inverted_index.h"
@@ -120,6 +121,24 @@ Index* index_factory(int dimension, const char* description) {
         return new DiskSeismicIndex(
             dimension,
             {.lambda = lambda, .beta = beta, .alpha = alpha, .seed = seed});
+    }
+
+    if (index_type == "disk_seismic_sq") {
+        std::string quantizer_str = get_param("quantizer", "8bit");
+        QuantizerType quantizer_type = QuantizerType::QT_8bit;
+        if (quantizer_str == "16bit") {
+            quantizer_type = QuantizerType::QT_16bit;
+        }
+        float vmin = std::stof(get_param("vmin", "0.0"));
+        float vmax = std::stof(get_param("vmax", "1.0"));
+        int lambda = std::stoi(get_param("lambda", "10"));
+        int beta = std::stoi(get_param("beta", "5"));
+        float alpha = std::stof(get_param("alpha", "0.5"));
+        int seed = std::stoi(get_param("seed", std::to_string(kRandomSeed)));
+        return new DiskSeismicScalarQuantizedIndex(
+            quantizer_type, vmin, vmax,
+            {.lambda = lambda, .beta = beta, .alpha = alpha, .seed = seed},
+            dimension);
     }
 
     if (index_type == "seismic_sq") {

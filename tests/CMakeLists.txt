@@ -31,6 +31,7 @@ set(NSPARSE_TEST_SRC
     scalar_quantizer_test.cpp
     seismic_common_test.cpp
     disk_seismic_index_test.cpp
+    disk_seismic_scalar_quantized_index_test.cpp
     seismic_index_test.cpp
     seismic_invlists_writer_test.cpp
     seismic_scalar_quantized_index_test.cpp

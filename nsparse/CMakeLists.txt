@@ -11,6 +11,7 @@ set(NSPARSE_SRC
     seismic_index.cpp
     seismic_scalar_quantized_index.cpp
     disk_seismic_index.cpp
+    disk_seismic_scalar_quantized_index.cpp
     sparse_vectors.cpp
     index_factory.cpp
     id_map_index.cpp
@@ -34,6 +35,8 @@ set(NSPARSE_HEADERS
     mmap_index.h
     seismic_index.h
     seismic_scalar_quantized_index.h
+    disk_seismic_index.h
+    disk_seismic_scalar_quantized_index.h
     inline_forward_index.h
     index_factory.h
     id_map_index.h
