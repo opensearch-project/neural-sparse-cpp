@@ -25,6 +25,21 @@ endif()
 
 FetchContent_MakeAvailable(googlebenchmark)
 
+# Kernel selection is compile-time (nsparse/utils/distance_simd.h) and the -m
+# flags live on the per-level library targets, so linking the plain `nsparse`
+# gets the scalar kernels no matter what NSPARSE_OPT_LEVEL says. Pick the library
+# that matches the requested level (as nsparse/python/CMakeLists.txt does) and
+# print which one, so a mismatch is visible instead of silently scalar. The
+# foreach over an explicit list (not nsparse_${NSPARSE_OPT_LEVEL}) makes a typo'd
+# level fall back to a target that exists rather than fail at link time.
+set(NSPARSE_BENCH_LIB nsparse)
+foreach(_level avx2 avx512 sve)
+    if(NSPARSE_OPT_LEVEL STREQUAL "${_level}")
+        set(NSPARSE_BENCH_LIB nsparse_${_level})
+    endif()
+endforeach()
+message(STATUS "benchmarks: NSPARSE_OPT_LEVEL=${NSPARSE_OPT_LEVEL} -> linking ${NSPARSE_BENCH_LIB}")
+
 if(NSPARSE_BENCHMARK_SRC)
     find_package(OpenMP REQUIRED)
 
@@ -33,7 +48,7 @@ if(NSPARSE_BENCHMARK_SRC)
     target_include_directories(nsparse_benchmark PRIVATE ${PROJECT_SOURCE_DIR})
 
     target_link_libraries(nsparse_benchmark PRIVATE
-        nsparse
+        ${NSPARSE_BENCH_LIB}
         OpenMP::OpenMP_CXX
         benchmark::benchmark
         benchmark::benchmark_main
@@ -48,7 +63,7 @@ endif()
 add_executable(sq_residency_bench sq_residency_bench.cpp)
 target_include_directories(sq_residency_bench PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(sq_residency_bench PRIVATE
-    nsparse
+    ${NSPARSE_BENCH_LIB}
     OpenMP::OpenMP_CXX
     absl::flat_hash_set
     absl::flat_hash_map
@@ -60,7 +75,7 @@ target_link_libraries(sq_residency_bench PRIVATE
 add_executable(nsparse_build_benchmark index_build_benchmark.cpp)
 target_include_directories(nsparse_build_benchmark PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(nsparse_build_benchmark PRIVATE
-    nsparse
+    ${NSPARSE_BENCH_LIB}
     OpenMP::OpenMP_CXX
     benchmark::benchmark
     absl::flat_hash_set

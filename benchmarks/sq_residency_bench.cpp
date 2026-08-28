@@ -35,6 +35,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "nsparse/disk_seismic_index.h"
 #include "nsparse/index.h"
 #include "nsparse/index_factory.h"
 #include "nsparse/io/index_io.h"
@@ -185,7 +186,7 @@ int do_build(int argc, char** argv) {
 int do_search(int argc, char** argv) {
     if (argc < 7) {
         std::cerr << "search <dat> <queries.csr> <k> <reps> <inmem|mmap> "
-                     "[truth.txt]\n";
+                     "[truth.txt|-] [cut] [k_prime] [heap_factor]\n";
         return 2;
     }
     std::string dat_path = argv[2];
@@ -193,7 +194,16 @@ int do_search(int argc, char** argv) {
     const int k = std::atoi(argv[4]);
     const int reps = std::atoi(argv[5]);
     const std::string residency = argv[6];
-    const std::string truth_path = argc > 7 ? argv[7] : "";
+    const std::string truth_path =
+        (argc > 7 && std::strcmp(argv[7], "-") != 0) ? argv[7] : "";
+    const int cut = argc > 8 ? std::atoi(argv[8]) : 3;
+    // k_prime > 0 selects the DiskSeismic GroC path (score summaries, take the
+    // global top-k' blocks); 0 uses the plain SEISMIC heap_factor traversal.
+    const int k_prime = argc > 9 ? std::atoi(argv[9]) : 0;
+    // SEISMIC pruning slack (used only when k_prime==0). Skip a cluster when
+    // cluster_score*heap_factor < heap.peek, so LARGER = prune fewer = higher
+    // recall + slower. Sweep this to raise SEISMIC recall for iso-recall points.
+    const float heap_factor = argc > 10 ? static_cast<float>(std::atof(argv[10])) : 1.0F;
 
     const int io_flags =
         residency == "mmap" ? nsparse::IndexIoFlag::kUseMmap : 0;
@@ -220,7 +230,14 @@ int do_search(int argc, char** argv) {
               << (vectors == nullptr ? 0 : vectors->get_element_size()) << "\n";
     print_memory("after_load");
 
-    nsparse::SeismicSearchParameters params(/*cut=*/3, /*heap_factor=*/1.0F);
+    std::unique_ptr<nsparse::SeismicSearchParameters> params;
+    if (k_prime > 0) {
+        params = std::make_unique<nsparse::DiskSeismicSearchParameters>(cut, k_prime);
+        std::cout << "search_params cut " << cut << " k_prime " << k_prime << "\n";
+    } else {
+        params = std::make_unique<nsparse::SeismicSearchParameters>(cut, heap_factor);
+        std::cout << "search_params cut " << cut << " heap_factor " << heap_factor << "\n";
+    }
     std::vector<float> distances(static_cast<size_t>(n_queries) * k);
     std::vector<nsparse::idx_t> labels(static_cast<size_t>(n_queries) * k);
 
@@ -231,7 +248,7 @@ int do_search(int argc, char** argv) {
         index->search(static_cast<nsparse::idx_t>(n_queries),
                       query.indptr.data(), query.indices.data(),
                       query.data.data(), k, distances.data(), labels.data(),
-                      &params);
+                      params.get());
         const auto t1 = std::chrono::steady_clock::now();
         const double ms =
             std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -255,7 +272,7 @@ int do_search(int argc, char** argv) {
         const auto t0 = std::chrono::steady_clock::now();
         index->search(1, q_indptr.data(), query.indices.data() + start,
                       query.data.data() + start, k, distances.data(),
-                      labels.data(), &params);
+                      labels.data(), params.get());
         const auto t1 = std::chrono::steady_clock::now();
         per_query_ms.push_back(
             std::chrono::duration<double, std::milli>(t1 - t0).count());
@@ -271,7 +288,7 @@ int do_search(int argc, char** argv) {
     // Recall from a final batched pass, so `labels` holds every query again.
     index->search(static_cast<nsparse::idx_t>(n_queries), query.indptr.data(),
                   query.indices.data(), query.data.data(), k, distances.data(),
-                  labels.data(), &params);
+                  labels.data(), params.get());
     if (!truth_path.empty()) {
         std::cout << "recall@" << k << " "
                   << recall_at_k(truth_path, labels, k, n_queries) << "\n";
