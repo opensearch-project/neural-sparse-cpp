@@ -75,3 +75,49 @@ include(GoogleTest)
 # every test case can exceed the 5s default, causing a spurious build failure.
 # Bump the timeout well above that to keep discovery robust.
 gtest_discover_tests(nsparse_test DISCOVERY_TIMEOUT 120)
+
+# SIMD kernel equivalence tests. distance_test.cpp above runs through the
+# flag-less `nsparse`, so it only ever exercises the scalar distance.h; the SIMD
+# kernels that ship in production (nsparse_avx2/avx512, selected at load time by
+# the Python bindings) are otherwise untested. Each binary below compiles
+# distance_kernel_equivalence_test.cpp with one ISA's -m flags so distance_simd.h
+# resolves to that SIMD kernel, and checks it against a plain reference.
+#
+# Because the whole binary is compiled for the ISA, its static initializers can
+# execute that ISA before main() -- so it must not even be launched on a CPU
+# that lacks the ISA (that would SIGILL, ahead of any in-process guard). ctest
+# therefore invokes each binary through run_if_isa_supported.cmake, which checks
+# the host CPU first and reports a skip otherwise; this also keeps the AVX-512
+# binary from faulting on an AVX-512-less host.
+#
+# Each binary links the matching per-ISA library (nsparse_avx2/avx512), so every
+# translation unit -- the test and the library -- is compiled for the same ISA:
+# the shared nsparse::detail kernel symbols then have one consistent definition
+# (no ODR violation), and SparseVectors' out-of-line symbols resolve. x86 only
+# for now; the NEON/SVE kernels want an ARM CI host and are a follow-up.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|i[3-6]86)" AND NOT WIN32)
+    # isa: label (also NSPARSE_EXPECT_ISA); cpu_flag: the /proc/cpuinfo token to
+    # gate the launch on; ARGN: the -m compile flags.
+    function(nsparse_add_kernel_test isa cpu_flag)
+        set(_tgt nsparse_${isa}_kernel_test)
+        add_executable(${_tgt} distance_kernel_equivalence_test.cpp)
+        target_include_directories(${_tgt} PRIVATE ${PROJECT_SOURCE_DIR})
+        target_compile_options(${_tgt} PRIVATE ${ARGN})
+        target_compile_definitions(${_tgt} PRIVATE NSPARSE_EXPECT_ISA="${isa}")
+        target_link_libraries(${_tgt} PRIVATE
+            nsparse_${isa}
+            OpenMP::OpenMP_CXX
+            GTest::gtest_main
+            absl::flat_hash_set
+        )
+        add_test(NAME ${_tgt}
+                 COMMAND ${CMAKE_COMMAND}
+                         -DTEST_EXE=$<TARGET_FILE:${_tgt}>
+                         -DCPU_FLAG=${cpu_flag}
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/run_if_isa_supported.cmake)
+    endfunction()
+
+    nsparse_add_kernel_test(avx2 avx2 -mavx2 -mfma -mf16c -mpopcnt)
+    nsparse_add_kernel_test(avx512 avx512f -mavx2 -mfma -mf16c -mavx512f
+                            -mavx512cd -mavx512vl -mavx512dq -mavx512bw -mpopcnt)
+endif()
