@@ -90,34 +90,57 @@ gtest_discover_tests(nsparse_test DISCOVERY_TIMEOUT 120)
 # the host CPU first and reports a skip otherwise; this also keeps the AVX-512
 # binary from faulting on an AVX-512-less host.
 #
-# Each binary links the matching per-ISA library (nsparse_avx2/avx512), so every
-# translation unit -- the test and the library -- is compiled for the same ISA:
-# the shared nsparse::detail kernel symbols then have one consistent definition
-# (no ODR violation), and SparseVectors' out-of-line symbols resolve. x86 only
-# for now; the NEON/SVE kernels want an ARM CI host and are a follow-up.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|i[3-6]86)" AND NOT WIN32)
-    # isa: label (also NSPARSE_EXPECT_ISA); cpu_flag: the /proc/cpuinfo token to
-    # gate the launch on; ARGN: the -m compile flags.
-    function(nsparse_add_kernel_test isa cpu_flag)
-        set(_tgt nsparse_${isa}_kernel_test)
-        add_executable(${_tgt} distance_kernel_equivalence_test.cpp)
-        target_include_directories(${_tgt} PRIVATE ${PROJECT_SOURCE_DIR})
-        target_compile_options(${_tgt} PRIVATE ${ARGN})
-        target_compile_definitions(${_tgt} PRIVATE NSPARSE_EXPECT_ISA="${isa}")
-        target_link_libraries(${_tgt} PRIVATE
-            nsparse_${isa}
-            OpenMP::OpenMP_CXX
-            GTest::gtest_main
-            absl::flat_hash_set
-        )
+# Each binary links the matching library (the base `nsparse` for an arch's
+# baseline kernel, else nsparse_avx2/avx512/sve), so every translation unit --
+# the test and the library -- is compiled for the same ISA: the shared
+# nsparse::detail kernel symbols then have one consistent definition (no ODR
+# violation), and SparseVectors' out-of-line symbols resolve.
+#
+# isa: label (also NSPARSE_EXPECT_ISA); cpu_flag: the /proc/cpuinfo (or macOS
+# sysctl) token to gate the launch on, or "" for an arch-baseline ISA that needs
+# no gate; lib: the library target to link; ARGN: the compile flags.
+function(nsparse_add_kernel_test isa cpu_flag lib)
+    set(_tgt nsparse_${isa}_kernel_test)
+    add_executable(${_tgt} distance_kernel_equivalence_test.cpp)
+    target_include_directories(${_tgt} PRIVATE ${PROJECT_SOURCE_DIR})
+    target_compile_options(${_tgt} PRIVATE ${ARGN})
+    target_compile_definitions(${_tgt} PRIVATE NSPARSE_EXPECT_ISA="${isa}")
+    target_link_libraries(${_tgt} PRIVATE
+        ${lib}
+        OpenMP::OpenMP_CXX
+        GTest::gtest_main
+        absl::flat_hash_set
+    )
+    if("${cpu_flag}" STREQUAL "")
+        # Arch-baseline ISA (e.g. NEON on aarch64): always safe to run.
+        add_test(NAME ${_tgt} COMMAND ${_tgt})
+    else()
+        # A specialized binary can execute its ISA in a static initializer --
+        # before main(), before any in-process guard -- so it must not even be
+        # launched on a CPU that lacks the ISA (that would SIGILL). ctest goes
+        # through run_if_isa_supported.cmake, which checks the host and reports a
+        # skip otherwise.
         add_test(NAME ${_tgt}
                  COMMAND ${CMAKE_COMMAND}
                          -DTEST_EXE=$<TARGET_FILE:${_tgt}>
                          -DCPU_FLAG=${cpu_flag}
                          -P ${CMAKE_CURRENT_SOURCE_DIR}/run_if_isa_supported.cmake)
-    endfunction()
+    endif()
+endfunction()
 
-    nsparse_add_kernel_test(avx2 avx2 -mavx2 -mfma -mf16c -mpopcnt)
-    nsparse_add_kernel_test(avx512 avx512f -mavx2 -mfma -mf16c -mavx512f
-                            -mavx512cd -mavx512vl -mavx512dq -mavx512bw -mpopcnt)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|i[3-6]86)" AND NOT WIN32)
+    nsparse_add_kernel_test(avx2 avx2 nsparse_avx2 -mavx2 -mfma -mf16c -mpopcnt)
+    nsparse_add_kernel_test(avx512 avx512f nsparse_avx512 -mavx2 -mfma -mf16c
+                            -mavx512f -mavx512cd -mavx512vl -mavx512dq -mavx512bw
+                            -mpopcnt)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|ARM64)" AND NOT WIN32)
+    # NEON is the aarch64 baseline: the base `nsparse` already compiles
+    # distance_neon.h (via __aarch64__), so no extra flags and no launch gate.
+    nsparse_add_kernel_test(neon "" nsparse)
+    # SVE is optional (Graviton3+) and, like AVX-512, can fault in a static
+    # initializer on a CPU without it, so gate the launch on the "sve" flag. Not
+    # built on Apple Silicon (no SVE) -- mirrors the nsparse_sve library target.
+    if(NOT APPLE)
+        nsparse_add_kernel_test(sve sve nsparse_sve -march=armv8-a+sve)
+    endif()
 endif()

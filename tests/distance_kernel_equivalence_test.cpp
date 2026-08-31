@@ -50,6 +50,10 @@ namespace {
 constexpr std::string_view kIsa = "avx512";
 #elif defined(__AVX2__)
 constexpr std::string_view kIsa = "avx2";
+#elif defined(__ARM_FEATURE_SVE)
+constexpr std::string_view kIsa = "sve";
+#elif defined(__aarch64__)
+constexpr std::string_view kIsa = "neon";
 #else
 constexpr std::string_view kIsa = "scalar";
 #endif
