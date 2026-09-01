@@ -19,6 +19,11 @@ enum IndexIoFlag {
 };
 
 namespace detail {
+// The fixed prefix every serialized index starts with. Exposed because a writer
+// that streams a payload out itself, rather than through an Index, still has to
+// lay the header out exactly the way read_header expects — see
+// build_seismic_index_batched.
+void write_header(const IndexHeader& header, IOWriter* io_writer);
 void write_index(Index* index, IOWriter* io_writer, bool keep_open);
 // `filename`, when given, lets an index that was written for mmap borrow from
 // the file instead of copying; without one the copying path is used, since a
