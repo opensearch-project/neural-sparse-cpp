@@ -81,3 +81,15 @@ target_link_libraries(nsparse_build_benchmark PRIVATE
     absl::flat_hash_set
     absl::flat_hash_map
 )
+
+# Peak-RSS build-memory driver for the term-batched build. Not a
+# google-benchmark target: that harness reports throughput, and what matters here
+# is the high-water mark of a single build, one configuration per process.
+add_executable(batched_build_mem_bench batched_build_mem_bench.cpp)
+target_include_directories(batched_build_mem_bench PRIVATE ${PROJECT_SOURCE_DIR})
+target_link_libraries(batched_build_mem_bench PRIVATE
+    ${NSPARSE_BENCH_LIB}
+    OpenMP::OpenMP_CXX
+    absl::flat_hash_set
+    absl::flat_hash_map
+)
