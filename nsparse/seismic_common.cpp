@@ -34,38 +34,59 @@ struct TermWindow {
     [[nodiscard]] size_t size() const { return end - begin; }
 };
 
-// Cuts [0, dimension) into at most `batches` windows carrying near-equal
-// clustering load, from the exact per-term counts.
+// How much more a posting costs once clustered than while being scattered into
+// an inverted list, per unit. A window's memory has two peaks: filling it holds
+// every posting of its terms, and clustering it holds the pruned survivors as
+// clusters and summaries, which are far bulkier per posting -- on msmarco
+// base_full the finished lists come to 14.9GB for 115M pruned postings, against
+// 8 bytes each while filling.
+//
+// Only the ratio matters, and only roughly: the cost curve is a shallow basin,
+// so assuming 8x or 32x here instead of 16x costs about a fifth of the benefit
+// and still beats weighting either phase alone. It is deliberately not derived
+// from alpha/beta/dimension, which would be a model of summarize() that this
+// does not need to be right about.
+constexpr size_t kClusterCostRatio = 16;
+
+// Cuts [0, dimension) into at most `batches` windows of near-equal estimated
+// memory, from the exact per-term counts.
 //
 // Equal width would not do, because term frequencies are heavily skewed: on
-// msmarco base_full the heaviest term has 5.7M postings against a mean of 37K,
-// and the top 1% of terms hold 19% of them. Peak memory is set by the largest
-// window, not the average one, so an uneven split wastes most of what batching
-// could save.
+// msmarco base_full the heaviest term holds 5.7M postings against a mean of
+// 37K, and the top 1% of terms hold 19% of them. Peak memory is set by the
+// largest window, not the average one, so an uneven split wastes most of what
+// batching could save.
 //
-// The load to even out is min(count, lambda), not count. Pruning keeps at most
-// lambda doc ids per term before clustering -- on base_full that is 115M of
-// 1121M postings, so 90% of them never reach the phase that dominates the peak,
-// and a term with 5.7M postings costs no more there than one with 6000.
-// Balancing raw counts instead was measured to make the load that matters
-// *worse* than equal width (3.3x the mean against 1.5x at 10 windows): it packs
-// the heavy terms into narrow windows and leaves the rest holding thousands of
-// light ones, which also starves the per-window parallel loop. Weighted this
-// way the same split comes out at 1.00x.
+// What to even out is neither phase alone but their sum. Weighting raw counts
+// balances the fill and unbalances the clustering, which is the more expensive
+// phase, and measured worse than equal width. Weighting min(count, lambda) --
+// what survives pruning, and so what clustering holds -- balances that phase
+// perfectly but concentrates the heavy terms, leaving one window holding 3.7x
+// the mean raw postings, which then becomes the peak. Weighting both together
+// at their relative cost balances what is actually resident. Predicted peak of
+// the largest window at 10 windows on base_full:
+//
+//   equal width          2.76GB
+//   raw count            4.93GB
+//   min(count, lambda)   3.32GB
+//   both, as here        2.07GB
 //
 // Windows stay contiguous and ascending, which is what lets the clustered lists
 // be appended to a file as each window finishes: the layout carries no per-list
-// offsets, so their order in the file is their term order. Grouping terms by a
-// hash (term % batches) balances well too, but scatters each window's terms
-// across the file, which the streaming write cannot express.
+// offsets, so a list's position in the file is its term order. Grouping terms
+// by a hash (term % batches) balances comparably, but scatters each window's
+// terms across the file, which the streaming write cannot express.
 //
 // Bounds are size_t, not term_t: dimension may be up to 65536 (term_t is
 // uint16), so a term_t window boundary would wrap and silently drop terms.
 std::vector<TermWindow> make_windows(const std::vector<size_t>& term_counts,
                                      size_t lambda, size_t batches) {
     const size_t dim = term_counts.size();
+    // Postings held while filling, plus the survivors of pruning weighted by
+    // what they cost once clustered. Relative, so the element width cancels: it
+    // scales both phases alike.
     const auto load_of = [lambda](size_t count) {
-        return std::min(count, lambda);
+        return count + kClusterCostRatio * std::min(count, lambda);
     };
     size_t remaining_load = 0;
     for (size_t count : term_counts) {
