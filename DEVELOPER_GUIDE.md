@@ -224,6 +224,117 @@ cmake --build build -j
 
 On Linux, the benchmarks support hardware performance counters via [libpfm](http://perfmon2.sourceforge.net/). Install `libpfm4-dev` to enable this.
 
+## Building an index larger than memory
+
+A whole-corpus build holds two intermediates that scale with the corpus's
+non-zeros — the inverted lists (every posting) and then the clustered posting
+lists — so peak memory scales with the corpus, and a corpus whose posting lists
+do not fit in RAM cannot be indexed at all.
+
+Batching splits the term space into contiguous windows and finishes one window
+before starting the next. It is a build option on the seismic family rather than
+a separate entry point, so it is set in the factory description alongside
+`lambda` and `beta`, and every type in the family gets it — `seismic`,
+`seismic_sq`, `disk_seismic`, `disk_seismic_sq`:
+
+| Option | Effect |
+|---|---|
+| `inverted_list_batch_size=N` | Build in `N` term windows. Bounds the inverted-list intermediate to one window; the index is still built in memory as usual. |
+| `batch_file_output_path=P` | Additionally serialize each window to `P` and free it, so the clustered lists are never all resident either. The index becomes the file: nothing is retained to search or to `write_index` afterwards. |
+
+```cpp
+auto* index = nsparse::index_factory(
+    dimension,
+    "seismic,lambda=6000|beta=400|alpha=0.4"
+    "|inverted_list_batch_size=10|batch_file_output_path=/data/index.dat");
+
+// Corpus residency is SparseVectors' business, not the build's: read_csr can
+// map a native-layout CSR instead of copying it, and the build is unchanged.
+index->read_csr("corpus.mcsr", nsparse::Residency::kMmap);
+index->build();   // streams straight to /data/index.dat
+
+std::unique_ptr<nsparse::Index> served(
+    nsparse::read_index("/data/index.dat", nsparse::IndexIoFlag::kUseMmap));
+```
+
+The same from Python, since it is only a description string:
+
+```python
+native = nsparse.native_path("corpus.csr")
+nsparse.convert("corpus.csr", native)
+index = nsparse.index_factory(
+    dim,
+    "seismic,lambda=6000|beta=400|alpha=0.4"
+    "|inverted_list_batch_size=10|batch_file_output_path=/data/index.dat",
+)
+index.read_csr(native, nsparse.Residency_kMmap)
+index.build()
+served = nsparse.read_index("/data/index.dat", nsparse.kUseMmap)
+```
+
+The file is an ordinary index of its type — byte-for-byte what `write_index`
+would have produced from the equivalent whole-corpus build. That is asserted
+rather than assumed: at a fixed `seed` the two are compared as files, for both a
+float and a quantizing index. Each posting list's k-means seed comes from its own
+*global* term id and `lambda`/`beta` are resolved once from the whole corpus, so
+the window count cannot change what is produced.
+
+### Choosing `inverted_list_batch_size`
+
+Peak memory falls roughly as 1/N down to a floor — the corpus itself, per-thread
+scratch, allocator retention — so raising it past the point where that floor
+dominates buys nothing, and eventually costs time, because every window makes its
+own pass over the corpus. On msmarco base_full (8.8M docs, dim 30109, 1.12B
+non-zeros, λ=6000 β=400 α=0.4) on a 36-core/68GB host, corpus on the heap in
+every row so the only difference is the build:
+
+| build | peak RSS | build time |
+|---|---|---|
+| whole corpus | 24085 MB | 106 s |
+| 2 windows | 19300 MB | 105 s |
+| 10 windows | 10516 MB | 103 s |
+| 20 windows | 9284 MB | 118 s |
+| 50 windows | 7917 MB | 164 s |
+| 100 windows | 7425 MB | 238 s |
+
+Ten windows is the sweet spot here: **2.3× less peak memory for the same build
+time**. By 100 windows the extra passes have more than doubled the build. The
+floor is 6.7 GB of corpus; mapping it via `read_csr` takes that off the heap too.
+
+Peak RSS above is measured from the start of the build, with the corpus already
+resident. Loading it costs more than holding it — a streaming ingest stages a
+second copy — so a whole-process high-water mark would report the loader (13.0 GB
+on this corpus) rather than the build, and hide everything below it.
+
+Query performance does not move, because the index is the same index. Two
+independent unseeded builds, whole-corpus against 10 windows, over 6980 msmarco
+dev queries at k=10, read in-memory:
+
+| index | QPS | p50 | p90 | p99 | recall@10 |
+|---|---|---|---|---|---|
+| whole corpus | 69332 | 0.290 ms | 0.601 ms | 1.000 ms | 0.8406 |
+| 10 windows | 70198 | 0.296 ms | 0.616 ms | 1.055 ms | 0.8432 |
+
+Write the index to a real disk. On a tmpfs such as `/tmp` it is RAM, which
+defeats the point.
+
+### Measuring it
+
+`benchmarks/batched_build_mem_bench` reports peak RSS (`VmHWM`) and wall time for
+one configuration per process — `google-benchmark` measures throughput, and a
+high-water mark is only clean in a process that has built nothing else. Use
+`inmem` to compare against `baseline`: both then hold the corpus on the heap, so
+the difference is the batching rather than the residency.
+
+```bash
+cmake -S . -B build -DNSPARSE_ENABLE_BENCHMARKS=ON && cmake --build build -j
+B=./build/benchmarks/batched_build_mem_bench
+$B convert corpus.csr corpus.mcsr
+$B baseline corpus.csr 6000 400 0.4               # whole-corpus build, for reference
+$B batched inmem corpus.csr 6000 400 0.4 10 /data # 10 windows, same corpus residency
+$B batched mmap corpus.mcsr 6000 400 0.4 10 /data # ... or with the corpus mapped
+```
+
 ## Python Bindings
 
 ### Build Python Bindings
