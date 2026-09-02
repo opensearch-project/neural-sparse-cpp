@@ -20,6 +20,7 @@
 #include "nsparse/io/index_io.h"
 #include "nsparse/seismic_index.h"
 #include "nsparse/types.h"
+#include "nsparse/utils/csr_layout.h"
 #include "tests/disk_seismic_test_util.h"
 
 namespace nsparse {
@@ -47,6 +48,48 @@ TEST(DiskSeismicIndex, MappedReloadMatchesFreshBuild) {
     EXPECT_EQ(mapped->num_vectors(), static_cast<size_t>(corpus.n));
     expect_same_results(search_all(*mapped, queries, 10, &params),
                         fresh);  // fwd_
+}
+
+// Building from a native CSR borrowed via mmap must match building the same
+// corpus fed through add(): convert -> read_csr(kMmap) -> build -> persist ->
+// mmap-reload -> search is bit-exact to the add()-fed build. This is also the
+// regression guard for the num_vectors_ desync -- read_csr(kMmap) borrows
+// vectors_ without running add(), so unless num_vectors_ is synced the written
+// index records nv=0 and a reloaded search returns nothing.
+TEST(DiskSeismicIndex, MmapCsrBuildMatchesAddBuild) {
+    const CSR corpus = make_corpus(1500, /*seed=*/1);
+    const CSR queries = make_corpus(40, /*seed=*/2);
+    DiskSeismicSearchParameters params(/*cut=*/10, /*k_prime=*/32);
+
+    // Reference: the same corpus fed through add(), then reloaded via mmap.
+    DiskSeismicIndex added(kDim, cluster_params());
+    add_corpus(added, corpus);
+    added.build();
+    TempIndexFile added_file("nsparse_disk_seismic_addbuild.idx");
+    write_index(&added, added_file.c_str());
+    std::unique_ptr<Index> added_mapped(
+        read_index(added_file.c_str(), IndexIoFlag::kUseMmap));
+    ASSERT_NE(added_mapped, nullptr);
+    const ScoreIds fresh = search_all(*added_mapped, queries, 10, &params);
+
+    // Under test: build from a native CSR of the same corpus, borrowed via mmap.
+    TempCsrFiles csr("nsparse_disk_seismic_source");
+    write_interchange_csr(csr.interchange(), corpus, kDim);
+    csr_layout::convert(csr.interchange(), csr.native());
+
+    DiskSeismicIndex mapped_build(kDim, cluster_params());
+    mapped_build.read_csr(csr.native().c_str(), Residency::kMmap);
+    // num_vectors_ must reflect the borrowed vectors (regression guard).
+    ASSERT_EQ(mapped_build.num_vectors(), static_cast<size_t>(corpus.n));
+    mapped_build.build();
+    TempIndexFile built_file("nsparse_disk_seismic_mmapbuild.idx");
+    write_index(&mapped_build, built_file.c_str());
+    std::unique_ptr<Index> built_mapped(
+        read_index(built_file.c_str(), IndexIoFlag::kUseMmap));
+    ASSERT_NE(built_mapped, nullptr);
+    // The persisted doc count must survive the mmap-CSR build.
+    EXPECT_EQ(built_mapped->num_vectors(), static_cast<size_t>(corpus.n));
+    expect_same_results(search_all(*built_mapped, queries, 10, &params), fresh);
 }
 
 // K' is a monotonic depth budget: the global top-K' blocks are nested by

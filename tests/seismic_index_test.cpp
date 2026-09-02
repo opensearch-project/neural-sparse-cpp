@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <random>
+#include <set>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -28,6 +29,8 @@
 #include "nsparse/io/index_io.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
+#include "nsparse/utils/csr_layout.h"
+#include "tests/csr_interchange_test_util.h"
 
 namespace nsparse {
 namespace {
@@ -956,6 +959,50 @@ void expect_both_reads_rejected(char* path, const char* fragment) {
     }
 }
 
+// Raw-array CSR corpus. A reproducible random corpus with distinct, ascending
+// terms per row (CSR convention) and values in (0, 1].
+struct RawCsr {
+    std::vector<idx_t> indptr;
+    std::vector<term_t> indices;
+    std::vector<float> values;
+    idx_t n = 0;
+};
+
+RawCsr make_raw_corpus(idx_t rows, int dim, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> nnz_dist(3, 12);
+    std::uniform_int_distribution<int> term_dist(0, dim - 1);
+    std::uniform_real_distribution<float> val_dist(0.05F, 1.0F);
+    RawCsr c;
+    c.n = rows;
+    c.indptr.push_back(0);
+    for (idx_t r = 0; r < rows; ++r) {
+        std::set<int> terms;
+        const int nnz = nnz_dist(rng);
+        while (static_cast<int>(terms.size()) < nnz) {
+            terms.insert(term_dist(rng));
+        }
+        for (const int t : terms) {
+            c.indices.push_back(static_cast<term_t>(t));
+            c.values.push_back(val_dist(rng));
+        }
+        c.indptr.push_back(static_cast<idx_t>(c.indices.size()));
+    }
+    return c;
+}
+
+// Batch search over the corpus rows as queries; returns per-query {labels,
+// scores} for a bit-exact comparison.
+std::pair<std::vector<idx_t>, std::vector<float>> search_corpus(
+    Index* index, const RawCsr& queries, int k) {
+    std::vector<idx_t> labels(static_cast<size_t>(queries.n) * k,
+                              detail::INVALID_IDX);
+    std::vector<float> distances(static_cast<size_t>(queries.n) * k, -1.0F);
+    index->search(queries.n, queries.indptr.data(), queries.indices.data(),
+                  queries.values.data(), k, distances.data(), labels.data());
+    return {labels, distances};
+}
+
 }  // namespace
 
 TEST(SeismicIndexMmapIO, mapped_read_matches_the_copying_read) {
@@ -1001,6 +1048,51 @@ TEST(SeismicIndexMmapIO, mapped_read_borrows_from_the_file) {
     EXPECT_EQ(indices_bytes - indptr_bytes,
               static_cast<ptrdiff_t>((vectors->num_vectors() + 1) *
                                      sizeof(idx_t)));
+}
+
+// Building from a native CSR borrowed via mmap (read_csr(kMmap)) must match
+// building the same corpus fed through add(): convert -> read_csr(kMmap) ->
+// build -> persist -> mmap-reload -> search is bit-exact to the add()-fed build.
+// This pins the mmap-CSR build path for the regular (unquantized) index; its
+// num_vectors() derives from get_vectors(), so no count fix is needed here.
+TEST(SeismicIndexMmapIO, mmap_csr_build_matches_add_build) {
+    constexpr int kDim = 128;
+    const RawCsr corpus = make_raw_corpus(800, kDim, /*seed=*/11);
+    const RawCsr queries = make_raw_corpus(30, kDim, /*seed=*/12);
+    const SeismicClusterParameters params{
+        .lambda = 20, .beta = 4, .alpha = 0.5F, .seed = 42};
+
+    // Reference: the same corpus fed through add().
+    SeismicIndex added(kDim, params);
+    added.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
+              corpus.values.data());
+    added.build();
+    const auto expected = search_corpus(&added, queries, 10);
+
+    // Under test: build from a native CSR of the same corpus borrowed via mmap,
+    // then persist and reload.
+    csr_test::TempCsrFiles csr("nsparse_seis_src");
+    csr_test::write_interchange_csr(csr.interchange(), corpus, kDim);
+    csr_layout::convert(csr.interchange(), csr.native());
+
+    SeismicIndex mapped_build(kDim, params);
+    mapped_build.read_csr(csr.native().c_str(), Residency::kMmap);
+    ASSERT_EQ(mapped_build.num_vectors(), static_cast<size_t>(corpus.n));
+    mapped_build.build();
+
+    TempIndexFile file("nsparse_seis_mmapbuild.idx");
+    write_index(&mapped_build, file.c_str());
+    std::unique_ptr<Index> reloaded(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+    ASSERT_NE(reloaded, nullptr);
+    EXPECT_EQ(reloaded->num_vectors(), static_cast<size_t>(corpus.n));
+
+    const auto got = search_corpus(reloaded.get(), queries, 10);
+    EXPECT_EQ(got.first, expected.first) << "labels differ";
+    ASSERT_EQ(got.second.size(), expected.second.size());
+    for (size_t i = 0; i < got.second.size(); ++i) {
+        EXPECT_FLOAT_EQ(got.second[i], expected.second[i]) << "score at " << i;
+    }
 }
 
 // A stream has no file to map, so the flag alone must not send read_index down

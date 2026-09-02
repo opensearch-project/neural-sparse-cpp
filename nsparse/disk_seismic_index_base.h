@@ -44,6 +44,20 @@ public:
              const float* values) override;
     void build() override;
 
+    // read_mcsr (the kMmap path) borrows vectors_ from the mapping but never
+    // touches num_vectors_, which otherwise only add() maintains; write_index
+    // and search read the member directly, so an out-of-sync count would
+    // persist nv=0 and gate search to empty. Sync it here after the base read.
+    // (kInMemory routes through add(), which already set it, so re-reading
+    // get_vectors() is then a harmless no-op.)
+    void read_csr(const char* file_path,
+                  Residency residency = Residency::kInMemory) override {
+        MmapIndex::read_csr(file_path, residency);
+        if (const auto* v = get_vectors(); v != nullptr) {
+            num_vectors_ = v->num_vectors();
+        }
+    }
+
 protected:
     DiskSeismicIndexBase(int dim, SeismicClusterParameters parameter);
 

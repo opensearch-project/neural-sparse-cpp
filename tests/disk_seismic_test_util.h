@@ -24,6 +24,7 @@
 #include "nsparse/io/index_io.h"
 #include "nsparse/seismic_index.h"
 #include "nsparse/types.h"
+#include "tests/csr_interchange_test_util.h"
 
 // Shared fixtures for the two disk-resident index test suites (DiskSeismicIndex
 // and DiskSeismicScalarQuantizedIndex): the same random corpus, temp file, and
@@ -81,6 +82,11 @@ inline CSR make_corpus(idx_t rows, unsigned seed) {
 inline void add_corpus(Index& index, const CSR& c) {
     index.add(c.n, c.indptr.data(), c.indices.data(), c.values.data());
 }
+
+// The mmap-CSR build helpers are generic (see csr_interchange_test_util.h);
+// re-exported here so the disk suite reaches them via `disk_seismic_test`.
+using csr_test::TempCsrFiles;
+using csr_test::write_interchange_csr;
 
 // Index file removed on destruction. write_index/read_index take char*.
 class TempIndexFile {
