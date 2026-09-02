@@ -11,19 +11,24 @@
 #define SEISMIC_BATCHED_BUILD_H
 
 #include <functional>
+#include <memory>
 #include <string>
+#include <vector>
 
+#include "nsparse/cluster/inverted_list_clusters.h"
+#include "nsparse/index.h"
 #include "nsparse/io/io.h"
 #include "nsparse/seismic_common.h"
 #include "nsparse/sparse_vectors.h"
+#include "nsparse/utils/mmap_file.h"
 
 namespace nsparse::detail {
 
 // Builds a seismic-family index and writes it straight to `out_path`, one term
 // window at a time, without ever holding the whole index in memory.
 //
-// The usual build holds two whole-corpus intermediates -- the inverted lists and
-// then the clustered posting lists -- so its peak memory scales with the
+// The usual build holds two whole-corpus intermediates -- the inverted lists
+// and then the clustered posting lists -- so its peak memory scales with the
 // corpus's non-zeros, and a corpus whose posting lists do not fit in RAM cannot
 // be indexed at all. for_each_clustered_window bounds the first to one window;
 // serializing each window and dropping it, which is what this does, bounds the
@@ -31,9 +36,9 @@ namespace nsparse::detail {
 // holds, at whatever residency SparseVectors was given) plus one window.
 //
 // Reached through an index's build(), by setting
-// SeismicClusterParameters::batch_clustering.batch_file_output_path. The index is
-// then the file, not the object: nothing is retained to serve or to write_index
-// afterwards.
+// SeismicClusterParameters::batch_clustering.batch_file_output_path. The index
+// is then the file, not the object: nothing is retained to serve or to
+// write_index afterwards.
 //
 // `header` and `write_prefix` are what make this work for every type in the
 // family rather than just SEIS. `write_prefix` writes whatever the type puts
@@ -47,13 +52,34 @@ namespace nsparse::detail {
 // whatever batch_size is, because every list's k-means seed comes from its own
 // global term id -- see for_each_clustered_window.
 //
+// Returns the absolute byte offset of the posting-list section, so the lists
+// can be mapped back in without re-parsing everything before them -- see
+// map_streamed_lists.
+//
 // Throws if the corpus is empty: there would be no windows to stream, and a
 // header-only file is not a readable index.
-void write_seismic_index_batched(
+size_t write_seismic_index_batched(
     const SparseVectors* vectors, const SparseVectorsConfig& config,
     const SeismicClusterParameters& params, const IndexHeader& header,
     const std::function<void(IOWriter*)>& write_prefix,
     const std::string& out_path);
+
+// Maps the file a streamed build just wrote and borrows its posting lists out
+// of it, so the build ends holding a usable index without ever having held all
+// of the lists at once.
+//
+// Only the lists. The forward vectors in the file are a copy of ones the index
+// already has, at whatever residency the caller chose for them, so re-reading
+// them would be work for nothing -- and it is why the corpus mapping can be
+// left alone rather than swapped out. `lists_offset` is what
+// write_seismic_index_batched returned, which saves parsing past the vectors to
+// find where the lists start.
+//
+// The mapping is handed to `into`, which must outlive the returned lists: they
+// point into it.
+std::vector<InvertedListClusters> map_streamed_lists(const std::string& path,
+                                                     size_t lists_offset,
+                                                     MmapFile* into);
 
 }  // namespace nsparse::detail
 

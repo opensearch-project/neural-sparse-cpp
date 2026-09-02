@@ -10,6 +10,7 @@
 #include "nsparse/seismic_batched_build.h"
 
 #include <cstddef>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -19,12 +20,15 @@
 #include "nsparse/io/file_io.h"
 #include "nsparse/io/index_io.h"
 #include "nsparse/io/io.h"
+#include "nsparse/io/seismic_invlists_writer.h"
 #include "nsparse/seismic_common.h"
 #include "nsparse/sparse_vectors.h"
+#include "nsparse/utils/mmap_cursor.h"
+#include "nsparse/utils/mmap_file.h"
 
 namespace nsparse::detail {
 
-void write_seismic_index_batched(
+size_t write_seismic_index_batched(
     const SparseVectors* vectors, const SparseVectorsConfig& config,
     const SeismicClusterParameters& params, const IndexHeader& header,
     const std::function<void(IOWriter*)>& write_prefix,
@@ -40,11 +44,11 @@ void write_seismic_index_batched(
     }
 
     // One writer for the whole file, windows serialized straight into it rather
-    // than spilled and concatenated: serialize() pads each array relative to the
-    // writer's current offset (see io/align.h), so bytes produced by a writer
-    // that started at 0 carry the wrong padding once appended at some other
-    // offset. Streaming through a single writer keeps pos() the true absolute
-    // offset.
+    // than spilled and concatenated: serialize() pads each array relative to
+    // the writer's current offset (see io/align.h), so bytes produced by a
+    // writer that started at 0 carry the wrong padding once appended at some
+    // other offset. Streaming through a single writer keeps pos() the true
+    // absolute offset.
     FileIOWriter writer(const_cast<char*>(out_path.c_str()));
     write_header(header, &writer);
     write_prefix(&writer);
@@ -52,11 +56,12 @@ void write_seismic_index_batched(
     // The list count, exactly where SeismicInvertedListsWriter::serialize puts
     // it. It is the whole dimension, known before any window is built, which is
     // what lets the lists be streamed after it rather than counted first.
+    const size_t lists_offset = writer.pos();
     size_t n_lists = config.dimension;
     writer.write(&n_lists, sizeof(size_t), 1);
 
-    // Windows arrive in ascending term order, so appending each in turn produces
-    // the same byte sequence as writing every list at once.
+    // Windows arrive in ascending term order, so appending each in turn
+    // produces the same byte sequence as writing every list at once.
     size_t next_term = 0;
     for_each_clustered_window(
         vectors, config, params,
@@ -65,7 +70,8 @@ void write_seismic_index_batched(
                 // The layout carries no per-list offsets, so a gap or a repeat
                 // would silently shift every list after it.
                 throw std::runtime_error(
-                    "write_seismic_index_batched: windows arrived out of order");
+                    "write_seismic_index_batched: windows arrived out of "
+                    "order");
             }
             for (const auto& list : clusters) {
                 list.serialize(&writer);
@@ -79,6 +85,26 @@ void write_seismic_index_batched(
             " of " + std::to_string(config.dimension) + " posting lists");
     }
     writer.close();
+    return lists_offset;
+}
+
+std::vector<InvertedListClusters> map_streamed_lists(const std::string& path,
+                                                     size_t lists_offset,
+                                                     MmapFile* into) {
+    MmapFile mapped(path);
+    // The cursor starts at 0 and skips, rather than mapping from lists_offset:
+    // absolute file offsets are what serialize() padded against, so a cursor
+    // that began part-way through would compute different padding and misread
+    // every array. Same reason mmap_index skips rather than offsets.
+    MmapCursor cursor(mapped.data(), mapped.size());
+    cursor.skip(lists_offset);
+    SeismicInvertedListsWriter lists;
+    lists.mmap_deserialize(&cursor);
+
+    // Committed only once the walk succeeded, so a truncated file cannot leave
+    // the index holding lists that point into a mapping it never took.
+    *into = std::move(mapped);
+    return std::move(lists.release());
 }
 
 }  // namespace nsparse::detail

@@ -81,7 +81,7 @@ private:
                       size_t q_len, const std::vector<term_t>& cuts, int k,
                       float heap_factor, SearchParameters* search_parameters)
         -> pair_of_score_id_vector_t;
-    
+
     SeismicClusterParameters cluster_parameter_;
 };
 }  // namespace nsparse

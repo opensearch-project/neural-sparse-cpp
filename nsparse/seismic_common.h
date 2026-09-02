@@ -36,14 +36,18 @@ namespace nsparse {
 // contiguous windows and finishing one window before starting the next makes the
 // first of those proportional to a window instead.
 //
-// `batch_file_output_path` bounds the second as well: with it set, each window's
-// clustered lists are serialized to that path and freed as they are produced, so
-// the build retains nothing and the index is the file rather than the object.
-// See build_seismic_index_batched.
+// `batch_file_output_path` bounds the second as well: with batch_size > 1, each
+// window's clustered lists are serialized to that path and freed as they are
+// produced, and the finished list section is then mapped back in, so the build
+// never holds more than one window's worth and still ends with a usable index.
+// See write_seismic_index_batched.
 struct BatchClusteringOption {
     // Contiguous term windows. <= 1 means one window, i.e. no batching. Clamped
     // to the dimension, since a window cannot be narrower than one term.
     size_t batch_size = 1;
+    // Where a batched build streams the index it produces. Used only when
+    // batch_size > 1: a single window is an ordinary build, which holds its own
+    // posting lists and so has nothing to stream or to map back.
     std::string batch_file_output_path;
 };
 

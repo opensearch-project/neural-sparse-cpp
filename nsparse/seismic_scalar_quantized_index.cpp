@@ -9,8 +9,6 @@
 
 #include "nsparse/seismic_scalar_quantized_index.h"
 
-#include "nsparse/seismic_batched_build.h"
-
 #include <sys/types.h>
 
 #include <algorithm>
@@ -29,6 +27,7 @@
 #include "nsparse/invlists/inverted_lists.h"
 #include "nsparse/io/io.h"
 #include "nsparse/io/seismic_invlists_writer.h"
+#include "nsparse/seismic_batched_build.h"
 #include "nsparse/seismic_common.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
@@ -196,13 +195,12 @@ void SeismicScalarQuantizedIndex::build() {
     const SparseVectorsConfig config = {
         .element_size = sq_.bytes_per_value(),
         .dimension = static_cast<size_t>(get_dimension())};
-    const std::string& out_path =
-        cluster_parameter_.batch_clustering.batch_file_output_path;
-    if (!out_path.empty()) {
-        // The quantization header comes first, exactly as write_index writes it;
-        // the codes in `vectors_` are already quantized, so the batched build
-        // needs no knowledge of the quantizer beyond its width.
-        detail::write_seismic_index_batched(
+    const auto& batch = cluster_parameter_.batch_clustering;
+    if (batch.batch_size > 1 && !batch.batch_file_output_path.empty()) {
+        // The quantization header comes first, exactly as write_index writes
+        // it; the codes in `vectors_` are already quantized, so the batched
+        // build needs no knowledge of the quantizer beyond its width.
+        const size_t lists_offset = detail::write_seismic_index_batched(
             get_vectors(), config, cluster_parameter_,
             {.id = fourcc(name),
              .version = kFormatVersion,
@@ -211,12 +209,13 @@ void SeismicScalarQuantizedIndex::build() {
                 write_quantization_header(io_writer);
                 vectors_->serialize(io_writer);
             },
-            out_path);
+            batch.batch_file_output_path);
+        clustered_inverted_lists = detail::map_streamed_lists(
+            batch.batch_file_output_path, lists_offset, &batch_mapped_file_);
         return;
     }
-    clustered_inverted_lists =
-        detail::build_inverted_lists_clusters(get_vectors(), config,
-                                              cluster_parameter_);
+    clustered_inverted_lists = detail::build_inverted_lists_clusters(
+        get_vectors(), config, cluster_parameter_);
 }
 
 auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
@@ -283,14 +282,14 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
         dynamic_cast<const SeismicSearchParameters*>(search_parameters);
     const auto* parameters =
         seismic_parameters != nullptr ? seismic_parameters : &default_params;
-    const size_t dense_bytes =
-        static_cast<size_t>(dimension_) * element_size;
+    const size_t dense_bytes = static_cast<size_t>(dimension_) * element_size;
 
     // Per-thread scratch reused across all queries a thread handles: a
-    // dimension-sized quantized-code dense buffer (kept all-zero between queries
-    // via a sparse clear inside single_query) and the visited-doc set. This
-    // replaces the previous per-query allocation of both. schedule(dynamic, 64)
-    // matches the coarse-chunk scheduling used by SeismicIndex::search.
+    // dimension-sized quantized-code dense buffer (kept all-zero between
+    // queries via a sparse clear inside single_query) and the visited-doc set.
+    // This replaces the previous per-query allocation of both.
+    // schedule(dynamic, 64) matches the coarse-chunk scheduling used by
+    // SeismicIndex::search.
 #pragma omp parallel
     {
         std::vector<uint8_t> dense(dense_bytes, 0);
@@ -306,9 +305,8 @@ auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
             std::vector<term_t> cuts;
             if (element_size == U16) {
                 cuts = detail::top_k_tokens<uint16_t>(
-                    q_indices,
-                    reinterpret_cast<const uint16_t*>(q_val_bytes), len,
-                    parameters->cut);
+                    q_indices, reinterpret_cast<const uint16_t*>(q_val_bytes),
+                    len, parameters->cut);
             } else {
                 cuts = detail::top_k_tokens<uint8_t>(q_indices, q_val_bytes,
                                                      len, parameters->cut);
@@ -336,11 +334,12 @@ auto SeismicScalarQuantizedIndex::single_query(
         return {{}, {}};
     }
 
-    // Scatter the query's quantized codes into the reused dense buffer (all-zero
-    // on entry): element_size contiguous bytes per non-zero dim.
+    // Scatter the query's quantized codes into the reused dense buffer
+    // (all-zero on entry): element_size contiguous bytes per non-zero dim.
     for (size_t i = 0; i < q_len; ++i) {
-        std::copy_n(q_val_bytes + i * element_size, element_size,
-                    dense.data() + static_cast<size_t>(q_idx[i]) * element_size);
+        std::copy_n(
+            q_val_bytes + i * element_size, element_size,
+            dense.data() + static_cast<size_t>(q_idx[i]) * element_size);
     }
     visited.clear();
 
@@ -452,7 +451,8 @@ void SeismicScalarQuantizedIndex::write_quantization_header(
     io_writer->write(&vmax, sizeof(float), 1);
 }
 
-void SeismicScalarQuantizedIndex::read_quantization_header(IOReader* io_reader) {
+void SeismicScalarQuantizedIndex::read_quantization_header(
+    IOReader* io_reader) {
     QuantizerType sq_type = QuantizerType::QT_8bit;
     float vmin = 0.0F;
     float vmax = 1.0F;

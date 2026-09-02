@@ -10,8 +10,9 @@
 Batching is a build option rather than a separate entry point, so there is
 nothing new to wrap: it is reached through the factory description, the same way
 lambda and beta are. `inverted_list_batch_size` bounds the build's memory;
-adding `batch_file_output_path` streams the index straight to that file instead
-of retaining it, which is the path a corpus too large for RAM needs.
+with more than one window, `batch_file_output_path` is where the index is streamed
+as it is built, and its posting lists are then borrowed back from that file --
+which is the path a corpus too large for RAM needs.
 """
 
 import numpy as np
@@ -43,7 +44,8 @@ def streamed(corpus, out_path, batch_size, kind="seismic"):
     return str(out_path)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 32])
+# Batching starts at 2: one window is an ordinary build and writes no file.
+@pytest.mark.parametrize("batch_size", [2, 4, 32])
 def test_happy_case(batch_size, corpus, queries, oracle, tmp_path):
     """build -> read back mapped -> query -> accuracy, at several splits."""
     path = streamed(corpus, tmp_path / "batched.idx", batch_size)
@@ -74,6 +76,26 @@ def test_matches_in_memory_build(kind, corpus, tmp_path):
     assert in_memory.read_bytes() == open(batched, "rb").read()
 
 
+def test_streamed_index_is_searchable_after_build(corpus, queries, oracle, tmp_path):
+    """build() leaves a usable index, not an empty object.
+
+    The lists are borrowed back from the file it just wrote, so there is no
+    reopening by path and they are never copied onto the heap.
+    """
+    spec = (
+        f"seismic,{BASE}|inverted_list_batch_size=8"
+        f"|batch_file_output_path={tmp_path / 'streamed.idx'}"
+    )
+    index = nsparse.index_factory(corpus.dim, spec)
+    add_corpus(index, corpus)
+    index.build()
+
+    assert index.num_vectors() == corpus.n
+    _, labels = search(index, queries)
+    want_labels, _ = oracle
+    assert recall_at_k(labels, want_labels) >= RECALL_FLOOR
+
+
 def test_batch_size_alone_leaves_the_index_in_memory(corpus, queries, tmp_path):
     """Without an output path, batching only bounds the build's intermediates.
 
@@ -91,11 +113,16 @@ def test_batch_size_alone_leaves_the_index_in_memory(corpus, queries, tmp_path):
 
 
 def test_batch_count_is_not_observable(corpus, queries, tmp_path):
-    """The split is a memory knob: at a fixed seed it cannot change the results."""
-    one = streamed(corpus, tmp_path / "one.idx", 1)
+    """The split is a memory knob: at a fixed seed it cannot change the results.
+
+    Against an unbatched build, which writes its file the ordinary way since one
+    window streams nothing.
+    """
+    plain = tmp_path / "plain.idx"
+    nsparse.write_index(make_index(f"seismic,{BASE}", corpus), str(plain))
     many = streamed(corpus, tmp_path / "many.idx", 16)
 
-    want_d, want_l = search(nsparse.read_index(one), queries)
+    want_d, want_l = search(nsparse.read_index(str(plain)), queries)
     got_d, got_l = search(nsparse.read_index(many), queries)
     np.testing.assert_array_equal(got_l, want_l)
     np.testing.assert_allclose(got_d, want_d, rtol=1e-6, atol=1e-6)

@@ -9,8 +9,6 @@
 
 #include "nsparse/seismic_index.h"
 
-#include "nsparse/seismic_batched_build.h"
-
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +24,7 @@
 #include "nsparse/index.h"
 #include "nsparse/invlists/inverted_lists.h"
 #include "nsparse/io/seismic_invlists_writer.h"
+#include "nsparse/seismic_batched_build.h"
 #include "nsparse/seismic_common.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
@@ -147,24 +146,25 @@ void SeismicIndex::build() {
     const SparseVectorsConfig config = {
         .element_size = kElementSize,
         .dimension = static_cast<size_t>(get_dimension())};
-    const std::string& out_path =
-        cluster_parameter_.batch_clustering.batch_file_output_path;
-    if (!out_path.empty()) {
-        // Streamed straight to a file and not retained: see
-        // BatchClusteringOption. write_index afterwards would write an index with
-        // no posting lists, so this index is deliberately left empty.
-        detail::write_seismic_index_batched(
+    const auto& batch = cluster_parameter_.batch_clustering;
+    if (batch.batch_size > 1 && !batch.batch_file_output_path.empty()) {
+        // Streamed to a file a window at a time, so the whole index is never
+        // resident, then borrowed back so this is a usable index. A single
+        // window takes the ordinary path below: it already holds its own lists,
+        // and writing them out only to map them back would be work for nothing.
+        const size_t lists_offset = detail::write_seismic_index_batched(
             get_vectors(), config, cluster_parameter_,
             {.id = fourcc(name),
              .version = kFormatVersion,
              .dimension = get_dimension()},
             [this](IOWriter* io_writer) { vectors_->serialize(io_writer); },
-            out_path);
+            batch.batch_file_output_path);
+        clustered_inverted_lists = detail::map_streamed_lists(
+            batch.batch_file_output_path, lists_offset, &batch_mapped_file_);
         return;
     }
-    clustered_inverted_lists =
-        detail::build_inverted_lists_clusters(get_vectors(), config,
-                                              cluster_parameter_);
+    clustered_inverted_lists = detail::build_inverted_lists_clusters(
+        get_vectors(), config, cluster_parameter_);
 }
 
 auto SeismicIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,

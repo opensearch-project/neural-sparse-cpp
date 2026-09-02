@@ -260,13 +260,19 @@ int csr_dimension(const std::string& path) {
 // so a build peak that sits below the loader's is not mistaken for the whole
 // story.
 void report(const std::string& mode, const std::string& detail, double build_s,
-            long load_hwm_kib, const PeakRssSampler& sampler) {
+            long load_hwm_kib, long start_anon_kib,
+            const PeakRssSampler& sampler) {
     const auto mb = [](long kib) { return static_cast<double>(kib) / 1024.0; };
     std::cout << "RESULT mode=" << mode << " " << detail
               << " build_s=" << build_s
               << " peak_rss_mb=" << mb(read_vm_hwm_kib())
               << " peak_rss_anon_mb=" << mb(sampler.peak_anon_kib())
-              << " peak_rss_file_mb=" << mb(sampler.peak_file_kib())
+              << " peak_rss_file_mb="
+              << mb(sampler.peak_file_kib())
+              // What the corpus and whatever the loader left behind already
+              // cost before the build allocated anything. peak_anon minus this
+              // is the build's own growth.
+              << " start_rss_anon_mb=" << mb(start_anon_kib)
               << " load_peak_rss_mb=" << mb(load_hwm_kib) << "\n";
 }
 
@@ -295,6 +301,7 @@ int run_baseline(int argc, char** argv) {
     streaming_add(&index, csr);
 
     const long load_hwm = read_vm_hwm_kib();
+    const long start_anon = read_status_kib("RssAnon:");
     reset_vm_hwm();
     // Scoped to the build, so the sampled peaks exclude corpus loading exactly
     // as the reset makes VmHWM exclude it.
@@ -302,7 +309,7 @@ int run_baseline(int argc, char** argv) {
     const double started = now_seconds();
     index.build();
     const double build_s = now_seconds() - started;
-    report("baseline", "batches=0", build_s, load_hwm, sampler);
+    report("baseline", "batches=0", build_s, load_hwm, start_anon, sampler);
 
     if (argc >= 7) {
         const std::string out = argv[6];
@@ -350,6 +357,7 @@ int run_batched(int argc, char** argv) {
     }
 
     const long load_hwm = read_vm_hwm_kib();
+    const long start_anon = read_status_kib("RssAnon:");
     reset_vm_hwm();
     PeakRssSampler sampler;
     const double started = now_seconds();
@@ -361,7 +369,7 @@ int run_batched(int argc, char** argv) {
     report("batched",
            "corpus=" + corpus_residency + " batches=" +
                std::to_string(batched_params.batch_clustering.batch_size),
-           build_s, load_hwm, sampler);
+           build_s, load_hwm, start_anon, sampler);
     std::ifstream file(out, std::ios::binary | std::ios::ate);
     std::cout << "index_bytes=" << file.tellg() << "\n";
     return 0;

@@ -240,7 +240,7 @@ a separate entry point, so it is set in the factory description alongside
 | Option | Effect |
 |---|---|
 | `inverted_list_batch_size=N` | Build in `N` term windows. Bounds the inverted-list intermediate to one window; the index is still built in memory as usual. |
-| `batch_file_output_path=P` | Additionally serialize each window to `P` and free it, so the clustered lists are never all resident either. The index becomes the file: nothing is retained to search or to `write_index` afterwards. |
+| `batch_file_output_path=P` | With `N > 1`, serialize each window to `P` and free it, so the clustered lists are never all resident either, then borrow them back from `P` by mapping it. Unused at `N <= 1`, which is an ordinary build and already holds its own lists. |
 
 ```cpp
 auto* index = nsparse::index_factory(
@@ -251,10 +251,11 @@ auto* index = nsparse::index_factory(
 // Corpus residency is SparseVectors' business, not the build's: read_csr can
 // map a native-layout CSR instead of copying it, and the build is unchanged.
 index->read_csr("corpus.mcsr", nsparse::Residency::kMmap);
-index->build();   // streams straight to /data/index.dat
+index->build();   // streams to /data/index.dat, then maps its lists back in
 
-std::unique_ptr<nsparse::Index> served(
-    nsparse::read_index("/data/index.dat", nsparse::IndexIoFlag::kUseMmap));
+// Ready to serve, with no reopening by path: the posting lists are borrowed from
+// the file just written, and the corpus is still borrowed from its own mapping.
+index->search(...);
 ```
 
 The same from Python, since it is only a description string:
@@ -268,8 +269,8 @@ index = nsparse.index_factory(
     "|inverted_list_batch_size=10|batch_file_output_path=/data/index.dat",
 )
 index.read_csr(native, nsparse.Residency_kMmap)
-index.build()
-served = nsparse.read_index("/data/index.dat", nsparse.kUseMmap)
+index.build()          # streams out, then maps its lists back in
+dists, labels = index.search(n, indptr, indices, values, k)
 ```
 
 The file is an ordinary index of its type — byte-for-byte what `write_index`
@@ -302,17 +303,30 @@ figure is the build's own memory:
 
 | windows | peak RssAnon | peak RSS | peak RssFile | build time |
 |---|---|---|---|---|
-| 1 (unbatched) | 10274 MB | 16723 MB | 6454 MB | 113 s |
-| 10 | 2820 MB | 9273 MB | 6454 MB | 107 s |
-| 20 | 1424 MB | 7878 MB | 6454 MB | 130 s |
-| 100 | 458 MB | 6907 MB | 6454 MB | 299 s |
+| 1 (unbatched) | 10281 MB | 16732 MB | 6454 MB | 105 s |
+| 10 | 2816 MB | 12811 MB | 9820 MB | 111 s |
+| 20 | 1471 MB | 11465 MB | 9185 MB | 130 s |
+| 100 | 465 MB | 10396 MB | 9725 MB | 295 s |
 
-Anonymous memory falls faster than 1/N — 3.6× at 10 windows and 22× at 100 —
+The unbatched row writes no file and maps nothing back, which is why its `RssFile`
+is the corpus alone. Anonymous memory falls faster than 1/N — 3.7× at 10 windows
+and 22× at 100 —
 because the split comes from the real per-term costs rather than from term ids. At
-100 windows the build allocates 458 MB while indexing 1.12 billion postings. Total
-RSS falls far less, being dominated by the mapped corpus, which is why the split is
-worth reporting: measured as RSS alone this looks like a 2.4× win rather than a 22×
-one.
+100 windows the build allocates 465 MB while indexing 1.12 billion postings. Total
+RSS barely moves, being dominated by page cache: the 6.45 GB mapped corpus plus
+~3.4 GB of the index touched when `build()` maps it back in. That is the whole
+reason to report the split — measured as RSS alone this looks like a 1.9× win
+rather than a 22× one, and neither figure in that column is memory the process
+would have to give up under pressure.
+
+Mapping the finished lists back in is nearly free in the column that matters:
+across those rows it costs about 4 s and leaves `RssAnon` unchanged (2816 MB at 10
+windows against 2820 MB without it). Borrowing a 14.9 GB index takes 0.19 s and
+8 MB of anonymous memory, against 11.2 s and 13.9 GB to copy it — the cursor only
+reads the size header before each array and skips the bulk, so it faults in about
+a quarter of the file as reclaimable page cache. That mapping is separate from the
+corpus's: an index that mapped its corpus with `read_csr` keeps doing so, since it
+still scores from it.
 
 Build time is flat to around ten windows and then climbs, because every window
 makes its own pass over the corpus. Ten to twenty is the useful range: 3.6–7.2×

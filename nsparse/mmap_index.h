@@ -10,13 +10,6 @@
 #ifndef MMAP_INDEX_H
 #define MMAP_INDEX_H
 
-#include "nsparse/index.h"
-#include "nsparse/seismic_common.h"
-#include "nsparse/utils/checks.h"
-#include "nsparse/utils/csr_layout.h"
-#include "nsparse/utils/mmap_file.h"
-#include "nsparse/sparse_vectors.h"
-
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -25,12 +18,20 @@
 #include <stdexcept>
 #include <string>
 
+#include "nsparse/index.h"
+#include "nsparse/seismic_common.h"
+#include "nsparse/sparse_vectors.h"
+#include "nsparse/utils/checks.h"
+#include "nsparse/utils/csr_layout.h"
+#include "nsparse/utils/mmap_file.h"
+
 namespace nsparse {
 class MmapIndex : public Index {
 public:
     explicit MmapIndex(int dim = 0) : Index(dim) {}
 
-    void read_csr(const char* file_path, Residency residency = Residency::kInMemory) override {
+    void read_csr(const char* file_path,
+                  Residency residency = Residency::kInMemory) override {
         switch (residency) {
             case Residency::kInMemory:
                 Index::read_csr(file_path);
@@ -60,6 +61,17 @@ protected:
     // Either residency: buffers owned when built or deserialized, borrowed from
     // mapped_file_ when mapped. get_vectors() cannot tell the two apart.
     std::unique_ptr<SparseVectors> vectors_;
+
+    // A second mapping, for the file a batched build streams itself to and then
+    // borrows its posting lists back from. Separate from mapped_file_ rather
+    // than replacing it, because the two coexist: the corpus may itself be a
+    // mapping that vectors_ is still borrowing from, and giving that up would
+    // leave the index unable to score anything.
+    //
+    // Whatever borrows from this lives in the derived class, and derived
+    // members are destroyed before base ones, so the borrowers are always gone
+    // first.
+    MmapFile batch_mapped_file_;
 
 private:
     // Values are borrowed at their stored width, so a quantizing index cannot
@@ -105,7 +117,8 @@ private:
 
         const size_t indptr_size = static_cast<size_t>(num_rows) + 1;
         const auto nnz_size = static_cast<size_t>(nnz);
-        if (file.size() != csr_layout::native_file_size(indptr_size, nnz_size)) {
+        if (file.size() !=
+            csr_layout::native_file_size(indptr_size, nnz_size)) {
             throw std::invalid_argument(
                 std::string("CSR file is not in the native layout (convert it "
                             "with csr_layout::convert): ") +
@@ -133,6 +146,6 @@ private:
         vectors_ = std::move(vectors);
     }
 };
-}
+}  // namespace nsparse
 
-#endif // MMAP_INDEX_H
+#endif  // MMAP_INDEX_H
