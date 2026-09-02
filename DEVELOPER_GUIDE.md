@@ -281,37 +281,51 @@ the window count cannot change what is produced.
 
 ### Choosing `inverted_list_batch_size`
 
-Windows are cut to equal *clustering load*, not equal width. Term frequencies are
+Windows are cut to equal estimated *memory*, not equal width. Term frequencies are
 heavily skewed — on msmarco base_full the heaviest term holds 5.7M postings
 against a mean of 37K — and peak memory is set by the largest window, so an uneven
-split wastes most of what batching could save. The load that matters is
-`min(count, lambda)` rather than `count`, because pruning keeps at most `lambda`
-doc ids per term before clustering: 115M of that corpus's 1121M postings, so 90%
-of them never reach the phase that dominates the peak. Weighting by that brings
-the largest window to 1.00× the mean, against 1.5× for equal width.
+split wastes most of what batching could save.
+
+A window has two memory peaks and the split has to weigh both. Filling it holds
+every posting of its terms; clustering it holds what survives pruning
+(`min(count, lambda)` per term, 10% of that corpus's postings) as clusters and
+summaries, roughly 16× bulkier per posting. Weighting either phase alone
+unbalances the other, both measurably worse than weighting their sum — see
+`make_windows` in `nsparse/seismic_common.cpp`, which records what each choice
+measured.
 
 `RssAnon` is the figure to watch, being what the process itself allocated;
 `RssFile` is pages it touched of a mapping, which the kernel can reclaim under
 pressure. On base_full (8.8M docs, dim 30109, 1.12B non-zeros, λ=6000 β=400
-α=0.4) on a 36-core/68GB host, with the corpus mapped so the numbers are the
-build's own memory rather than the corpus:
+α=0.4) on a 36-core/68GB host, with the corpus **mapped in every row**, so each
+figure is the build's own memory:
 
 | windows | peak RssAnon | peak RSS | peak RssFile | build time |
 |---|---|---|---|---|
-| whole corpus (on heap) | 24095 MB | 24100 MB | 4 MB | 105 s |
-| 10 | 3265 MB | 9724 MB | 6454 MB | 109 s |
-| 20 | 2148 MB | 8604 MB | 6454 MB | 127 s |
-| 100 | 734 MB | 7186 MB | 6454 MB | 286 s |
+| 1 (unbatched) | 10274 MB | 16723 MB | 6454 MB | 113 s |
+| 10 | 2820 MB | 9273 MB | 6454 MB | 107 s |
+| 20 | 1424 MB | 7878 MB | 6454 MB | 130 s |
+| 100 | 458 MB | 6907 MB | 6454 MB | 299 s |
 
-Anonymous memory falls roughly as 1/N: at 100 windows the build allocates under
-1 GB while indexing 1.12 billion postings, against 24 GB unbatched. Total RSS
-falls far less because it is dominated by the 6.45 GB of mapped corpus — which is
-why the split is worth reporting, an RSS-only measurement making this look like a
-3× win rather than a 33× one.
+Anonymous memory falls faster than 1/N — 3.6× at 10 windows and 22× at 100 —
+because the split comes from the real per-term costs rather than from term ids. At
+100 windows the build allocates 458 MB while indexing 1.12 billion postings. Total
+RSS falls far less, being dominated by the mapped corpus, which is why the split is
+worth reporting: measured as RSS alone this looks like a 2.4× win rather than a 22×
+one.
 
 Build time is flat to around ten windows and then climbs, because every window
-makes its own pass over the corpus. Ten to twenty is the useful range: 7–11× less
-allocated memory for a few percent of build time.
+makes its own pass over the corpus. Ten to twenty is the useful range: 3.6–7.2×
+less allocated memory for at most a few percent of build time.
+
+Those rows are comparable to each other but not to a build that loads the corpus
+instead of mapping it, and the difference is not just the corpus. The same
+1-window build measures 10274 MB mapped against 24084 MB with a streaming ingest —
+13.8 GB more for a 6.86 GB corpus — because the ingest stages a second copy of it
+(a 13.0 GB load peak) that the allocator retains rather than returning to the OS.
+How much of that overlaps the build's own peak depends on how much the build then
+asks for, so do not read a heap figure and a mapped figure as differing by a fixed
+offset.
 
 All of the above is measured from the start of the build, with the corpus already
 resident. Loading it costs more than holding it — a streaming ingest stages a
