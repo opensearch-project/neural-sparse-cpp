@@ -31,9 +31,19 @@ jobs:
       product: opensearch
 
   Build-nsparse-Linux:
-    name: Build and Test nsparse on Linux
-    runs-on: ubuntu-latest
+    name: Build and Test nsparse on Linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     needs: Get-CI-Image-Tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    # ci-image-version-linux is a multi-arch manifest, so the same tag resolves
+    # to the arm64 image on an arm64 runner.
     container:
       image: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-version-linux }}
       options: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-options }}
