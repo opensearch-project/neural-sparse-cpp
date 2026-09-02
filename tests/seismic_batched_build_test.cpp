@@ -20,6 +20,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "nsparse/cluster/inverted_list_clusters.h"
@@ -288,6 +289,46 @@ TEST(SeismicBatchedBuild, StreamsAQuantizedIndexIdenticallyToo) {
         read_index(const_cast<char*>(streamed_path.c_str())));
     EXPECT_EQ(reloaded->id(), SeismicScalarQuantizedIndex::name);
     EXPECT_EQ(reloaded->num_vectors(), static_cast<size_t>(corpus.n()));
+}
+
+// Windows are cut to equal posting counts, not equal width, so a term heavier
+// than a whole window's target has to be handled: it cannot be split, and it
+// must still land in exactly one window with every other term. This corpus puts
+// most of the postings on one term, and asks for far more windows than that
+// allows.
+TEST(SeismicBatchedBuild, HandlesATermHeavierThanAWholeWindow) {
+    const int dim = 64;
+    Corpus corpus = make_corpus(/*n_docs=*/400, dim, /*seed=*/97);
+    // Term 7 in every document, on top of what make_corpus drew: one term with
+    // an order of magnitude more postings than the rest put together.
+    Corpus skewed;
+    skewed.dim = dim;
+    skewed.indptr.push_back(0);
+    for (idx_t doc = 0; doc < corpus.n(); ++doc) {
+        std::vector<std::pair<term_t, float>> row;
+        for (idx_t j = corpus.indptr[doc]; j < corpus.indptr[doc + 1]; ++j) {
+            if (corpus.indices[j] != 7) {
+                row.emplace_back(corpus.indices[j], corpus.values[j]);
+            }
+        }
+        row.emplace_back(static_cast<term_t>(7), 2.5F);
+        std::sort(row.begin(), row.end());  // CSR rows must be term-ascending
+        for (const auto& [term, value] : row) {
+            skewed.indices.push_back(term);
+            skewed.values.push_back(value);
+        }
+        skewed.indptr.push_back(static_cast<idx_t>(skewed.indices.size()));
+    }
+
+    TempDir dir("skewed");
+    const auto one = streamed(skewed, 1, dir.file("b1.dat"));
+    ASSERT_FALSE(one.empty());
+    // Every one of these has to cover all 64 terms exactly once, or the
+    // streamed file would be short and the write would refuse it.
+    EXPECT_EQ(one, streamed(skewed, 8, dir.file("b8.dat")));
+    EXPECT_EQ(one, streamed(skewed, 32, dir.file("b32.dat")));
+    EXPECT_EQ(one, streamed(skewed, 64, dir.file("b64.dat")));
+    EXPECT_EQ(one, streamed(skewed, 200, dir.file("b200.dat")));
 }
 
 // Same invariant without a seed, where the files legitimately differ: the

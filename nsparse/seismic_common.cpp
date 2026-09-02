@@ -34,14 +34,72 @@ struct TermWindow {
     [[nodiscard]] size_t size() const { return end - begin; }
 };
 
-// Cuts [0, dimension) into `batches` near-equal windows.
-std::vector<TermWindow> make_windows(size_t dim, size_t batches) {
-    // Bounds are size_t, not term_t: dimension may be up to 65536 (term_t is
-    // uint16), so a term_t window boundary would wrap and silently drop terms.
-    const size_t per_batch = (dim + batches - 1) / batches;
+// Cuts [0, dimension) into at most `batches` windows carrying near-equal
+// clustering load, from the exact per-term counts.
+//
+// Equal width would not do, because term frequencies are heavily skewed: on
+// msmarco base_full the heaviest term has 5.7M postings against a mean of 37K,
+// and the top 1% of terms hold 19% of them. Peak memory is set by the largest
+// window, not the average one, so an uneven split wastes most of what batching
+// could save.
+//
+// The load to even out is min(count, lambda), not count. Pruning keeps at most
+// lambda doc ids per term before clustering -- on base_full that is 115M of
+// 1121M postings, so 90% of them never reach the phase that dominates the peak,
+// and a term with 5.7M postings costs no more there than one with 6000.
+// Balancing raw counts instead was measured to make the load that matters
+// *worse* than equal width (3.3x the mean against 1.5x at 10 windows): it packs
+// the heavy terms into narrow windows and leaves the rest holding thousands of
+// light ones, which also starves the per-window parallel loop. Weighted this
+// way the same split comes out at 1.00x.
+//
+// Windows stay contiguous and ascending, which is what lets the clustered lists
+// be appended to a file as each window finishes: the layout carries no per-list
+// offsets, so their order in the file is their term order. Grouping terms by a
+// hash (term % batches) balances well too, but scatters each window's terms
+// across the file, which the streaming write cannot express.
+//
+// Bounds are size_t, not term_t: dimension may be up to 65536 (term_t is
+// uint16), so a term_t window boundary would wrap and silently drop terms.
+std::vector<TermWindow> make_windows(const std::vector<size_t>& term_counts,
+                                     size_t lambda, size_t batches) {
+    const size_t dim = term_counts.size();
+    const auto load_of = [lambda](size_t count) {
+        return std::min(count, lambda);
+    };
+    size_t remaining_load = 0;
+    for (size_t count : term_counts) {
+        remaining_load += load_of(count);
+    }
+
     std::vector<TermWindow> windows;
-    for (size_t begin = 0; begin < dim; begin += per_batch) {
-        windows.push_back({begin, std::min(dim, begin + per_batch)});
+    size_t begin = 0;
+    while (begin < dim) {
+        const size_t windows_left = batches - windows.size();
+        if (windows_left <= 1) {
+            windows.push_back({begin, dim});
+            break;
+        }
+        // Recomputed per window from what is left, so overshooting one window
+        // tightens the next instead of accumulating.
+        const size_t target =
+            (remaining_load + windows_left - 1) / windows_left;
+        // Leave one term for each window still to come, so none comes out
+        // empty.
+        const size_t max_end = dim - (windows_left - 1);
+
+        size_t end = begin;
+        size_t load = 0;
+        // `end == begin` on the first step: a term heavier than the whole
+        // target still has to go somewhere, and it goes here rather than
+        // nowhere.
+        while (end < max_end && (end == begin || load < target)) {
+            load += load_of(term_counts[end]);
+            ++end;
+        }
+        windows.push_back({begin, end});
+        remaining_load -= load;
+        begin = end;
     }
     return windows;
 }
@@ -69,8 +127,8 @@ std::vector<size_t> count_postings_per_term(const SparseVectors& vectors,
     return counts;
 }
 
-// The inverted lists of one term window, sized exactly from the counting pass so
-// no list ever grows.
+// The inverted lists of one term window, sized exactly from the counting pass
+// so no list ever grows.
 //
 // Doc ids arrive in ascending order, because fill_from_corpus walks documents
 // ascending, which is what a single-window build produces. That matters beyond
@@ -97,9 +155,9 @@ public:
         const size_t slot = fill_[local_term]++;
         if (slot >= ids_[local_term].size()) {
             // The list was sized from the counting pass, so more postings than
-            // that means the corpus changed under us. One compare on a path that
-            // is bound by reading the corpus, and it is the difference between
-            // an exception and a heap overflow.
+            // that means the corpus changed under us. One compare on a path
+            // that is bound by reading the corpus, and it is the difference
+            // between an exception and a heap overflow.
             throw std::runtime_error(
                 "for_each_clustered_window: corpus changed during the build");
         }
@@ -153,8 +211,8 @@ void fill_from_corpus(const SparseVectors& vectors, const TermWindow& window,
     }
 }
 
-// Lists per OpenMP chunk, at most. Posting lists are wildly uneven in length, so
-// they are handed out dynamically rather than split up front.
+// Lists per OpenMP chunk, at most. Posting lists are wildly uneven in length,
+// so they are handed out dynamically rather than split up front.
 constexpr size_t kMaxClusterChunk = 64;
 
 // Chunks a window should break into, so the threads have something to steal. A
@@ -174,10 +232,9 @@ struct ResolvedParameters {
     uint32_t base_seed;
 };
 
-std::vector<InvertedListClusters> cluster_window(const SparseVectors& vectors,
-                                                 ArrayInvertedLists& lists,
-                                                 const TermWindow& window,
-                                                 const ResolvedParameters& params) {
+std::vector<InvertedListClusters> cluster_window(
+    const SparseVectors& vectors, ArrayInvertedLists& lists,
+    const TermWindow& window, const ResolvedParameters& params) {
     std::vector<InvertedListClusters> clustered(window.size());
     const auto chunk = static_cast<int64_t>(std::clamp<size_t>(
         window.size() / kMinClusterChunks, 1, kMaxClusterChunk));
@@ -211,7 +268,8 @@ void for_each_clustered_window(const SparseVectors* vectors,
     }
     if (vectors->get_element_size() != config.element_size) {
         throw std::invalid_argument(
-            "for_each_clustered_window: corpus element width does not match the "
+            "for_each_clustered_window: corpus element width does not match "
+            "the "
             "index's");
     }
 
@@ -225,21 +283,22 @@ void for_each_clustered_window(const SparseVectors* vectors,
         .beta = calculate_beta(params.beta, lambda),
         .alpha = params.alpha,
         // Resolved once, outside the loop: std::random_device usually opens
-        // /dev/urandom per construction, so drawing per posting list would put a
-        // syscall on every iteration with every thread doing it. Once for the
+        // /dev/urandom per construction, so drawing per posting list would put
+        // a syscall on every iteration with every thread doing it. Once for the
         // whole build, not per window, or the window count would be observable.
         .base_seed = params.seed == kRandomSeed
                          ? std::random_device{}()
                          : static_cast<uint32_t>(params.seed)};
 
     // Exact per-term sizes, so no window's list ever grows and the bulk
-    // set_entries path can be used instead of per-posting locking. Also the only
-    // place a term outside the dimension is caught: the mapped read does not
-    // range-check.
+    // set_entries path can be used instead of per-posting locking. Also the
+    // only place a term outside the dimension is caught: the mapped read does
+    // not range-check.
     const std::vector<size_t> term_counts =
         count_postings_per_term(*vectors, dim);
 
-    for (const TermWindow& window : make_windows(dim, batches)) {
+    for (const TermWindow& window : make_windows(
+             term_counts, static_cast<size_t>(resolved.lambda), batches)) {
         WindowLists lists(term_counts, window, config.element_size);
         fill_from_corpus(*vectors, window, config.element_size, &lists);
         sink(window.begin,
