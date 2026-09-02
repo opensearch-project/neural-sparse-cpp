@@ -53,7 +53,8 @@ public:
     void read_csr(const char* file_path,
                   Residency residency = Residency::kInMemory) override {
         MmapIndex::read_csr(file_path, residency);
-        if (const auto* v = get_vectors(); v != nullptr) {
+        const auto* v = get_vectors();
+        if (v != nullptr) {
             num_vectors_ = v->num_vectors();
         }
     }
