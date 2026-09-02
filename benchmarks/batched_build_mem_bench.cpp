@@ -34,6 +34,12 @@
 // Point <out_dir> at a real disk: on a tmpfs such as /tmp the index is RAM, and
 // the numbers are meaningless.
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -43,6 +49,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "nsparse/io/index_io.h"
@@ -52,19 +59,93 @@
 
 namespace {
 
-// Peak resident set size in KiB, read from /proc/self/status (VmHWM).
-long read_vm_hwm_kib() {
-    std::ifstream status("/proc/self/status");
-    std::string line;
-    while (std::getline(status, line)) {
-        if (line.rfind("VmHWM:", 0) == 0) {
-            long kib = 0;
-            std::sscanf(line.c_str(), "VmHWM: %ld kB", &kib);
-            return kib;
+// One "Field: N kB" line from /proc/self/status, in KiB, or -1.
+//
+// Reads into a stack buffer rather than through iostreams because the sampler
+// below calls this thousands of times while the thing being measured is memory:
+// a per-sample allocation would show up in the number it is reporting.
+long read_status_kib(const char* field) {
+    const int fd = ::open("/proc/self/status", O_RDONLY);  // NOLINT
+    if (fd < 0) {
+        return -1;
+    }
+    std::array<char, 4096> buffer{};
+    const ssize_t got = ::read(fd, buffer.data(), buffer.size() - 1);
+    ::close(fd);
+    if (got <= 0) {
+        return -1;
+    }
+    buffer[static_cast<size_t>(got)] = '\0';
+    const char* at = std::strstr(buffer.data(), field);
+    if (at == nullptr) {
+        return -1;
+    }
+    long kib = -1;
+    std::sscanf(at + std::strlen(field), " %ld", &kib);
+    return kib;
+}
+
+long read_vm_hwm_kib() { return read_status_kib("VmHWM:"); }
+
+// Tracks the high-water mark of RssAnon and RssFile over its own lifetime.
+//
+// VmHWM is a kernel counter, so peak RSS needs no help. RssAnon and RssFile are
+// reported only as current values, and there is no peak equivalent, so the only
+// way to get their maxima is to sample. That makes them lower bounds: a spike
+// shorter than the interval is missed. The interval is small next to a build
+// that runs for minutes and allocates in per-window steps, so in practice they
+// track the real peaks, but they are not the guarantee VmHWM is.
+//
+// The split is worth the trouble because it separates what the build allocates
+// (RssAnon -- the inverted lists and clusters, which is what batching bounds)
+// from what it merely touches (RssFile -- a mapped corpus, which is the
+// kernel's to reclaim under pressure).
+class PeakRssSampler {
+public:
+    explicit PeakRssSampler(
+        std::chrono::milliseconds interval = std::chrono::milliseconds(50))
+        : thread_([this, interval] {
+              while (!stop_.load(std::memory_order_relaxed)) {
+                  sample();
+                  std::this_thread::sleep_for(interval);
+              }
+              // Once more after the stop, so the final state is never missed.
+              sample();
+          }) {}
+
+    ~PeakRssSampler() {
+        stop_.store(true, std::memory_order_relaxed);
+        thread_.join();
+    }
+
+    PeakRssSampler(const PeakRssSampler&) = delete;
+    PeakRssSampler& operator=(const PeakRssSampler&) = delete;
+
+    [[nodiscard]] long peak_anon_kib() const {
+        return peak_anon_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] long peak_file_kib() const {
+        return peak_file_.load(std::memory_order_relaxed);
+    }
+
+private:
+    void sample() {
+        keep_max(&peak_anon_, read_status_kib("RssAnon:"));
+        keep_max(&peak_file_, read_status_kib("RssFile:"));
+    }
+
+    static void keep_max(std::atomic<long>* peak, long value) {
+        long seen = peak->load(std::memory_order_relaxed);
+        while (value > seen && !peak->compare_exchange_weak(
+                                   seen, value, std::memory_order_relaxed)) {
         }
     }
-    return -1;
-}
+
+    std::atomic<bool> stop_{false};
+    std::atomic<long> peak_anon_{-1};
+    std::atomic<long> peak_file_{-1};
+    std::thread thread_;
+};
 
 // Resets VmHWM to the current VmRSS, so a later read reports the peak since
 // this call rather than since the process started.
@@ -170,17 +251,23 @@ int csr_dimension(const std::string& path) {
     return static_cast<int>(sizes[1]);
 }
 
-// `peak_rss_mb` is the build's own high-water mark (see reset_vm_hwm);
-// `load_peak_rss_mb` is what loading the corpus cost before it, reported so a
-// build peak that sits below the loader's is not mistaken for the whole story.
+// `peak_rss_mb` is the build's own high-water mark (see reset_vm_hwm), split
+// into what the build allocated (`peak_rss_anon_mb`) and what it touched of a
+// mapping
+// (`peak_rss_file_mb`). The anon figure is the one batching is meant to move;
+// the file figure is a mapped corpus, which the kernel can reclaim.
+// `load_peak_rss_mb` is what loading the corpus cost before the build, reported
+// so a build peak that sits below the loader's is not mistaken for the whole
+// story.
 void report(const std::string& mode, const std::string& detail, double build_s,
-            long load_hwm_kib) {
-    const long hwm = read_vm_hwm_kib();
+            long load_hwm_kib, const PeakRssSampler& sampler) {
+    const auto mb = [](long kib) { return static_cast<double>(kib) / 1024.0; };
     std::cout << "RESULT mode=" << mode << " " << detail
               << " build_s=" << build_s
-              << " peak_rss_mb=" << (static_cast<double>(hwm) / 1024.0)
-              << " load_peak_rss_mb="
-              << (static_cast<double>(load_hwm_kib) / 1024.0) << "\n";
+              << " peak_rss_mb=" << mb(read_vm_hwm_kib())
+              << " peak_rss_anon_mb=" << mb(sampler.peak_anon_kib())
+              << " peak_rss_file_mb=" << mb(sampler.peak_file_kib())
+              << " load_peak_rss_mb=" << mb(load_hwm_kib) << "\n";
 }
 
 int run_convert(int argc, char** argv) {
@@ -209,9 +296,13 @@ int run_baseline(int argc, char** argv) {
 
     const long load_hwm = read_vm_hwm_kib();
     reset_vm_hwm();
+    // Scoped to the build, so the sampled peaks exclude corpus loading exactly
+    // as the reset makes VmHWM exclude it.
+    PeakRssSampler sampler;
     const double started = now_seconds();
     index.build();
-    report("baseline", "batches=0", now_seconds() - started, load_hwm);
+    const double build_s = now_seconds() - started;
+    report("baseline", "batches=0", build_s, load_hwm, sampler);
 
     if (argc >= 7) {
         const std::string out = argv[6];
@@ -260,6 +351,7 @@ int run_batched(int argc, char** argv) {
 
     const long load_hwm = read_vm_hwm_kib();
     reset_vm_hwm();
+    PeakRssSampler sampler;
     const double started = now_seconds();
     // batch_file_output_path is set, so build() streams the index out rather
     // than retaining it -- the same call an ordinary build makes.
@@ -269,7 +361,7 @@ int run_batched(int argc, char** argv) {
     report("batched",
            "corpus=" + corpus_residency + " batches=" +
                std::to_string(batched_params.batch_clustering.batch_size),
-           build_s, load_hwm);
+           build_s, load_hwm, sampler);
     std::ifstream file(out, std::ios::binary | std::ios::ate);
     std::cout << "index_bytes=" << file.tellg() << "\n";
     return 0;

@@ -288,23 +288,42 @@ own pass over the corpus. On msmarco base_full (8.8M docs, dim 30109, 1.12B
 non-zeros, λ=6000 β=400 α=0.4) on a 36-core/68GB host, corpus on the heap in
 every row so the only difference is the build:
 
-| build | peak RSS | build time |
-|---|---|---|
-| whole corpus | 24085 MB | 106 s |
-| 2 windows | 19300 MB | 105 s |
-| 10 windows | 10516 MB | 103 s |
-| 20 windows | 9284 MB | 118 s |
-| 50 windows | 7917 MB | 164 s |
-| 100 windows | 7425 MB | 238 s |
+| build | peak RSS | peak RssAnon | build time |
+|---|---|---|---|
+| whole corpus | 24100 MB | 24095 MB | 105 s |
+| 2 windows | 19300 MB | — | 105 s |
+| 10 windows | 10533 MB | 10528 MB | 106 s |
+| 20 windows | 9284 MB | — | 118 s |
+| 50 windows | 7917 MB | — | 164 s |
+| 100 windows | 7417 MB | 7418 MB | 267 s |
 
 Ten windows is the sweet spot here: **2.3× less peak memory for the same build
-time**. By 100 windows the extra passes have more than doubled the build. The
-floor is 6.7 GB of corpus; mapping it via `read_csr` takes that off the heap too.
+time**. By 100 windows the extra passes have more than doubled the build.
 
-Peak RSS above is measured from the start of the build, with the corpus already
+`RssAnon` is the half that matters, being what the process itself allocated;
+`RssFile` is pages it touched of a mapping, which the kernel can reclaim under
+pressure. With the corpus on the heap they are the same number, because the only
+mapping is the binary. Map the corpus instead and they diverge sharply — same
+corpus, same 10 windows:
+
+| corpus residency | peak RSS | peak RssAnon | peak RssFile | build time |
+|---|---|---|---|---|
+| heap (`kInMemory`) | 10533 MB | 10528 MB | 4 MB | 106 s |
+| mapped (`kMmap`) | 10536 MB | **4082 MB** | 6454 MB | 123 s |
+
+Total RSS is unchanged, so an RSS-only measurement makes mapping look pointless.
+What actually happens is that the 6.45 GB corpus moves out of anonymous memory
+into the page cache: the memory the process is responsible for falls to 4.1 GB.
+Batching and mapping together take that from 24.1 GB to 4.1 GB, a 5.9× reduction,
+for 17 s of extra page faults.
+
+All of the above is measured from the start of the build, with the corpus already
 resident. Loading it costs more than holding it — a streaming ingest stages a
 second copy — so a whole-process high-water mark would report the loader (13.0 GB
-on this corpus) rather than the build, and hide everything below it.
+on this corpus) rather than the build, and hide everything below it. Peak RSS
+comes from `VmHWM`, a kernel counter; the anon and file peaks have no such
+counter and are sampled, so they are lower bounds and can disagree with `VmHWM`
+by a hair.
 
 Query performance does not move, because the index is the same index. Two
 independent unseeded builds, whole-corpus against 10 windows, over 6980 msmarco
