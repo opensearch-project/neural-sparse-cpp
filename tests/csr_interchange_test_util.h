@@ -18,6 +18,8 @@
 #include <system_error>
 #include <vector>
 
+#include "nsparse/types.h"
+
 // Shared helpers for the mmap-CSR build path, used by both the regular and the
 // disk-resident index suites: write a corpus as an interchange CSR (the layout
 // csr_layout::convert consumes) and manage the interchange + native temp files.
@@ -45,6 +47,19 @@ void write_interchange_csr(const std::string& path, const Corpus& c,
               static_cast<std::streamsize>(indices32.size() * sizeof(int32_t)));
     out.write(reinterpret_cast<const char*>(c.values.data()),
               static_cast<std::streamsize>(c.values.size() * sizeof(float)));
+}
+
+// Writes the id-map file that IDMapIndex::read_csr_and_read_id reads:
+// [int64 count][idx_t external_id x count]. Row-aligned with the CSR, so
+// external_ids[i] is the external id of CSR row i.
+inline void write_id_map_file(const std::string& path,
+                              const std::vector<idx_t>& external_ids) {
+    std::ofstream out(path, std::ios::binary);
+    const int64_t count = static_cast<int64_t>(external_ids.size());
+    out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    out.write(
+        reinterpret_cast<const char*>(external_ids.data()),
+        static_cast<std::streamsize>(external_ids.size() * sizeof(idx_t)));
 }
 
 // An interchange CSR temp file and the native path convert writes it to, both

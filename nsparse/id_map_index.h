@@ -101,6 +101,10 @@ public:
 
     void add_with_ids(idx_t n, const idx_t* indptr, const term_t* indices,
                       const float* values, const idx_t* ids) override;
+
+    void read_csr_and_read_id(const char* csr_path, const char* id_path,
+                              Residency residency = Residency::kInMemory);
+
     [[nodiscard]] uint32_t format_version() const override {
         return kFormatVersion;
     }

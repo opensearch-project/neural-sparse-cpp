@@ -11,6 +11,12 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <filesystem>
+#include <random>
+#include <set>
+#include <string>
+#include <system_error>
 #include <vector>
 
 #include "nsparse/id_selector.h"
@@ -20,6 +26,8 @@
 #include "nsparse/io/index_io.h"
 #include "nsparse/seismic_index.h"
 #include "nsparse/types.h"
+#include "nsparse/utils/csr_layout.h"
+#include "tests/csr_interchange_test_util.h"
 
 namespace {
 
@@ -369,4 +377,235 @@ TEST_F(IDMapIndexTest, search_with_not_id_selector) {
         EXPECT_NE(label, 200);
         EXPECT_TRUE(label == 100 || label == 300 || label == -1);
     }
+}
+
+namespace {
+
+using nsparse::idx_t;
+using nsparse::term_t;
+
+// A CSR corpus exposing the fields csr_test::write_interchange_csr needs
+// (.n / .indptr / .indices / .values).
+struct Corpus {
+    idx_t n = 0;
+    std::vector<idx_t> indptr;
+    std::vector<term_t> indices;
+    std::vector<float> values;
+};
+
+// Reproducible random corpus: distinct ascending terms per row (CSR
+// convention) and values in (0, 1].
+Corpus make_corpus(idx_t rows, int dim, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> nnz_dist(3, 10);
+    std::uniform_int_distribution<int> term_dist(0, dim - 1);
+    std::uniform_real_distribution<float> val_dist(0.05F, 1.0F);
+    Corpus c;
+    c.n = rows;
+    c.indptr.push_back(0);
+    for (idx_t r = 0; r < rows; ++r) {
+        std::set<int> terms;
+        const int nnz = nnz_dist(rng);
+        while (static_cast<int>(terms.size()) < nnz) {
+            terms.insert(term_dist(rng));
+        }
+        for (const int t : terms) {
+            c.indices.push_back(static_cast<term_t>(t));
+            c.values.push_back(val_dist(rng));
+        }
+        c.indptr.push_back(static_cast<idx_t>(c.indices.size()));
+    }
+    return c;
+}
+
+// External ids distinct from the internal row indices, to prove the search
+// output is translated through the id map rather than echoing internal ids.
+std::vector<idx_t> make_external_ids(idx_t rows) {
+    std::vector<idx_t> ids(static_cast<size_t>(rows));
+    for (idx_t i = 0; i < rows; ++i) {
+        ids[static_cast<size_t>(i)] = 1000 + i * 7;
+    }
+    return ids;
+}
+
+// Batch search over the corpus rows as queries; returns per-query {labels,
+// scores} for a bit-exact comparison.
+std::pair<std::vector<idx_t>, std::vector<float>> search_corpus(
+    nsparse::Index& index, const Corpus& queries, int k) {
+    std::vector<idx_t> labels(static_cast<size_t>(queries.n) * k,
+                              nsparse::detail::INVALID_IDX);
+    std::vector<float> distances(static_cast<size_t>(queries.n) * k, -1.0F);
+    index.search(queries.n, queries.indptr.data(), queries.indices.data(),
+                 queries.values.data(), k, distances.data(), labels.data());
+    return {labels, distances};
+}
+
+// A temp file removed on destruction (for the id-map file).
+class TempIdFile {
+public:
+    explicit TempIdFile(const std::string& stem)
+        : path_((std::filesystem::temp_directory_path() / stem).string()) {
+        std::error_code ignored;
+        std::filesystem::remove(path_, ignored);
+    }
+    ~TempIdFile() {
+        std::error_code ignored;
+        std::filesystem::remove(path_, ignored);
+    }
+    TempIdFile(const TempIdFile&) = delete;
+    TempIdFile& operator=(const TempIdFile&) = delete;
+    const std::string& path() const { return path_; }
+
+private:
+    std::string path_;
+};
+
+constexpr int kDim = 100;
+const nsparse::SeismicClusterParameters kClusterParams{
+    .lambda = 10, .beta = 2, .alpha = 0.5F, .seed = 42};
+
+}  // namespace
+
+// The single-function file build (delegate read_csr(kMmap) + id map from a
+// file) must produce a search result bit-exact to the in-RAM add_with_ids
+// build: same corpus, same external ids, same fixed cluster seed. This is the
+// mmap-CSR memory-saving path, and its labels must be the external ids.
+TEST(IDMapReadCsrAndId, MatchesAddWithIdsBuild) {
+    const Corpus corpus = make_corpus(300, kDim, /*seed=*/1);
+    const Corpus queries = make_corpus(20, kDim, /*seed=*/2);
+    const std::vector<idx_t> ids = make_external_ids(corpus.n);
+    constexpr int k = 10;
+
+    // Reference: add_with_ids() then build().
+    nsparse::IDMapIndex added(new nsparse::SeismicIndex(kDim, kClusterParams));
+    added.add_with_ids(corpus.n, corpus.indptr.data(), corpus.indices.data(),
+                       corpus.values.data(), ids.data());
+    added.build();
+    const auto expected = search_corpus(added, queries, k);
+
+    // Under test: build the delegate from a native CSR borrowed via mmap and
+    // read the id map from a file, through the single entry point.
+    nsparse::csr_test::TempCsrFiles csr("nsparse_idmap_src");
+    nsparse::csr_test::write_interchange_csr(csr.interchange(), corpus, kDim);
+    nsparse::csr_layout::convert(csr.interchange(), csr.native());
+    TempIdFile idfile("nsparse_idmap_src.ids");
+    nsparse::csr_test::write_id_map_file(idfile.path(), ids);
+
+    nsparse::IDMapIndex mapped(new nsparse::SeismicIndex(kDim, kClusterParams));
+    mapped.read_csr_and_read_id(csr.native().c_str(), idfile.path().c_str(),
+                                nsparse::Residency::kMmap);
+    ASSERT_EQ(mapped.num_vectors(), static_cast<size_t>(corpus.n));
+    mapped.build();
+    const auto got = search_corpus(mapped, queries, k);
+
+    EXPECT_EQ(got.first, expected.first) << "external-id labels differ";
+    ASSERT_EQ(got.second.size(), expected.second.size());
+    for (size_t i = 0; i < got.second.size(); ++i) {
+        EXPECT_FLOAT_EQ(got.second[i], expected.second[i]) << "score at " << i;
+    }
+    // Sanity: the labels are external ids, not internal row indices.
+    bool saw_external = false;
+    for (const idx_t label : got.first) {
+        if (label >= 1000) {
+            saw_external = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(saw_external) << "labels should be translated to external ids";
+}
+
+// The id map is row-aligned with the CSR, so a count that disagrees with the
+// delegate's vector count is rejected.
+TEST(IDMapReadCsrAndId, CountMismatchThrows) {
+    const Corpus corpus = make_corpus(50, kDim, /*seed=*/3);
+    nsparse::csr_test::TempCsrFiles csr("nsparse_idmap_mismatch");
+    nsparse::csr_test::write_interchange_csr(csr.interchange(), corpus, kDim);
+    nsparse::csr_layout::convert(csr.interchange(), csr.native());
+
+    // One too few ids for the 50 CSR rows.
+    const std::vector<idx_t> short_ids = make_external_ids(corpus.n - 1);
+    TempIdFile idfile("nsparse_idmap_mismatch.ids");
+    nsparse::csr_test::write_id_map_file(idfile.path(), short_ids);
+
+    nsparse::IDMapIndex mapped(new nsparse::SeismicIndex(kDim, kClusterParams));
+    EXPECT_THROW(
+        mapped.read_csr_and_read_id(csr.native().c_str(), idfile.path().c_str(),
+                                    nsparse::Residency::kMmap),
+        std::invalid_argument);
+}
+
+// A file whose byte size does not match its declared count is malformed.
+TEST(IDMapReadCsrAndId, MalformedFileThrows) {
+    const Corpus corpus = make_corpus(5, kDim, /*seed=*/4);
+    nsparse::csr_test::TempCsrFiles csr("nsparse_idmap_malformed");
+    nsparse::csr_test::write_interchange_csr(csr.interchange(), corpus, kDim);
+    nsparse::csr_layout::convert(csr.interchange(), csr.native());
+
+    // Header claims 5 ids but only 3 follow -> size mismatch.
+    TempIdFile idfile("nsparse_idmap_malformed.ids");
+    {
+        std::ofstream out(idfile.path(), std::ios::binary);
+        const int64_t bogus_count = 5;
+        out.write(reinterpret_cast<const char*>(&bogus_count),
+                  sizeof(bogus_count));
+        const std::vector<idx_t> only_three = {1, 2, 3};
+        out.write(reinterpret_cast<const char*>(only_three.data()),
+                  static_cast<std::streamsize>(only_three.size() * sizeof(idx_t)));
+    }
+
+    nsparse::IDMapIndex mapped(new nsparse::SeismicIndex(kDim, kClusterParams));
+    EXPECT_THROW(
+        mapped.read_csr_and_read_id(csr.native().c_str(), idfile.path().c_str(),
+                                    nsparse::Residency::kMmap),
+        std::invalid_argument);
+}
+
+// The reverse map (external -> internal) must be populated by the file build,
+// so an id-selector filter over external ids still works.
+TEST(IDMapReadCsrAndId, IdSelectorFilterWorksAfterFileBuild) {
+    const Corpus corpus = make_corpus(200, kDim, /*seed=*/5);
+    const std::vector<idx_t> ids = make_external_ids(corpus.n);
+
+    nsparse::csr_test::TempCsrFiles csr("nsparse_idmap_filter");
+    nsparse::csr_test::write_interchange_csr(csr.interchange(), corpus, kDim);
+    nsparse::csr_layout::convert(csr.interchange(), csr.native());
+    TempIdFile idfile("nsparse_idmap_filter.ids");
+    nsparse::csr_test::write_id_map_file(idfile.path(), ids);
+
+    nsparse::IDMapIndex mapped(new nsparse::SeismicIndex(kDim, kClusterParams));
+    mapped.read_csr_and_read_id(csr.native().c_str(), idfile.path().c_str(),
+                                nsparse::Residency::kMmap);
+    mapped.build();
+
+    // Allow only the first two external ids (internal rows 0 and 1).
+    const std::vector<idx_t> allowed = {ids[0], ids[1]};
+    nsparse::SetIDSelector selector(allowed.size(), allowed.data());
+    nsparse::SeismicSearchParameters params;
+    params.set_id_selector(&selector);
+
+    // Query with the corpus rows themselves, so rows 0 and 1 (the allowed docs)
+    // match their own vectors and are guaranteed to score. For an allowed doc
+    // to survive the external-id filter and be returned, the reverse map
+    // (external -> internal) must be populated by the file build -- an empty
+    // reverse map would filter everything out and still pass a "no disallowed
+    // leak" check, so this asserts a positive hit too.
+    constexpr int k = 5;
+    std::vector<idx_t> labels(static_cast<size_t>(corpus.n) * k,
+                              nsparse::detail::INVALID_IDX);
+    std::vector<float> distances(static_cast<size_t>(corpus.n) * k, -1.0F);
+    mapped.search(corpus.n, corpus.indptr.data(), corpus.indices.data(),
+                  corpus.values.data(), k, distances.data(), labels.data(),
+                  &params);
+
+    bool saw_allowed = false;
+    for (const idx_t label : labels) {
+        EXPECT_TRUE(label == ids[0] || label == ids[1] ||
+                    label == nsparse::detail::INVALID_IDX)
+            << "filter must restrict to allowed external ids, got " << label;
+        if (label == ids[0] || label == ids[1]) {
+            saw_allowed = true;
+        }
+    }
+    EXPECT_TRUE(saw_allowed) << "reverse map must be populated: an allowed doc "
+                                "should actually be returned";
 }
