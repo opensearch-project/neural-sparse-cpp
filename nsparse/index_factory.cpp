@@ -58,6 +58,13 @@ SeismicClusterParameters parse_cluster_params(const GetParam& get_param) {
     return {.lambda = std::stoi(get_param("lambda", "10")),
             .beta = std::stoi(get_param("beta", "5")),
             .alpha = std::stof(get_param("alpha", "0.5")),
+            // Term windows to build in, and where to stream the result if it is
+            // not to be retained. See BatchClusteringOption.
+            .batch_clustering =
+                {.batch_size = static_cast<size_t>(std::stoul(
+                     get_param("inverted_list_batch_size", "1"))),
+                 .batch_file_output_path =
+                     get_param("batch_file_output_path", "")},
             .seed = std::stoi(get_param("seed", std::to_string(kRandomSeed)))};
 }
 

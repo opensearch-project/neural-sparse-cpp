@@ -9,6 +9,8 @@
 
 #include "nsparse/seismic_index.h"
 
+#include "nsparse/seismic_batched_build.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -142,11 +144,27 @@ void SeismicIndex::add(idx_t n, const idx_t* indptr, const term_t* indices,
 }
 
 void SeismicIndex::build() {
-    clustered_inverted_lists = std::move(detail::build_inverted_lists_clusters(
-        get_vectors(),
-        {.element_size = kElementSize,
-         .dimension = static_cast<size_t>(get_dimension())},
-        cluster_parameter_));
+    const SparseVectorsConfig config = {
+        .element_size = kElementSize,
+        .dimension = static_cast<size_t>(get_dimension())};
+    const std::string& out_path =
+        cluster_parameter_.batch_clustering.batch_file_output_path;
+    if (!out_path.empty()) {
+        // Streamed straight to a file and not retained: see
+        // BatchClusteringOption. write_index afterwards would write an index with
+        // no posting lists, so this index is deliberately left empty.
+        detail::write_seismic_index_batched(
+            get_vectors(), config, cluster_parameter_,
+            {.id = fourcc(name),
+             .version = kFormatVersion,
+             .dimension = get_dimension()},
+            [this](IOWriter* io_writer) { vectors_->serialize(io_writer); },
+            out_path);
+        return;
+    }
+    clustered_inverted_lists =
+        detail::build_inverted_lists_clusters(get_vectors(), config,
+                                              cluster_parameter_);
 }
 
 auto SeismicIndex::search(idx_t n, const idx_t* indptr, const term_t* indices,

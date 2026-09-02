@@ -33,6 +33,7 @@ set(NSPARSE_TEST_SRC
     disk_seismic_index_test.cpp
     disk_seismic_scalar_quantized_index_test.cpp
     seismic_index_test.cpp
+    seismic_batched_build_test.cpp
     seismic_invlists_writer_test.cpp
     seismic_scalar_quantized_index_test.cpp
     sparse_vectors_test.cpp

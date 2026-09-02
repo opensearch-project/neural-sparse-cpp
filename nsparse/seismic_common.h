@@ -11,6 +11,7 @@
 #define SEISMIC_COMMON_H
 
 #include <memory>
+#include <functional>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -26,7 +27,22 @@
 
 namespace nsparse {
 
+// How a build bounds its own memory.
+//
+// Clustering the whole term space at once holds two intermediates for the whole
+// corpus: the inverted lists (every posting) and then the clustered lists. Both
+// scale with the corpus's non-zeros, which is what puts a ceiling on the corpus
+// an index can be built from. Splitting the term space into `batch_size`
+// contiguous windows and finishing one window before starting the next makes the
+// first of those proportional to a window instead.
+//
+// `batch_file_output_path` bounds the second as well: with it set, each window's
+// clustered lists are serialized to that path and freed as they are produced, so
+// the build retains nothing and the index is the file rather than the object.
+// See build_seismic_index_batched.
 struct BatchClusteringOption {
+    // Contiguous term windows. <= 1 means one window, i.e. no batching. Clamped
+    // to the dimension, since a window cannot be narrower than one term.
     size_t batch_size = 1;
     std::string batch_file_output_path;
 };
@@ -39,8 +55,7 @@ struct SeismicClusterParameters {
     int lambda;
     int beta;
     float alpha;
-    int inverted_list_batch_size = 1;
-    char* batch_file_output_path = nullptr;
+    BatchClusteringOption batch_clustering;
     // Fix this to make a build reproducible; two builds of the same corpus
     // differ by default.
     int seed = kRandomSeed;
@@ -55,7 +70,9 @@ constexpr float kDefaultBetaRatio = 0.1F;
 constexpr int kDefaultBeta = -1;
 constexpr float kDefaultAlpha = 0.4F;
 
-constexpr SeismicClusterParameters kDefaultSeismicClusterParams = {
+// const rather than constexpr: BatchClusteringOption holds a std::string for the
+// output path, which is not a literal type.
+inline const SeismicClusterParameters kDefaultSeismicClusterParams = {
     .lambda = kDefaultLambda, .beta = kDefaultBeta, .alpha = kDefaultAlpha};
 
 inline std::vector<float> calculate_summary_scores(
@@ -143,44 +160,48 @@ inline int calculate_beta(int beta, int lambda) {
     return beta;
 }
 
+// Clusters and summarizes the posting lists of one term window at a time,
+// handing each window to `sink` in ascending term order.
+//
+// This is the one place the seismic family's build work lives: every index type
+// reaches it, either through build_inverted_lists_clusters below or through the
+// streaming build in seismic_batched_build.h. The element width comes from
+// `config`, so a quantizing index gets the same treatment as a float one -- the
+// values in `vectors` are already encoded by the time they arrive here.
+//
+// `sink` receives the window's global first term and its lists, and must not
+// hold on to them: they are freed as soon as it returns, which is what bounds
+// the memory. Windows come from params.batch_clustering.batch_size.
+//
+// Every window's lambda and beta are computed from the GLOBAL corpus, and every
+// list's k-means seed from its own GLOBAL term id, so the window count cannot
+// change what is produced -- see the batched-build tests, which assert file
+// equality against an unbatched build.
+using ClusteredWindowSink =
+    std::function<void(size_t term_begin,
+                       std::vector<InvertedListClusters>&& clusters)>;
+
+void for_each_clustered_window(const SparseVectors* vectors,
+                               const SparseVectorsConfig& config,
+                               const SeismicClusterParameters& params,
+                               const ClusteredWindowSink& sink);
+
+// Every term's clustered posting list, in term order. The whole-corpus form of
+// for_each_clustered_window: batch_size still bounds the inverted-list
+// intermediate, but the result is retained in full, so this is bounded by the
+// clustered lists rather than by a window.
 inline std::vector<InvertedListClusters> build_inverted_lists_clusters(
     const SparseVectors* vectors, const SparseVectorsConfig& config,
     const SeismicClusterParameters& seismic_cluster_params) {
-    // build inverted index
-    std::unique_ptr<ArrayInvertedLists> inverted_lists =
-        ArrayInvertedLists::build_inverted_lists(config.dimension,
-                                                 config.element_size, vectors);
-    int lambda =
-        calculate_lambda(seismic_cluster_params.lambda, vectors->num_vectors());
-    int beta = calculate_beta(seismic_cluster_params.beta, lambda);
-    size_t inverted_lists_size = inverted_lists->size();
-    std::vector<InvertedListClusters> clustered_inverted_lists(
-        inverted_lists_size);
-
-    // Resolved once, outside the loop: std::random_device usually opens
-    // /dev/urandom per construction, so drawing per posting list would put a
-    // syscall on every iteration with every thread doing it.
-    // uint32_t, not int: std::random_device yields a full unsigned 32-bit
-    // value, and the per-list offset below must wrap rather than overflow.
-    const uint32_t base_seed =
-        seismic_cluster_params.seed == kRandomSeed
-            ? std::random_device{}()
-            : static_cast<uint32_t>(seismic_cluster_params.seed);
-
-#pragma omp parallel for schedule(dynamic, 64)
-    for (int64_t idx = 0; idx < static_cast<int64_t>(inverted_lists_size);
-         ++idx) {
-        auto& invlist = (*inverted_lists)[idx];
-        const auto& doc_ids = invlist.prune_and_keep_doc_ids(lambda);
-        // Offset by the list's own index, so which thread picks up which list
-        // cannot change the result.
-        InvertedListClusters inverted_list_clusters(detail::RandomKMeans::train(
-            vectors, doc_ids, beta, base_seed + static_cast<uint32_t>(idx)));
-        inverted_list_clusters.summarize(vectors, seismic_cluster_params.alpha);
-        clustered_inverted_lists[idx] = std::move(inverted_list_clusters);
-        invlist.clear();
-    }
-    return clustered_inverted_lists;
+    std::vector<InvertedListClusters> clustered(config.dimension);
+    for_each_clustered_window(
+        vectors, config, seismic_cluster_params,
+        [&clustered](size_t term_begin,
+                     std::vector<InvertedListClusters>&& window) {
+            std::move(window.begin(), window.end(),
+                      clustered.begin() + static_cast<ptrdiff_t>(term_begin));
+        });
+    return clustered;
 }
 
 }  // namespace detail

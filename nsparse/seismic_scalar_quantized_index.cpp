@@ -9,6 +9,8 @@
 
 #include "nsparse/seismic_scalar_quantized_index.h"
 
+#include "nsparse/seismic_batched_build.h"
+
 #include <sys/types.h>
 
 #include <algorithm>
@@ -191,11 +193,30 @@ ScalarQuantizer SeismicScalarQuantizedIndex::query_quantizer(
 }
 
 void SeismicScalarQuantizedIndex::build() {
-    clustered_inverted_lists = std::move(detail::build_inverted_lists_clusters(
-        get_vectors(),
-        {.element_size = sq_.bytes_per_value(),
-         .dimension = static_cast<size_t>(get_dimension())},
-        cluster_parameter_));
+    const SparseVectorsConfig config = {
+        .element_size = sq_.bytes_per_value(),
+        .dimension = static_cast<size_t>(get_dimension())};
+    const std::string& out_path =
+        cluster_parameter_.batch_clustering.batch_file_output_path;
+    if (!out_path.empty()) {
+        // The quantization header comes first, exactly as write_index writes it;
+        // the codes in `vectors_` are already quantized, so the batched build
+        // needs no knowledge of the quantizer beyond its width.
+        detail::write_seismic_index_batched(
+            get_vectors(), config, cluster_parameter_,
+            {.id = fourcc(name),
+             .version = kFormatVersion,
+             .dimension = get_dimension()},
+            [this](IOWriter* io_writer) {
+                write_quantization_header(io_writer);
+                vectors_->serialize(io_writer);
+            },
+            out_path);
+        return;
+    }
+    clustered_inverted_lists =
+        detail::build_inverted_lists_clusters(get_vectors(), config,
+                                              cluster_parameter_);
 }
 
 auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,

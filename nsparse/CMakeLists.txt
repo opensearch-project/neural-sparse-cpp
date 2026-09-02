@@ -8,7 +8,9 @@
 set(NSPARSE_SRC
     index.cpp
     brutal_index.cpp
+    seismic_common.cpp
     seismic_index.cpp
+    seismic_batched_build.cpp
     seismic_scalar_quantized_index.cpp
     disk_seismic_index.cpp
     disk_seismic_scalar_quantized_index.cpp
@@ -36,6 +38,7 @@ set(NSPARSE_HEADERS
     brutal_index.h
     mmap_index.h
     seismic_index.h
+    seismic_batched_build.h
     seismic_scalar_quantized_index.h
     disk_seismic_index.h
     disk_seismic_scalar_quantized_index.h
