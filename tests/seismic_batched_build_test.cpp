@@ -224,23 +224,32 @@ TEST(SeismicBatchedBuild, BatchedBuildIsIdenticalAcrossBatchCounts) {
     EXPECT_EQ(one, batched(corpus, 1000, dir, dir.file("b1000.dat")));
 }
 
-// The spill is scratch, and nothing outlives the build: it is unlinked as soon
-// as it is mapped, so the directory the caller lent is empty again while the
-// index is still serving from those very bytes.
+// The spill is scratch: whatever is left of it goes with the index, and while
+// the index lives its lists stay readable from the mapping either way.
+//
+// When it goes is the platform's business, not the contract's -- unlinked the
+// moment it is mapped where that is allowed, removed on release where it is not
+// (Windows) -- so this asserts the directory is empty once the index is gone,
+// and only that the spill is the sole occupant before then.
 TEST(SeismicBatchedBuild, LeavesNothingInTheScratchDirectory) {
     Corpus corpus = make_corpus(/*n_docs=*/1500, /*dim=*/200, /*seed=*/3);
     TempDir dir("scratch");
     const std::string scratch = dir.scratch();
 
-    SeismicIndex index(corpus.dim, params_for(8, scratch, kSeed));
-    index.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
-              corpus.values.data());
-    index.build();
+    {
+        SeismicIndex index(corpus.dim, params_for(8, scratch, kSeed));
+        index.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
+                  corpus.values.data());
+        index.build();
+
+        EXPECT_LE(std::distance(std::filesystem::directory_iterator(scratch),
+                                std::filesystem::directory_iterator{}),
+                  1);
+        // Serialized from lists that are still borrowed from the spill.
+        write_index(&index, const_cast<char*>(dir.file("out.dat").c_str()));
+    }
 
     EXPECT_TRUE(std::filesystem::is_empty(scratch));
-    // And the lists are still readable, which is the point of unlinking rather
-    // than deleting: the mapping keeps the bytes alive.
-    write_index(&index, const_cast<char*>(dir.file("out.dat").c_str()));
     EXPECT_EQ(read_file(dir.file("out.dat")),
               in_memory(corpus, dir.file("mem.dat")));
 }

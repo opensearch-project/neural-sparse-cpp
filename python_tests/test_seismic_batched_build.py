@@ -92,18 +92,22 @@ def test_matches_in_memory_build(kind, corpus, tmp_path):
 
 
 def test_scratch_directory_is_left_empty(corpus, tmp_path):
-    """The spill is scratch: unlinked as soon as it is mapped.
+    """The spill is scratch: whatever is left of it goes with the index.
 
-    The lists stay readable from the mapping, so the index is still servable
-    while the directory the caller lent is already empty again.
+    Its lists stay readable while the index lives, so it is servable and
+    writable throughout; when the spill is removed (immediately where a mapped
+    file can be unlinked, on release where it cannot) is the platform's business.
     """
     scratch = scratch_dir(tmp_path)
     index = batched_index(corpus, tmp_path, 8)
 
-    assert list(scratch.iterdir()) == []
     assert index.num_vectors() == corpus.n
+    assert len(list(scratch.iterdir())) <= 1
     nsparse.write_index(index, str(tmp_path / "out.idx"))
     assert (tmp_path / "out.idx").stat().st_size > 0
+
+    del index
+    assert list(scratch.iterdir()) == []
 
 
 @pytest.mark.parametrize("kind", ["seismic", "disk_seismic"])
