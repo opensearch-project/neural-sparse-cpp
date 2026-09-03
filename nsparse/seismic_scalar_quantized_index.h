@@ -64,9 +64,9 @@ public:
                                                    size_t pos);
 
 private:
-    // The value width read_csr(kMmap) borrows a native CSR at: this index's
-    // code width, so a codes CSR is borrowed in place rather than a float one.
-    [[nodiscard]] size_t mmap_element_size() const override {
+    // Stored value width: this index's code width, so read_mcsr borrows a codes
+    // CSR in place (rather than a float one) via MmapIndex::code_element_size.
+    [[nodiscard]] size_t code_element_size() const override {
         return sq_.bytes_per_value();
     }
 

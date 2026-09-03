@@ -64,8 +64,10 @@ protected:
 
     // --- Hooks the concrete indexes implement. ---
 
-    // Stored value width in bytes: 4 (float) or 1/2 (quantized codes).
-    [[nodiscard]] virtual size_t code_element_size() const = 0;
+    // Stored value width in bytes: 4 (float) or 1/2 (quantized codes). Kept
+    // pure (overriding MmapIndex's default) so each concrete disk type must
+    // state its width.
+    [[nodiscard]] size_t code_element_size() const override = 0;
 
     // Encode nnz float values to the stored width, returning a pointer to
     // code_element_size()-byte-per-value data. `scratch` backs the result when

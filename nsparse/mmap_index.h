@@ -72,11 +72,13 @@ protected:
     // so they are always gone before the spill is released.
     detail::ClusteredListsSpill batch_spill_;
 
-    // The value width read_mcsr borrows a native CSR's values at. Float for the
-    // unquantized types (the default); a quantizing index overrides it to its
-    // code width so the same mapped-CSR path yields codes borrowed in place
-    // rather than floats.
-    [[nodiscard]] virtual size_t mmap_element_size() const { return U32; }
+    // The stored value width, in bytes, which is also what read_mcsr borrows a
+    // native CSR's values at: float (the default) for the unquantized types, or
+    // the quantizer's code width for a quantizing index, so the same mapped-CSR
+    // path yields codes borrowed in place rather than floats. Non-pure because
+    // MmapIndex is instantiated directly (e.g. TestMmapIndex); the disk family
+    // re-declares it pure so each concrete type must state its width.
+    [[nodiscard]] virtual size_t code_element_size() const { return U32; }
 
 private:
     bool is_mmap_index_ = false;
@@ -122,7 +124,7 @@ private:
         // file written at a different width fails the size check below, so a
         // codes CSR handed to a float index (or vice versa) is rejected rather
         // than misread.
-        const size_t element_size = mmap_element_size();
+        const size_t element_size = code_element_size();
 
         const size_t indptr_size = static_cast<size_t>(num_rows) + 1;
         const auto nnz_size = static_cast<size_t>(nnz);
