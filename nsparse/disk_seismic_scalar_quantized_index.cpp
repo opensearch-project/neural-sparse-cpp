@@ -77,16 +77,6 @@ DiskSeismicScalarQuantizedIndex::DiskSeismicScalarQuantizedIndex(
     SeismicClusterParameters parameter, int dim)
     : DiskSeismicIndexBase(dim, parameter), sq_(quantizer_type, vmin, vmax) {}
 
-void DiskSeismicScalarQuantizedIndex::read_csr(const char* file_path,
-                                               Residency residency) {
-    if (residency == Residency::kMmap) {
-        throw std::invalid_argument(
-            "mmap residency is not available for a quantized index: a mapped "
-            "CSR is borrowed as float, and this index searches over codes");
-    }
-    MmapIndex::read_csr(file_path, residency);
-}
-
 size_t DiskSeismicScalarQuantizedIndex::code_element_size() const {
     return sq_.bytes_per_value();
 }

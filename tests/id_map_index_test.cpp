@@ -25,8 +25,10 @@
 #include "nsparse/io/buffered_io.h"
 #include "nsparse/io/index_io.h"
 #include "nsparse/seismic_index.h"
+#include "nsparse/seismic_scalar_quantized_index.h"
 #include "nsparse/types.h"
 #include "nsparse/utils/csr_layout.h"
+#include "nsparse/utils/scalar_quantizer.h"
 #include "tests/csr_interchange_test_util.h"
 
 namespace {
@@ -512,6 +514,55 @@ TEST(IDMapReadCsrAndId, MatchesAddWithIdsBuild) {
         }
     }
     EXPECT_TRUE(saw_external) << "labels should be translated to external ids";
+}
+
+// read_csr_and_ids over a QUANTIZED delegate: since CR-2 the quantized types
+// accept a mmapped (codes) CSR, so the id-map wrapper works over them too --
+// this used to throw. The upstream writes codes at the quantizer's width; the
+// build is bit-exact to add_with_ids feeding the same corpus (which add()
+// quantizes with the same ScalarQuantizer the test wrote).
+TEST(IDMapReadCsrAndId, MatchesAddWithIdsBuildQuantized) {
+    const Corpus corpus = make_corpus(300, kDim, /*seed=*/1);
+    const Corpus queries = make_corpus(20, kDim, /*seed=*/2);
+    const std::vector<idx_t> ids = make_external_ids(corpus.n);
+    constexpr int k = 10;
+    auto delegate = [] {
+        return new nsparse::SeismicScalarQuantizedIndex(
+            nsparse::QuantizerType::QT_8bit, 0.0F, 1.0F, kClusterParams, kDim);
+    };
+
+    // Reference: add_with_ids() feeds floats, which the delegate quantizes.
+    nsparse::IDMapIndex added(delegate());
+    added.add_with_ids(corpus.n, corpus.indptr.data(), corpus.indices.data(),
+                       corpus.values.data(), ids.data());
+    added.build();
+    const auto expected = search_corpus(added, queries, k);
+
+    // Under test: the same corpus pre-quantized to codes, borrowed via mmap.
+    const nsparse::ScalarQuantizer sq(nsparse::QuantizerType::QT_8bit, 0.0F,
+                                      1.0F);
+    const size_t element_size = sq.bytes_per_value();
+    std::vector<uint8_t> codes(corpus.indices.size() * element_size);
+    sq.encode(corpus.values.data(), codes.data(), corpus.indices.size());
+    nsparse::csr_test::TempCsrFiles csr("nsparse_idmap_sq_src");
+    nsparse::csr_test::write_native_codes_csr(csr.native(), corpus.indptr,
+                                             corpus.indices, codes, kDim,
+                                             element_size);
+    TempIdFile idfile("nsparse_idmap_sq_src.ids");
+    nsparse::csr_test::write_id_map_file(idfile.path(), ids);
+
+    nsparse::IDMapIndex mapped(delegate());
+    mapped.read_csr_and_ids(csr.native().c_str(), idfile.path().c_str(),
+                            nsparse::Residency::kMmap);
+    ASSERT_EQ(mapped.num_vectors(), static_cast<size_t>(corpus.n));
+    mapped.build();
+    const auto got = search_corpus(mapped, queries, k);
+
+    EXPECT_EQ(got.first, expected.first) << "external-id labels differ";
+    ASSERT_EQ(got.second.size(), expected.second.size());
+    for (size_t i = 0; i < got.second.size(); ++i) {
+        EXPECT_FLOAT_EQ(got.second[i], expected.second[i]) << "score at " << i;
+    }
 }
 
 // The id map is row-aligned with the CSR, so a count that disagrees with the

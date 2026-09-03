@@ -14,11 +14,13 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
 
 #include "nsparse/types.h"
+#include "nsparse/utils/csr_layout.h"
 
 // Shared helpers for the mmap-CSR build path, used by both the regular and the
 // disk-resident index suites: write a corpus as an interchange CSR (the layout
@@ -47,6 +49,47 @@ void write_interchange_csr(const std::string& path, const Corpus& c,
               static_cast<std::streamsize>(indices32.size() * sizeof(int32_t)));
     out.write(reinterpret_cast<const char*>(c.values.data()),
               static_cast<std::streamsize>(c.values.size() * sizeof(float)));
+}
+
+// Writes a corpus of pre-quantized codes as a NATIVE CSR -- the layout read_mcsr
+// borrows when a quantizing index maps it: int64 header {rows, num_cols, nnz},
+// idx_t indptr[rows+1], term_t indices[nnz], pad to alignof(float), then
+// `element_size`-byte codes[nnz]. `codes` holds nnz*element_size bytes,
+// row-aligned with `indices`. This is the code-width analog of
+// csr_layout::convert's output, written directly since the codes path has no
+// interchange form.
+inline void write_native_codes_csr(const std::string& path,
+                                   const std::vector<idx_t>& indptr,
+                                   const std::vector<term_t>& indices,
+                                   const std::vector<uint8_t>& codes,
+                                   int64_t num_cols, size_t element_size) {
+    // The declared width must describe the buffer, or the file would not match
+    // the layout read_mcsr validates -- a mismatch here is a test-authoring bug.
+    if (codes.size() != indices.size() * element_size) {
+        throw std::invalid_argument(
+            "write_native_codes_csr: codes size does not match indices * "
+            "element_size");
+    }
+    std::ofstream out(path, std::ios::binary);
+    const std::array<int64_t, 3> header = {
+        static_cast<int64_t>(indptr.size()) - 1, num_cols,
+        static_cast<int64_t>(indices.size())};
+    out.write(reinterpret_cast<const char*>(header.data()),
+              header.size() * sizeof(int64_t));
+    out.write(reinterpret_cast<const char*>(indptr.data()),
+              static_cast<std::streamsize>(indptr.size() * sizeof(idx_t)));
+    out.write(reinterpret_cast<const char*>(indices.data()),
+              static_cast<std::streamsize>(indices.size() * sizeof(term_t)));
+    const size_t values_pos = csr_layout::kHeaderBytes +
+                              indptr.size() * sizeof(idx_t) +
+                              indices.size() * sizeof(term_t);
+    const std::array<char, alignof(float)> pad{};
+    if (const size_t pad_bytes = csr_layout::padding(values_pos);
+        pad_bytes > 0) {
+        out.write(pad.data(), static_cast<std::streamsize>(pad_bytes));
+    }
+    out.write(reinterpret_cast<const char*>(codes.data()),
+              static_cast<std::streamsize>(codes.size()));
 }
 
 // Writes the id-map file that IDMapIndex::read_csr_and_ids reads:

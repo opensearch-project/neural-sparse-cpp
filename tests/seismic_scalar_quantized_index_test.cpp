@@ -32,6 +32,8 @@
 #include "nsparse/io/index_io.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
+#include "nsparse/utils/scalar_quantizer.h"
+#include "tests/csr_interchange_test_util.h"
 
 namespace nsparse {
 namespace {
@@ -1354,13 +1356,75 @@ TEST(SeismicSQIndexMmapIOSingle, mapped_index_stays_valid_for_its_whole_life) {
     loaded.reset();  // must not fault, and must not double-unmap
 }
 
-// A mapped CSR is borrowed at the width it was written in, which is float, so
-// this index cannot take that path: its values have to be quantized by add().
-TEST(SeismicSQIndexMmapIOSingle, read_csr_rejects_the_mapped_residency) {
-    SeismicScalarQuantizedIndex index(QuantizerType::QT_8bit, 0.0F, 1.0F,
+// Building from a native codes CSR borrowed via mmap must match building the
+// same corpus fed through add(): the upstream writes codes at the quantizer's
+// width, read_csr(kMmap) borrows them in place, and build/write/reload/search
+// is bit-exact to the add()-fed build. This is the quantized analog of the
+// unquantized mmap-CSR build; the two builds see identical codes because add()
+// runs the same ScalarQuantizer::encode the test wrote into the file.
+TEST(SeismicSQIndexMmapIOSingle, mmap_codes_csr_build_matches_add_build) {
+    constexpr int kDim = 5;
+    const SeismicClusterParameters params{
+        .lambda = 10, .beta = 2, .alpha = 0.5F, .seed = 42};
+    // A small reproducible corpus, held as raw CSR arrays so it can be fed both
+    // ways from the same bytes.
+    const std::vector<idx_t> indptr = {0, 2, 4, 6, 9};
+    const std::vector<term_t> indices = {0, 2, 1, 3, 0, 4, 2, 3, 4};
+    const std::vector<float> values = {1.0F, 0.9F, 0.5F, 0.7F, 0.3F,
+                                       0.8F, 0.6F, 0.4F, 0.2F};
+    const idx_t n = static_cast<idx_t>(indptr.size()) - 1;
+
+    // Reference: the float corpus fed through add(), which quantizes it.
+    SeismicScalarQuantizedIndex added(QuantizerType::QT_8bit, 0.0F, 1.0F, params,
+                                      kDim);
+    added.add(n, indptr.data(), indices.data(), values.data());
+    added.build();
+
+    // Under test: the same corpus pre-quantized to codes and borrowed via mmap.
+    const ScalarQuantizer sq(QuantizerType::QT_8bit, 0.0F, 1.0F);
+    const size_t element_size = sq.bytes_per_value();
+    std::vector<uint8_t> codes(indices.size() * element_size);
+    sq.encode(values.data(), codes.data(), indices.size());
+
+    csr_test::TempCsrFiles csr("nsparse_sesq_codes");
+    csr_test::write_native_codes_csr(csr.native(), indptr, indices, codes, kDim,
+                                     element_size);
+
+    SeismicScalarQuantizedIndex mapped(QuantizerType::QT_8bit, 0.0F, 1.0F,
+                                       params, kDim);
+    mapped.read_csr(csr.native().c_str(), Residency::kMmap);
+    ASSERT_EQ(mapped.num_vectors(), static_cast<size_t>(n));
+    mapped.build();
+
+    TempIndexFile file("nsparse_sesq_mmapbuild.idx");
+    write_index(&mapped, file.c_str());
+    std::unique_ptr<Index> reloaded(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+    ASSERT_NE(reloaded, nullptr);
+
+    for (term_t term = 0; term < kDim; ++term) {
+        EXPECT_EQ(search_scored(reloaded.get(), term, 4),
+                  search_scored(&added, term, 4))
+            << "mismatch at term " << term;
+    }
+}
+
+// A codes CSR whose value width does not match the index's quantizer is
+// rejected by read_mcsr's native-layout size check rather than misread: here
+// 16-bit-wide values (element_size 2) are fed to an 8-bit index.
+TEST(SeismicSQIndexMmapIOSingle, mmap_codes_csr_wrong_width_is_rejected) {
+    constexpr int kDim = 5;
+    const std::vector<idx_t> indptr = {0, 2, 4};
+    const std::vector<term_t> indices = {0, 2, 1, 3};
+    std::vector<uint8_t> wide_codes(indices.size() * 2);
+    csr_test::TempCsrFiles csr("nsparse_sesq_wrongwidth");
+    csr_test::write_native_codes_csr(csr.native(), indptr, indices, wide_codes,
+                                     kDim, /*element_size=*/2);
+
+    SeismicScalarQuantizedIndex eight(QuantizerType::QT_8bit, 0.0F, 1.0F,
                                       {.lambda = 10, .beta = 2, .alpha = 0.5F},
-                                      5);
-    EXPECT_THROW(index.read_csr("does_not_matter.csr", Residency::kMmap),
+                                      kDim);
+    EXPECT_THROW(eight.read_csr(csr.native().c_str(), Residency::kMmap),
                  std::invalid_argument);
 }
 

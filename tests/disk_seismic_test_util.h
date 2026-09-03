@@ -87,6 +87,7 @@ inline void add_corpus(Index& index, const CSR& c) {
 // re-exported here so the disk suite reaches them via `disk_seismic_test`.
 using csr_test::TempCsrFiles;
 using csr_test::write_interchange_csr;
+using csr_test::write_native_codes_csr;
 
 // Index file removed on destruction. write_index/read_index take char*.
 class TempIndexFile {

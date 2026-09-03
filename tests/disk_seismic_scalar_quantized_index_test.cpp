@@ -331,4 +331,62 @@ TEST(DiskSeismicSQIndex, FactoryCreatesIt) {
               QuantizerType::QT_16bit);
 }
 
+// Building the disk quantized index from a native codes CSR borrowed via mmap
+// must match the add()-fed build: the upstream writes codes at the quantizer's
+// width, read_csr(kMmap) borrows them, and build -> persist -> mmap-reload ->
+// search is bit-exact to feeding the same corpus (quantized by add()) then
+// building. Both see identical codes because add() runs the same
+// ScalarQuantizer::encode the test wrote. Also asserts a width-mismatched codes
+// file is rejected rather than misread.
+TEST(DiskSeismicSQIndex, MmapCodesCsrBuildMatchesAddBuild) {
+    const CSR corpus = make_corpus(1500, /*seed=*/1);
+    const CSR queries = make_corpus(40, /*seed=*/2);
+    DiskSeismicSearchParameters params(/*cut=*/25, /*k_prime=*/32);
+
+    // Reference: float corpus fed through add() (which quantizes), reloaded.
+    DiskSeismicScalarQuantizedIndex added(QuantizerType::QT_8bit, 0.0F, 1.0F,
+                                          cluster_params(), kDim);
+    add_corpus(added, corpus);
+    added.build();
+    TempIndexFile added_file("nsparse_dssq_addbuild.idx");
+    write_index(&added, added_file.c_str());
+    std::unique_ptr<Index> added_mapped(
+        read_index(added_file.c_str(), IndexIoFlag::kUseMmap));
+    ASSERT_NE(added_mapped, nullptr);
+    const ScoreIds fresh = search_all(*added_mapped, queries, 10, &params);
+
+    // Under test: the same corpus pre-quantized to codes, borrowed via mmap.
+    const ScalarQuantizer sq(QuantizerType::QT_8bit, 0.0F, 1.0F);
+    const size_t element_size = sq.bytes_per_value();
+    std::vector<uint8_t> codes(corpus.indices.size() * element_size);
+    sq.encode(corpus.values.data(), codes.data(), corpus.indices.size());
+    TempCsrFiles csr("nsparse_dssq_codes");
+    write_native_codes_csr(csr.native(), corpus.indptr, corpus.indices, codes,
+                           kDim, element_size);
+
+    DiskSeismicScalarQuantizedIndex mapped(QuantizerType::QT_8bit, 0.0F, 1.0F,
+                                           cluster_params(), kDim);
+    mapped.read_csr(csr.native().c_str(), Residency::kMmap);
+    ASSERT_EQ(mapped.num_vectors(), static_cast<size_t>(corpus.n));
+    mapped.build();
+    TempIndexFile built_file("nsparse_dssq_mmapbuild.idx");
+    write_index(&mapped, built_file.c_str());
+    std::unique_ptr<Index> built_mapped(
+        read_index(built_file.c_str(), IndexIoFlag::kUseMmap));
+    ASSERT_NE(built_mapped, nullptr);
+    EXPECT_EQ(built_mapped->num_vectors(), static_cast<size_t>(corpus.n));
+    expect_same_results(search_all(*built_mapped, queries, 10, &params), fresh);
+
+    // A codes file whose width does not match the index's quantizer is rejected
+    // by the native-layout size check: 16-bit-wide values fed to an 8-bit index.
+    std::vector<uint8_t> wide_codes(corpus.indices.size() * 2);
+    TempCsrFiles wrong("nsparse_dssq_wrongwidth");
+    write_native_codes_csr(wrong.native(), corpus.indptr, corpus.indices,
+                           wide_codes, kDim, /*element_size=*/2);
+    DiskSeismicScalarQuantizedIndex eight(QuantizerType::QT_8bit, 0.0F, 1.0F,
+                                          cluster_params(), kDim);
+    EXPECT_THROW(eight.read_csr(wrong.native().c_str(), Residency::kMmap),
+                 std::invalid_argument);
+}
+
 }  // namespace nsparse

@@ -146,16 +146,6 @@ SeismicScalarQuantizedIndex::SeismicScalarQuantizedIndex(
       sq_(quantizer_type, vmin, vmax),
       cluster_parameter_(parameter) {}
 
-void SeismicScalarQuantizedIndex::read_csr(const char* file_path,
-                                           Residency residency) {
-    if (residency == Residency::kMmap) {
-        throw std::invalid_argument(
-            "mmap residency is not available for a quantized index: a mapped "
-            "CSR is borrowed as float, and this index searches over codes");
-    }
-    MmapIndex::read_csr(file_path, residency);
-}
-
 void SeismicScalarQuantizedIndex::add(idx_t n, const idx_t* indptr,
                                       const term_t* indices,
                                       const float* values) {

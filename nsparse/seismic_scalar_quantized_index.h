@@ -63,13 +63,13 @@ public:
                                                    const char* index_file,
                                                    size_t pos);
 
-    // Only the copying residency. A mapped CSR is borrowed at the width it was
-    // written in, which is float, whereas this index searches over codes: the
-    // values have to pass through add() to be quantized.
-    void read_csr(const char* file_path,
-                  Residency residency = Residency::kInMemory) override;
-
 private:
+    // The value width read_csr(kMmap) borrows a native CSR at: this index's
+    // code width, so a codes CSR is borrowed in place rather than a float one.
+    [[nodiscard]] size_t mmap_element_size() const override {
+        return sq_.bytes_per_value();
+    }
+
     // interfaces of IndexIO
     [[nodiscard]] uint32_t format_version() const override {
         return kFormatVersion;
