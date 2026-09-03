@@ -102,8 +102,8 @@ public:
     void add_with_ids(idx_t n, const idx_t* indptr, const term_t* indices,
                       const float* values, const idx_t* ids) override;
 
-    void read_csr_and_read_id(const char* csr_path, const char* id_path,
-                              Residency residency = Residency::kInMemory);
+    void read_csr_and_ids(const char* csr_path, const char* id_path,
+                          Residency residency = Residency::kInMemory);
 
     [[nodiscard]] uint32_t format_version() const override {
         return kFormatVersion;
@@ -113,6 +113,10 @@ public:
                     int io_flags = 0) override;
 
 private:
+    std::vector<idx_t> read_id_file(const char* id_path);
+
+    void set_id_map(std::vector<idx_t>&& internal_to_external);
+
     // Owns the wrapped delegate index. Using unique_ptr ensures the delegate is
     // freed when the IDMapIndex is destroyed (previously a raw pointer with a
     // defaulted destructor, which leaked the delegate and everything it owned).

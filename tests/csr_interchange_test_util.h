@@ -27,8 +27,8 @@ namespace nsparse::csr_test {
 
 // Writes a corpus as an interchange CSR: int64 header {rows, num_cols, nnz},
 // int64 indptr[rows + 1], int32 indices[nnz], float values[nnz]. Templated on
-// the corpus struct (any type exposing .n / .indptr / .indices / .values), so it
-// serves any test corpus. The values are written verbatim, so a convert +
+// the corpus struct (any type exposing .n / .indptr / .indices / .values), so
+// it serves any test corpus. The values are written verbatim, so a convert +
 // read_csr(kMmap) build sees the exact same vectors as add().
 template <class Corpus>
 void write_interchange_csr(const std::string& path, const Corpus& c,
@@ -49,7 +49,7 @@ void write_interchange_csr(const std::string& path, const Corpus& c,
               static_cast<std::streamsize>(c.values.size() * sizeof(float)));
 }
 
-// Writes the id-map file that IDMapIndex::read_csr_and_read_id reads:
+// Writes the id-map file that IDMapIndex::read_csr_and_ids reads:
 // [int64 count][idx_t external_id x count]. Row-aligned with the CSR, so
 // external_ids[i] is the external id of CSR row i.
 inline void write_id_map_file(const std::string& path,
@@ -67,7 +67,8 @@ inline void write_id_map_file(const std::string& path,
 class TempCsrFiles {
 public:
     explicit TempCsrFiles(const std::string& stem)
-        : interchange_(std::filesystem::temp_directory_path() / (stem + ".csr")),
+        : interchange_(std::filesystem::temp_directory_path() /
+                       (stem + ".csr")),
           native_(std::filesystem::temp_directory_path() / (stem + ".mcsr")) {
         std::error_code ignored;
         std::filesystem::remove(interchange_, ignored);

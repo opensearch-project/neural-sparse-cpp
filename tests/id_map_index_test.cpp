@@ -492,8 +492,8 @@ TEST(IDMapReadCsrAndId, MatchesAddWithIdsBuild) {
     nsparse::csr_test::write_id_map_file(idfile.path(), ids);
 
     nsparse::IDMapIndex mapped(new nsparse::SeismicIndex(kDim, kClusterParams));
-    mapped.read_csr_and_read_id(csr.native().c_str(), idfile.path().c_str(),
-                                nsparse::Residency::kMmap);
+    mapped.read_csr_and_ids(csr.native().c_str(), idfile.path().c_str(),
+                            nsparse::Residency::kMmap);
     ASSERT_EQ(mapped.num_vectors(), static_cast<size_t>(corpus.n));
     mapped.build();
     const auto got = search_corpus(mapped, queries, k);
@@ -529,8 +529,8 @@ TEST(IDMapReadCsrAndId, CountMismatchThrows) {
 
     nsparse::IDMapIndex mapped(new nsparse::SeismicIndex(kDim, kClusterParams));
     EXPECT_THROW(
-        mapped.read_csr_and_read_id(csr.native().c_str(), idfile.path().c_str(),
-                                    nsparse::Residency::kMmap),
+        mapped.read_csr_and_ids(csr.native().c_str(), idfile.path().c_str(),
+                                nsparse::Residency::kMmap),
         std::invalid_argument);
 }
 
@@ -549,14 +549,15 @@ TEST(IDMapReadCsrAndId, MalformedFileThrows) {
         out.write(reinterpret_cast<const char*>(&bogus_count),
                   sizeof(bogus_count));
         const std::vector<idx_t> only_three = {1, 2, 3};
-        out.write(reinterpret_cast<const char*>(only_three.data()),
-                  static_cast<std::streamsize>(only_three.size() * sizeof(idx_t)));
+        out.write(
+            reinterpret_cast<const char*>(only_three.data()),
+            static_cast<std::streamsize>(only_three.size() * sizeof(idx_t)));
     }
 
     nsparse::IDMapIndex mapped(new nsparse::SeismicIndex(kDim, kClusterParams));
     EXPECT_THROW(
-        mapped.read_csr_and_read_id(csr.native().c_str(), idfile.path().c_str(),
-                                    nsparse::Residency::kMmap),
+        mapped.read_csr_and_ids(csr.native().c_str(), idfile.path().c_str(),
+                                nsparse::Residency::kMmap),
         std::invalid_argument);
 }
 
@@ -573,8 +574,8 @@ TEST(IDMapReadCsrAndId, IdSelectorFilterWorksAfterFileBuild) {
     nsparse::csr_test::write_id_map_file(idfile.path(), ids);
 
     nsparse::IDMapIndex mapped(new nsparse::SeismicIndex(kDim, kClusterParams));
-    mapped.read_csr_and_read_id(csr.native().c_str(), idfile.path().c_str(),
-                                nsparse::Residency::kMmap);
+    mapped.read_csr_and_ids(csr.native().c_str(), idfile.path().c_str(),
+                            nsparse::Residency::kMmap);
     mapped.build();
 
     // Allow only the first two external ids (internal rows 0 and 1).

@@ -67,6 +67,51 @@ def test_with_id_map(corpus, queries, oracle, doc_ids):
     assert recall_at_k(labels, want_external) >= RECALL_FLOOR
 
 
+def _write_interchange_csr(path, corpus):
+    """Corpus as an interchange CSR: int64 header {n, dim, nnz}, int64 indptr,
+    int32 indices, float32 values -- the layout nsparse.convert consumes."""
+    with open(path, "wb") as out:
+        np.array(
+            [corpus.n, corpus.dim, corpus.indices.size], dtype=np.int64
+        ).tofile(out)
+        corpus.indptr.astype(np.int64).tofile(out)
+        corpus.indices.astype(np.int32).tofile(out)
+        corpus.values.astype(np.float32).tofile(out)
+
+
+def _write_id_map(path, external_ids):
+    """The id-map file read_csr_and_ids reads: int64 count, then int32 ids,
+    row-aligned with the CSR."""
+    with open(path, "wb") as out:
+        np.array([external_ids.size], dtype=np.int64).tofile(out)
+        external_ids.astype(np.int32).tofile(out)
+
+
+def test_id_map_from_csr_and_id_files(corpus, queries, oracle, doc_ids, tmp_path):
+    """read_csr_and_ids builds an idmap from a native CSR (borrowed via mmap)
+    plus a separate id file -- the memory-saving build path -- and must return
+    the caller's external ids, matching the in-RAM add_with_ids path."""
+    interchange = tmp_path / "corpus.csr"
+    native = tmp_path / "corpus.mcsr"
+    id_file = tmp_path / "ids.bin"
+    _write_interchange_csr(interchange, corpus)
+    nsparse.convert(str(interchange), str(native))
+    _write_id_map(id_file, doc_ids)
+
+    index = nsparse.index_factory(corpus.dim, f"idmap,{SPEC}")
+    index.read_csr_and_ids(str(native), str(id_file), nsparse.Residency_kMmap)
+    index.build()
+
+    _, labels = search(index, queries)
+    returned = labels[labels >= 0]
+    assert returned.size > 0, "every query should return at least one hit"
+    assert np.isin(returned, doc_ids).all(), "returned ids must be caller ids"
+
+    want_labels, _ = oracle
+    want_external = np.where(want_labels >= 0, doc_ids[want_labels], -1)
+    assert recall_at_k(labels, want_external) >= RECALL_FLOOR
+
+
 def test_exact_match(index, queries, oracle):
     """An enumerable selector of size <= k switches search to the exact path.
 
