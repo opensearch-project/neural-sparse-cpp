@@ -90,8 +90,6 @@ private:
     // The quantization parameters that open this index's payload -- distinct
     // from the IndexHeader the file itself starts with.
     void write_payload_header(IOWriter* io_writer) const override;
-    // Adopts the quantizer a mapped payload declares, rejecting an unknown type.
-    void read_mapped_payload_header(MmapCursor* cursor) override;
     void validate_mapped_payload() const override;
 
     // The quantizer a query is encoded with: DiskSeismicSQSearchParameters

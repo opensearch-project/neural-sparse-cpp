@@ -104,16 +104,25 @@ public:
         return path_ + "/" + name;
     }
 
+    // An existing, empty directory to spill into: what
+    // batch_file_output_path takes.
+    [[nodiscard]] std::string scratch(
+        const std::string& name = "scratch") const {
+        const std::string dir = file(name);
+        std::filesystem::create_directories(dir);
+        return dir;
+    }
+
 private:
     std::string path_;
 };
 
 SeismicClusterParameters params_for(size_t batch_size,
-                                    const std::string& out_path, int seed) {
+                                    const std::string& scratch_dir, int seed) {
     SeismicClusterParameters params = {
         .lambda = kLambda, .beta = kBeta, .alpha = kAlpha};
     params.batch_clustering.batch_size = batch_size;
-    params.batch_clustering.batch_file_output_path = out_path;
+    params.batch_clustering.batch_file_output_path = scratch_dir;
     params.seed = seed;
     return params;
 }
@@ -124,17 +133,21 @@ std::vector<uint8_t> read_file(const std::string& path) {
             std::istreambuf_iterator<char>()};
 }
 
-// A build streamed straight to `out`, through the index's own build().
-std::vector<uint8_t> streamed(const Corpus& corpus, size_t batch_size,
-                              const std::string& out, int seed = kSeed) {
-    SeismicIndex index(corpus.dim, params_for(batch_size, out, seed));
+// A batched build -- windows spilled to a scratch directory -- then written out
+// the ordinary way. build() itself produces no file; write_index is still what
+// serializes an index.
+std::vector<uint8_t> batched(const Corpus& corpus, size_t batch_size,
+                             const TempDir& dir, const std::string& out,
+                             int seed = kSeed) {
+    SeismicIndex index(corpus.dim, params_for(batch_size, dir.scratch(), seed));
     index.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
               corpus.values.data());
     index.build();
+    write_index(&index, const_cast<char*>(out.c_str()));
     return read_file(out);
 }
 
-// The same corpus built the ordinary way and written with write_index.
+// The same corpus built whole and written the same way.
 std::vector<uint8_t> in_memory(const Corpus& corpus, const std::string& out,
                                size_t batch_size = 1, int seed = kSeed) {
     SeismicIndex index(corpus.dim, params_for(batch_size, "", seed));
@@ -186,34 +199,71 @@ std::string write_native_csr(const Corpus& corpus, const std::string& path) {
 
 }  // namespace
 
-// The point of the seeding discipline: for a fixed seed a streamed build is not
-// merely equivalent to build() + write_index, it is the same file. Each list's
-// k-means seed comes from its own global term id, so neither the window a term
-// landed in nor the order the threads reached it can leak into the output.
-TEST(SeismicBatchedBuild, StreamedBuildIsByteIdenticalToInMemoryBuild) {
+// The point of the seeding discipline: for a fixed seed a batched build is not
+// merely equivalent to a whole-corpus one, it serializes to the same file. Each
+// list's k-means seed comes from its own global term id, so neither the window
+// a term landed in nor the order the threads reached it can leak into the
+// output.
+TEST(SeismicBatchedBuild, BatchedBuildIsByteIdenticalToInMemoryBuild) {
     Corpus corpus = make_corpus(/*n_docs=*/2000, /*dim=*/200, /*seed=*/42);
     TempDir dir("identical");
     EXPECT_EQ(in_memory(corpus, dir.file("mem.dat")),
-              streamed(corpus, /*batch_size=*/4, dir.file("streamed.dat")));
+              batched(corpus, /*batch_size=*/4, dir, dir.file("batched.dat")));
 }
 
 // The window count is a memory knob, not a behaviour knob: at a fixed seed
-// every count has to produce the same file.
-TEST(SeismicBatchedBuild, StreamedBuildIsIdenticalAcrossBatchCounts) {
+// every count has to produce the same index.
+TEST(SeismicBatchedBuild, BatchedBuildIsIdenticalAcrossBatchCounts) {
     Corpus corpus = make_corpus(/*n_docs=*/2000, /*dim=*/200, /*seed=*/11);
     TempDir dir("counts");
-    // batch_size <= 1 is an ordinary build, so its file comes from write_index.
     const auto one = in_memory(corpus, dir.file("b1.dat"));
     ASSERT_FALSE(one.empty());
-    EXPECT_EQ(one, streamed(corpus, 2, dir.file("b2.dat")));
-    EXPECT_EQ(one, streamed(corpus, 10, dir.file("b10.dat")));
+    EXPECT_EQ(one, batched(corpus, 2, dir, dir.file("b2.dat")));
+    EXPECT_EQ(one, batched(corpus, 10, dir, dir.file("b10.dat")));
     // More windows than terms is clamped to one term each.
-    EXPECT_EQ(one, streamed(corpus, 1000, dir.file("b1000.dat")));
+    EXPECT_EQ(one, batched(corpus, 1000, dir, dir.file("b1000.dat")));
 }
 
-// batch_size alone bounds the inverted-list intermediate and leaves the index
-// in memory. That is the path every index type gets, including the two disk
-// ones, so it must not change what build() produces either.
+// The spill is scratch, and nothing outlives the build: it is unlinked as soon
+// as it is mapped, so the directory the caller lent is empty again while the
+// index is still serving from those very bytes.
+TEST(SeismicBatchedBuild, LeavesNothingInTheScratchDirectory) {
+    Corpus corpus = make_corpus(/*n_docs=*/1500, /*dim=*/200, /*seed=*/3);
+    TempDir dir("scratch");
+    const std::string scratch = dir.scratch();
+
+    SeismicIndex index(corpus.dim, params_for(8, scratch, kSeed));
+    index.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
+              corpus.values.data());
+    index.build();
+
+    EXPECT_TRUE(std::filesystem::is_empty(scratch));
+    // And the lists are still readable, which is the point of unlinking rather
+    // than deleting: the mapping keeps the bytes alive.
+    write_index(&index, const_cast<char*>(dir.file("out.dat").c_str()));
+    EXPECT_EQ(read_file(dir.file("out.dat")),
+              in_memory(corpus, dir.file("mem.dat")));
+}
+
+// The two knobs are only useful together. A window count with nowhere to spill
+// the windows bounds the fill intermediate while leaving the clustered lists to
+// accumulate -- a corpus pass per window for a fraction of the peak -- so it is
+// resolved to one window rather than honoured.
+TEST(SeismicBatchedBuild, BatchSizeWithoutAScratchDirectoryIsOneWindow) {
+    BatchClusteringOption opt;
+    opt.batch_size = 64;
+    EXPECT_EQ(opt.effective_batch_size(), 1U);
+
+    opt.batch_file_output_path = "/tmp/does-not-need-to-exist";
+    EXPECT_EQ(opt.effective_batch_size(), 64U);
+
+    // 0 is not a window count; a build always runs at least one.
+    opt.batch_size = 0;
+    EXPECT_EQ(opt.effective_batch_size(), 1U);
+}
+
+// End to end, the resolution above is invisible: a batch size with no scratch
+// directory builds exactly what an unbatched build does.
 TEST(SeismicBatchedBuild, BatchSizeAloneDoesNotChangeAnInMemoryBuild) {
     Corpus corpus = make_corpus(/*n_docs=*/1500, /*dim=*/200, /*seed=*/5);
     TempDir dir("inmem_batched");
@@ -223,210 +273,45 @@ TEST(SeismicBatchedBuild, BatchSizeAloneDoesNotChangeAnInMemoryBuild) {
     EXPECT_EQ(unbatched, in_memory(corpus, dir.file("b64.dat"), 64));
 }
 
-// The disk-resident types share the same build, so batch_size has to bound
-// their intermediates too without changing what they produce.
-TEST(SeismicBatchedBuild, BatchSizeAloneDoesNotChangeADiskIndex) {
-    Corpus corpus = make_corpus(/*n_docs=*/1500, /*dim=*/200, /*seed=*/71);
-    TempDir dir("disk");
+// Every type in the family reaches the same build, so each has to spill and
+// come back with the index a whole-corpus build would have produced.
+// Parametrized over all four: float and quantizing, in-memory and
+// disk-resident.
+class BatchedBuildEveryType : public testing::TestWithParam<const char*> {};
 
-    auto build_disk = [&corpus](size_t batch_size, const std::string& out) {
-        DiskSeismicIndex index(corpus.dim, params_for(batch_size, "", kSeed));
-        index.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
-                  corpus.values.data());
-        index.build();
-        write_index(&index, const_cast<char*>(out.c_str()));
+TEST_P(BatchedBuildEveryType, SpilledBuildIsByteIdenticalToInMemoryBuild) {
+    const std::string kind = GetParam();
+    Corpus corpus = make_corpus(/*n_docs=*/1500, /*dim=*/200, /*seed=*/71);
+    TempDir dir("every_type");
+    const std::string base =
+        "lambda=64|beta=6|alpha=0.4|seed=42|inverted_list_batch_size=";
+
+    const auto build_and_write = [&](const std::string& spec,
+                                     const std::string& out) {
+        std::unique_ptr<Index> index(index_factory(corpus.dim, spec.c_str()));
+        index->add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
+                   corpus.values.data());
+        index->build();
+        write_index(index.get(), const_cast<char*>(out.c_str()));
         return read_file(out);
     };
 
-    const auto unbatched = build_disk(1, dir.file("b1.dat"));
-    ASSERT_FALSE(unbatched.empty());
-    EXPECT_EQ(unbatched, build_disk(8, dir.file("b8.dat")));
-    EXPECT_EQ(unbatched, build_disk(64, dir.file("b64.dat")));
+    const auto whole =
+        build_and_write(kind + "," + base + "1", dir.file("mem.dat"));
+    ASSERT_FALSE(whole.empty());
+    const std::string scratch = dir.scratch();
+    EXPECT_EQ(whole, build_and_write(kind + "," + base +
+                                         "8|batch_file_output_path=" + scratch,
+                                     dir.file("b8.dat")));
+    EXPECT_EQ(whole, build_and_write(kind + "," + base +
+                                         "64|batch_file_output_path=" + scratch,
+                                     dir.file("b64.dat")));
+    EXPECT_TRUE(std::filesystem::is_empty(scratch));
 }
 
-// The disk types cannot stream their payload out window by window -- the inline
-// forward index that follows their summaries is laid out from the doc-id
-// membership of every list -- so they spill the lists instead and write the
-// payload from that mapping. Same contract as the in-memory types all the same:
-// at a fixed seed the file is what write_index would have produced.
-TEST(SeismicBatchedBuild, StreamsADiskIndexIdenticallyToo) {
-    Corpus corpus = make_corpus(/*n_docs=*/1500, /*dim=*/200, /*seed=*/71);
-    TempDir dir("disk_streamed");
-    const std::string mem_path = dir.file("mem.dat");
-    const std::string streamed_path = dir.file("streamed.dat");
-
-    DiskSeismicIndex mem(corpus.dim, params_for(1, "", kSeed));
-    mem.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
-            corpus.values.data());
-    mem.build();
-    write_index(&mem, const_cast<char*>(mem_path.c_str()));
-
-    DiskSeismicIndex batched(corpus.dim, params_for(8, streamed_path, kSeed));
-    batched.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
-                corpus.values.data());
-    batched.build();
-
-    EXPECT_EQ(read_file(mem_path), read_file(streamed_path));
-    // The spill is scratch: it must not outlive the build that took it.
-    EXPECT_FALSE(std::filesystem::exists(streamed_path + ".lists"));
-    // And the window count is still not a behaviour knob.
-    const std::string many_path = dir.file("many.dat");
-    DiskSeismicIndex many(corpus.dim, params_for(64, many_path, kSeed));
-    many.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
-             corpus.values.data());
-    many.build();
-    EXPECT_EQ(read_file(mem_path), read_file(many_path));
-}
-
-// The quantized disk index writes a quantization header before the shared
-// payload, so a batched build has to lay that down and read it back to reopen
-// its own file at the right offset.
-TEST(SeismicBatchedBuild, StreamsAQuantizedDiskIndexIdenticallyToo) {
-    Corpus corpus = make_corpus(/*n_docs=*/1500, /*dim=*/200, /*seed=*/29);
-    TempDir dir("disk_sq");
-    const std::string mem_path = dir.file("mem.dat");
-    const std::string streamed_path = dir.file("streamed.dat");
-
-    DiskSeismicScalarQuantizedIndex mem(QuantizerType::QT_8bit, 0.0F, 3.0F,
-                                        params_for(1, "", kSeed), corpus.dim);
-    mem.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
-            corpus.values.data());
-    mem.build();
-    write_index(&mem, const_cast<char*>(mem_path.c_str()));
-
-    DiskSeismicScalarQuantizedIndex batched(QuantizerType::QT_8bit, 0.0F, 3.0F,
-                                            params_for(8, streamed_path, kSeed),
-                                            corpus.dim);
-    batched.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
-                corpus.values.data());
-    batched.build();
-
-    EXPECT_EQ(read_file(mem_path), read_file(streamed_path));
-    // It reads back as the quantized disk type it claims to be, with the range
-    // it was built with -- the header the batched write had to reproduce.
-    std::unique_ptr<Index> reloaded(read_index(
-        const_cast<char*>(streamed_path.c_str()), IndexIoFlag::kUseMmap));
-    EXPECT_EQ(reloaded->id(), DiskSeismicScalarQuantizedIndex::name);
-    EXPECT_EQ(reloaded->num_vectors(), static_cast<size_t>(corpus.n));
-    const auto* sq_index =
-        dynamic_cast<DiskSeismicScalarQuantizedIndex*>(reloaded.get());
-    ASSERT_NE(sq_index, nullptr);
-    EXPECT_EQ(sq_index->get_scalar_quantizer().get_min(), 0.0F);
-    EXPECT_EQ(sq_index->get_scalar_quantizer().get_max(), 3.0F);
-}
-
-// A batched disk build ends serving from the file it wrote: its summaries and
-// its forward index are borrowed from that mapping, not from the spill it
-// deleted. Against an unbatched build at the same seed, so identical results
-// rather than merely close ones.
-TEST(SeismicBatchedBuild, BatchedDiskBuildIsSearchableAfterBuild) {
-    Corpus corpus = make_corpus(/*n_docs=*/2000, /*dim=*/200, /*seed=*/17);
-    Corpus queries = make_corpus(/*n_docs=*/50, /*dim=*/200, /*seed=*/99);
-    const int k = 10;
-    const auto n = static_cast<size_t>(queries.n);
-    TempDir dir("disk_searchable");
-
-    const auto search_with = [&](Index& index) {
-        std::vector<float> dist(n * k);
-        std::vector<idx_t> lab(n * k);
-        DiskSeismicSearchParameters params(/*cut=*/3, /*k_prime=*/50);
-        index.search(queries.n, queries.indptr.data(), queries.indices.data(),
-                     queries.values.data(), k, dist.data(), lab.data(),
-                     &params);
-        return std::pair{dist, lab};
-    };
-
-    // The unbatched reference has to be read back mapped: an unwritten disk
-    // index has no forward index to score from.
-    const std::string mem_path = dir.file("mem.dat");
-    DiskSeismicIndex mem(corpus.dim, params_for(1, "", kSeed));
-    mem.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
-            corpus.values.data());
-    mem.build();
-    write_index(&mem, const_cast<char*>(mem_path.c_str()));
-    std::unique_ptr<Index> reference(
-        read_index(const_cast<char*>(mem_path.c_str()), IndexIoFlag::kUseMmap));
-    const auto [want_dist, want_lab] = search_with(*reference);
-
-    DiskSeismicIndex batched(corpus.dim,
-                             params_for(4, dir.file("b.dat"), kSeed));
-    batched.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
-                corpus.values.data());
-    batched.build();
-
-    // No reopening by path: build() mapped its own output back in.
-    EXPECT_EQ(batched.num_vectors(), static_cast<size_t>(corpus.n));
-    const auto [got_dist, got_lab] = search_with(batched);
-    EXPECT_EQ(got_lab, want_lab);
-    EXPECT_EQ(got_dist, want_dist);
-}
-
-// The disk index's own reason for existing: a corpus that came from a mapping.
-// Three mappings are then live at once -- the corpus, the spill, and the output
-// -- and the build may give up only the spill.
-TEST(SeismicBatchedBuild, BatchedDiskBuildKeepsTheCorpusMapping) {
-    Corpus corpus = make_corpus(/*n_docs=*/1500, /*dim=*/200, /*seed=*/13);
-    Corpus queries = make_corpus(/*n_docs=*/40, /*dim=*/200, /*seed=*/77);
-    const int k = 10;
-    const auto n = static_cast<size_t>(queries.n);
-    TempDir dir("disk_mapped");
-
-    const std::string native = write_native_csr(corpus, dir.file("corpus.csr"));
-    const std::string out = dir.file("out.dat");
-    DiskSeismicIndex index(corpus.dim, params_for(3, out, kSeed));
-    index.read_csr(native.c_str(), Residency::kMmap);
-    index.build();
-
-    EXPECT_EQ(index.num_vectors(), static_cast<size_t>(corpus.n));
-    std::vector<float> dist(n * k);
-    std::vector<idx_t> lab(n * k);
-    DiskSeismicSearchParameters params(/*cut=*/3, /*k_prime=*/50);
-    static_cast<Index&>(index).search(
-        queries.n, queries.indptr.data(), queries.indices.data(),
-        queries.values.data(), k, dist.data(), lab.data(), &params);
-    EXPECT_TRUE(
-        std::any_of(lab.begin(), lab.end(), [](idx_t id) { return id >= 0; }));
-
-    // Same file a heap-resident corpus produces: residency is SparseVectors'
-    // business, not the build's.
-    DiskSeismicIndex owned(corpus.dim,
-                           params_for(3, dir.file("owned.dat"), kSeed));
-    owned.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
-              corpus.values.data());
-    owned.build();
-    EXPECT_EQ(read_file(out), read_file(dir.file("owned.dat")));
-}
-
-// The generalization that matters: a quantizing index streams too, because the
-// codes in `vectors_` are already quantized by add() and the shared build only
-// needs their width.
-TEST(SeismicBatchedBuild, StreamsAQuantizedIndexIdenticallyToo) {
-    Corpus corpus = make_corpus(/*n_docs=*/1500, /*dim=*/200, /*seed=*/23);
-    TempDir dir("sq");
-    const std::string mem_path = dir.file("mem.dat");
-    const std::string streamed_path = dir.file("streamed.dat");
-
-    SeismicScalarQuantizedIndex mem(QuantizerType::QT_8bit, 0.0F, 3.0F,
-                                    params_for(1, "", kSeed), corpus.dim);
-    mem.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
-            corpus.values.data());
-    mem.build();
-    write_index(&mem, const_cast<char*>(mem_path.c_str()));
-
-    SeismicScalarQuantizedIndex batched(QuantizerType::QT_8bit, 0.0F, 3.0F,
-                                        params_for(4, streamed_path, kSeed),
-                                        corpus.dim);
-    batched.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
-                corpus.values.data());
-    batched.build();
-
-    EXPECT_EQ(read_file(mem_path), read_file(streamed_path));
-    // And it loads as the quantized type it claims to be.
-    std::unique_ptr<Index> reloaded(
-        read_index(const_cast<char*>(streamed_path.c_str())));
-    EXPECT_EQ(reloaded->id(), SeismicScalarQuantizedIndex::name);
-    EXPECT_EQ(reloaded->num_vectors(), static_cast<size_t>(corpus.n));
-}
+INSTANTIATE_TEST_SUITE_P(AllSeismicTypes, BatchedBuildEveryType,
+                         testing::Values("seismic", "seismic_sq",
+                                         "disk_seismic", "disk_seismic_sq"));
 
 // Windows are cut to equal posting counts, not equal width, so a term heavier
 // than a whole window's target has to be handled: it cannot be split, and it
@@ -461,17 +346,17 @@ TEST(SeismicBatchedBuild, HandlesATermHeavierThanAWholeWindow) {
     TempDir dir("skewed");
     const auto one = in_memory(skewed, dir.file("b1.dat"));
     ASSERT_FALSE(one.empty());
-    // Every one of these has to cover all 64 terms exactly once, or the
-    // streamed file would be short and the write would refuse it.
-    EXPECT_EQ(one, streamed(skewed, 8, dir.file("b8.dat")));
-    EXPECT_EQ(one, streamed(skewed, 32, dir.file("b32.dat")));
-    EXPECT_EQ(one, streamed(skewed, 64, dir.file("b64.dat")));
-    EXPECT_EQ(one, streamed(skewed, 200, dir.file("b200.dat")));
+    // Every one of these has to cover all 64 terms exactly once, or the spill
+    // would be short and mapping it back would refuse it.
+    EXPECT_EQ(one, batched(skewed, 8, dir, dir.file("b8.dat")));
+    EXPECT_EQ(one, batched(skewed, 32, dir, dir.file("b32.dat")));
+    EXPECT_EQ(one, batched(skewed, 64, dir, dir.file("b64.dat")));
+    EXPECT_EQ(one, batched(skewed, 200, dir, dir.file("b200.dat")));
 }
 
-// A batched build ends holding the index it wrote, so build() leaves something
-// usable rather than an empty object. Against an unbatched build at the same
-// seed: identical builds, so identical results.
+// A batched build ends holding its lists, borrowed from the spill, so build()
+// leaves an index that serves rather than an empty object. Against an unbatched
+// build at the same seed: identical builds, so identical results.
 TEST(SeismicBatchedBuild, BatchedBuildIsSearchableAfterBuild) {
     Corpus corpus = make_corpus(/*n_docs=*/2000, /*dim=*/200, /*seed=*/7);
     Corpus queries = make_corpus(/*n_docs=*/50, /*dim=*/200, /*seed=*/99);
@@ -495,22 +380,56 @@ TEST(SeismicBatchedBuild, BatchedBuildIsSearchableAfterBuild) {
     mem.build();
     const auto [want_dist, want_lab] = search_with(mem);
 
-    SeismicIndex batched(corpus.dim, params_for(4, dir.file("b.dat"), kSeed));
-    batched.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
+    SeismicIndex spilled(corpus.dim, params_for(4, dir.scratch(), kSeed));
+    spilled.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
                 corpus.values.data());
-    batched.build();
+    spilled.build();
 
-    // No reopening by path: build() mapped the lists back in.
-    EXPECT_EQ(batched.num_vectors(), static_cast<size_t>(corpus.n));
-    const auto [got_dist, got_lab] = search_with(batched);
+    EXPECT_EQ(spilled.num_vectors(), static_cast<size_t>(corpus.n));
+    const auto [got_dist, got_lab] = search_with(spilled);
+    EXPECT_EQ(got_lab, want_lab);
+    EXPECT_EQ(got_dist, want_dist);
+}
+
+// A batched disk build serves too, from the corpus it already holds -- the
+// forward index only exists once write_index has laid it out.
+TEST(SeismicBatchedBuild, BatchedDiskBuildIsSearchableAfterBuild) {
+    Corpus corpus = make_corpus(/*n_docs=*/2000, /*dim=*/200, /*seed=*/17);
+    Corpus queries = make_corpus(/*n_docs=*/50, /*dim=*/200, /*seed=*/99);
+    const int k = 10;
+    const auto n = static_cast<size_t>(queries.n);
+    TempDir dir("disk_searchable");
+
+    const auto search_with = [&](Index& index) {
+        std::vector<float> dist(n * k);
+        std::vector<idx_t> lab(n * k);
+        DiskSeismicSearchParameters params(/*cut=*/3, /*k_prime=*/50);
+        index.search(queries.n, queries.indptr.data(), queries.indices.data(),
+                     queries.values.data(), k, dist.data(), lab.data(),
+                     &params);
+        return std::pair{dist, lab};
+    };
+
+    DiskSeismicIndex mem(corpus.dim, params_for(1, "", kSeed));
+    mem.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
+            corpus.values.data());
+    mem.build();
+    const auto [want_dist, want_lab] = search_with(mem);
+
+    DiskSeismicIndex spilled(corpus.dim, params_for(4, dir.scratch(), kSeed));
+    spilled.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
+                corpus.values.data());
+    spilled.build();
+
+    EXPECT_EQ(spilled.num_vectors(), static_cast<size_t>(corpus.n));
+    const auto [got_dist, got_lab] = search_with(spilled);
     EXPECT_EQ(got_lab, want_lab);
     EXPECT_EQ(got_dist, want_dist);
 }
 
 // A corpus borrowed from a mapping is the case two mappings exist for: the
-// corpus one, which vectors_ still scores from, and the one the build just
-// wrote, which the posting lists borrow from. Neither may be given up for the
-// other.
+// corpus's, which vectors_ still scores from, and the spill's, which the
+// posting lists borrow from. Neither may be given up for the other.
 TEST(SeismicBatchedBuild, KeepsTheCorpusMappingWhileBorrowingItsOwnLists) {
     Corpus corpus = make_corpus(/*n_docs=*/1500, /*dim=*/200, /*seed=*/13);
     Corpus queries = make_corpus(/*n_docs=*/40, /*dim=*/200, /*seed=*/77);
@@ -519,12 +438,12 @@ TEST(SeismicBatchedBuild, KeepsTheCorpusMappingWhileBorrowingItsOwnLists) {
     TempDir dir("mapped_reload");
 
     const std::string native = write_native_csr(corpus, dir.file("corpus.csr"));
-    SeismicIndex index(corpus.dim, params_for(3, dir.file("out.dat"), kSeed));
+    SeismicIndex index(corpus.dim, params_for(3, dir.scratch(), kSeed));
     index.read_csr(native.c_str(), Residency::kMmap);
     index.build();
 
     // Still serving: scoring reads the mapped corpus, the lists come from the
-    // second mapping.
+    // spill's mapping.
     EXPECT_EQ(index.num_vectors(), static_cast<size_t>(corpus.n));
     std::vector<float> dist(n * k);
     std::vector<idx_t> lab(n * k);
@@ -545,7 +464,7 @@ TEST(SeismicBatchedBuild, PerTermMembershipInvariantAcrossBatches) {
     const std::string one = dir.file("1.dat");
     const std::string ten = dir.file("10.dat");
     in_memory(corpus, one, /*batch_size=*/1, kRandomSeed);
-    streamed(corpus, 10, ten, kRandomSeed);
+    batched(corpus, 10, dir, ten, kRandomSeed);
 
     auto sets1 = per_term_doc_sets(one);
     auto sets10 = per_term_doc_sets(ten);
@@ -559,14 +478,14 @@ TEST(SeismicBatchedBuild, PerTermMembershipInvariantAcrossBatches) {
 // Regression for the term_t (uint16) window-bound overflow: a dimension at the
 // 2^16 boundary must still build every term's list. Before the fix, size_t
 // window bounds cast to term_t wrapped mod 65536, so dim=65536 built nothing
-// while n_lists claimed 65536 -> a corrupt, unloadable file.
+// while n_lists claimed 65536 -> a corrupt, unloadable spill.
 TEST(SeismicBatchedBuild, HandlesDimensionAt65536) {
     const int dim = 65536;  // term ids 0..65535 all fit term_t (uint16)
     Corpus corpus = make_corpus(/*n_docs=*/3000, dim, /*seed=*/5);
     TempDir dir("dim64k");
     const std::string path = dir.file("index.dat");
-    // Two windows, so the batched path is what produces the file.
-    streamed(corpus, 2, path);
+    // Two windows, so the spilling path is what produces the lists.
+    batched(corpus, 2, dir, path);
 
     // Must load without "unexpected end of index file".
     std::unique_ptr<Index> idx(read_index(const_cast<char*>(path.c_str())));
@@ -581,23 +500,23 @@ TEST(SeismicBatchedBuild, HandlesDimensionAt65536) {
     EXPECT_GT(total_docs, 0U);
 }
 
-// A streamed index must serve correctly through the mapped read path -- the way
-// a caller whose corpus did not fit in RAM is going to use it.
+// A batched build's index must serve correctly through the mapped read path --
+// the way a caller whose corpus did not fit in RAM is going to use it.
 TEST(SeismicBatchedBuild, SearchThroughMappedReadMatchesInMemory) {
     Corpus corpus = make_corpus(/*n_docs=*/2000, /*dim=*/200, /*seed=*/7);
     Corpus queries = make_corpus(/*n_docs=*/50, /*dim=*/200, /*seed=*/99);
     const int k = 10;
     TempDir dir("search");
-    const std::string streamed_path = dir.file("streamed.dat");
+    const std::string batched_path = dir.file("batched.dat");
 
     SeismicIndex mem(corpus.dim, params_for(1, "", kSeed));
     mem.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
             corpus.values.data());
     mem.build();
-    streamed(corpus, 4, streamed_path);
+    batched(corpus, 4, dir, batched_path);
 
     std::unique_ptr<Index> disk(read_index(
-        const_cast<char*>(streamed_path.c_str()), IndexIoFlag::kUseMmap));
+        const_cast<char*>(batched_path.c_str()), IndexIoFlag::kUseMmap));
 
     SeismicSearchParameters search_params(/*cut=*/3, /*heap_factor=*/1.0F);
     const auto n = static_cast<size_t>(queries.n);
@@ -625,12 +544,13 @@ TEST(SeismicBatchedBuild, MappedCorpusMatchesOwnedCorpus) {
     TempDir dir("mapped");
     const std::string owned_path = dir.file("owned.dat");
     const std::string mapped_path = dir.file("mapped.dat");
-    streamed(corpus, 3, owned_path);
+    batched(corpus, 3, dir, owned_path);
 
     const std::string native = write_native_csr(corpus, dir.file("corpus.csr"));
-    SeismicIndex mapped(corpus.dim, params_for(3, mapped_path, kSeed));
+    SeismicIndex mapped(corpus.dim, params_for(3, dir.scratch(), kSeed));
     mapped.read_csr(native.c_str(), Residency::kMmap);
     mapped.build();
+    write_index(&mapped, const_cast<char*>(mapped_path.c_str()));
 
     EXPECT_EQ(read_file(owned_path), read_file(mapped_path));
 }
@@ -644,15 +564,15 @@ TEST(SeismicBatchedBuild, FactoryDescriptionDrivesTheBatchedBuild) {
     const std::string spec =
         "seismic,lambda=64|beta=6|alpha=0.4|seed=42|"
         "inverted_list_batch_size=8|batch_file_output_path=" +
-        path;
+        dir.scratch("from_factory");
 
     std::unique_ptr<Index> index(index_factory(corpus.dim, spec.c_str()));
     index->add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
                corpus.values.data());
     index->build();
+    write_index(index.get(), const_cast<char*>(path.c_str()));
 
-    ASSERT_TRUE(std::filesystem::exists(path));
-    EXPECT_EQ(streamed(corpus, 8, dir.file("direct.dat")), read_file(path));
+    EXPECT_EQ(batched(corpus, 8, dir, dir.file("direct.dat")), read_file(path));
 }
 
 TEST(SeismicBatchedBuild, RejectsInvalidInput) {
@@ -662,20 +582,27 @@ TEST(SeismicBatchedBuild, RejectsInvalidInput) {
     // A term the declared dimension does not cover. The mapped read path does
     // not range-check terms, so this is the build's own guard -- without it the
     // term would be silently dropped from the index.
-    SeismicIndex narrow(corpus.dim / 2,
-                        params_for(1, dir.file("narrow.dat"), kSeed));
+    SeismicIndex narrow(corpus.dim / 2, params_for(1, "", kSeed));
     narrow.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
                corpus.values.data());
     EXPECT_THROW(narrow.build(), std::invalid_argument);
 
-    // Streaming an empty corpus would leave a header-only file that read_index
-    // cannot parse, so it is refused rather than written.
-    SeismicIndex empty(corpus.dim, params_for(4, dir.file("empty.dat"), kSeed));
+    // Somewhere to spill is the caller's to provide: a path that is not a
+    // directory is refused rather than half-written.
+    SeismicIndex no_dir(corpus.dim,
+                        params_for(4, dir.file("not-a-directory"), kSeed));
+    no_dir.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
+               corpus.values.data());
+    EXPECT_THROW(no_dir.build(), std::invalid_argument);
+
+    // An empty corpus spills no windows at all, which would map back to no
+    // lists, so it is refused rather than silently producing an empty index.
+    SeismicIndex empty(corpus.dim, params_for(4, dir.scratch(), kSeed));
     EXPECT_THROW(empty.build(), std::invalid_argument);
 
-    // Same for a disk index, whose spill would map back to no lists at all.
-    DiskSeismicIndex empty_disk(
-        corpus.dim, params_for(4, dir.file("empty_disk.dat"), kSeed));
+    // Same for a disk index, which reaches the same build.
+    DiskSeismicIndex empty_disk(corpus.dim,
+                                params_for(4, dir.scratch(), kSeed));
     EXPECT_THROW(empty_disk.build(), std::invalid_argument);
 }
 

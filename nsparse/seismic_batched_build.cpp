@@ -10,15 +10,16 @@
 #include "nsparse/seismic_batched_build.h"
 
 #include <cstddef>
-#include <memory>
+#include <filesystem>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 #include "nsparse/cluster/inverted_list_clusters.h"
 #include "nsparse/io/file_io.h"
-#include "nsparse/io/index_io.h"
 #include "nsparse/io/io.h"
 #include "nsparse/io/seismic_invlists_writer.h"
 #include "nsparse/seismic_common.h"
@@ -29,30 +30,26 @@
 namespace nsparse::detail {
 namespace {
 
-// Both entry points below refuse the same two inputs: nowhere to write to, and
-// a corpus with no postings to write.
-void throw_if_not_streamable(const SparseVectors* vectors,
-                             const std::string& path, const char* who) {
-    if (path.empty()) {
-        throw std::invalid_argument(std::string(who) +
-                                    ": output path must not be empty");
-    }
-    if (vectors == nullptr || vectors->num_vectors() == 0) {
-        throw std::invalid_argument(
-            std::string(who) + ": corpus is empty; there is nothing to stream");
-    }
+// A spill file of this build's own inside `dir`. Named uniquely rather than
+// fixed, so concurrent builds sharing a scratch directory cannot overwrite each
+// other's windows.
+std::string scratch_file_path(const std::string& dir) {
+    const auto token = static_cast<uint64_t>(std::random_device{}()) << 32U |
+                       std::random_device{}();
+    return (std::filesystem::path(dir) /
+            ("nsparse-clustered-lists-" + std::to_string(token) + ".tmp"))
+        .string();
 }
 
 // The posting-list section -- [count][list...], the layout
 // SeismicInvertedListsWriter produces -- streamed into `writer` one window at a
-// time, starting wherever the writer has reached.
+// time.
 //
-// The writer is the one the whole file is being written through, rather than a
-// per-window one whose output is concatenated: serialize() pads each array
+// One writer for the whole section, windows serialized straight into it rather
+// than written separately and concatenated: serialize() pads each array
 // relative to the writer's current offset (see io/align.h), so bytes produced
 // by a writer that started at 0 carry the wrong padding once appended at some
-// other offset. Streaming through a single writer keeps pos() the true absolute
-// offset.
+// other offset.
 void stream_clustered_lists(const SparseVectors* vectors,
                             const SparseVectorsConfig& config,
                             const SeismicClusterParameters& params,
@@ -73,7 +70,7 @@ void stream_clustered_lists(const SparseVectors* vectors,
                 // The layout carries no per-list offsets, so a gap or a repeat
                 // would silently shift every list after it.
                 throw std::runtime_error(
-                    "stream_clustered_lists: windows arrived out of order");
+                    "spill_clustered_lists: windows arrived out of order");
             }
             for (const auto& list : clusters) {
                 list.serialize(writer);
@@ -83,35 +80,31 @@ void stream_clustered_lists(const SparseVectors* vectors,
         });
     if (next_term != config.dimension) {
         throw std::runtime_error(
-            "stream_clustered_lists: wrote " + std::to_string(next_term) +
+            "spill_clustered_lists: spilled " + std::to_string(next_term) +
             " of " + std::to_string(config.dimension) + " posting lists");
     }
 }
 
 }  // namespace
 
-size_t write_seismic_index_batched(
-    const SparseVectors* vectors, const SparseVectorsConfig& config,
-    const SeismicClusterParameters& params, const IndexHeader& header,
-    const std::function<void(IOWriter*)>& write_prefix,
-    const std::string& out_path) {
-    throw_if_not_streamable(vectors, out_path, "write_seismic_index_batched");
+SpilledLists spill_clustered_lists(const SparseVectors* vectors,
+                                   const SparseVectorsConfig& config,
+                                   const SeismicClusterParameters& params,
+                                   const std::string& scratch_dir,
+                                   MmapFile* into) {
+    if (!std::filesystem::is_directory(scratch_dir)) {
+        throw std::invalid_argument(
+            "spill_clustered_lists: batch_file_output_path must be an existing "
+            "directory to spill into, got '" +
+            scratch_dir + "'");
+    }
+    if (vectors == nullptr || vectors->num_vectors() == 0) {
+        throw std::invalid_argument(
+            "spill_clustered_lists: corpus is empty; there is nothing to "
+            "spill");
+    }
 
-    FileIOWriter writer(const_cast<char*>(out_path.c_str()));
-    write_header(header, &writer);
-    write_prefix(&writer);
-
-    const size_t lists_offset = writer.pos();
-    stream_clustered_lists(vectors, config, params, &writer);
-    writer.close();
-    return lists_offset;
-}
-
-std::vector<InvertedListClusters> spill_clustered_lists(
-    const SparseVectors* vectors, const SparseVectorsConfig& config,
-    const SeismicClusterParameters& params, const std::string& path,
-    MmapFile* into) {
-    throw_if_not_streamable(vectors, path, "spill_clustered_lists");
+    const std::string path = scratch_file_path(scratch_dir);
     {
         // Closed before the mapping is taken: the writer buffers, and what is
         // not flushed is not in the file to map.
@@ -119,28 +112,30 @@ std::vector<InvertedListClusters> spill_clustered_lists(
         stream_clustered_lists(vectors, config, params, &writer);
         writer.close();
     }
-    // Offset 0: a spill is the section and nothing else, with no header for it
-    // to sit behind.
-    return map_streamed_lists(path, /*lists_offset=*/0, into);
-}
 
-std::vector<InvertedListClusters> map_streamed_lists(const std::string& path,
-                                                     size_t lists_offset,
-                                                     MmapFile* into) {
     MmapFile mapped(path);
-    // The cursor starts at 0 and skips, rather than mapping from lists_offset:
-    // absolute file offsets are what serialize() padded against, so a cursor
-    // that began part-way through would compute different padding and misread
-    // every array. Same reason mmap_index skips rather than offsets.
+    // The cursor starts at the section, which is the whole file: a spill has no
+    // header for it to sit behind. Absolute offsets are what serialize() padded
+    // against, and here they are the section's own.
     MmapCursor cursor(mapped.data(), mapped.size());
-    cursor.skip(lists_offset);
     SeismicInvertedListsWriter lists;
     lists.mmap_deserialize(&cursor);
 
-    // Committed only once the walk succeeded, so a truncated file cannot leave
-    // the index holding lists that point into a mapping it never took.
+    // Unlinked now rather than when the index is done with it: the mapping
+    // keeps the bytes alive wherever unlinking an open file is allowed, so
+    // scratch cannot outlive the process even if it dies mid-build. Where it is
+    // not allowed, the path goes back to the caller to remove after the
+    // mapping.
+    std::error_code failed;
+    std::filesystem::remove(path, failed);
+
+    SpilledLists spilled;
+    spilled.lists = std::move(lists.release());
+    spilled.scratch_path = failed ? path : std::string();
+    // Committed once the walk succeeded, so a truncated spill cannot leave the
+    // caller holding lists that point into a mapping it never took.
     *into = std::move(mapped);
-    return std::move(lists.release());
+    return spilled;
 }
 
 }  // namespace nsparse::detail

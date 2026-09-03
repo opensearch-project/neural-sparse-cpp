@@ -57,10 +57,7 @@ DiskSeismicIndex* DiskSeismicIndex::mmap_index(const IndexHeader& header,
     MmapCursor cursor(mmap_file.data(), mmap_file.size());
     cursor.skip(pos);
 
-    // No extra header for the float index, so the hook is a no-op and the
-    // shared payload follows directly; called anyway, so the two disk types
-    // read their payload through the same two steps.
-    index->read_mapped_payload_header(&cursor);
+    // No extra header for the float index; the shared payload follows directly.
     index->load_mapped_payload(&cursor, std::move(mmap_file));
     return index.release();
 }

@@ -27,7 +27,6 @@
 #include "nsparse/invlists/inverted_lists.h"
 #include "nsparse/io/io.h"
 #include "nsparse/io/seismic_invlists_writer.h"
-#include "nsparse/seismic_batched_build.h"
 #include "nsparse/seismic_common.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
@@ -192,30 +191,12 @@ ScalarQuantizer SeismicScalarQuantizedIndex::query_quantizer(
 }
 
 void SeismicScalarQuantizedIndex::build() {
-    const SparseVectorsConfig config = {
-        .element_size = sq_.bytes_per_value(),
-        .dimension = static_cast<size_t>(get_dimension())};
-    const auto& batch = cluster_parameter_.batch_clustering;
-    if (batch.batch_size > 1 && !batch.batch_file_output_path.empty()) {
-        // The quantization header comes first, exactly as write_index writes
-        // it; the codes in `vectors_` are already quantized, so the batched
-        // build needs no knowledge of the quantizer beyond its width.
-        const size_t lists_offset = detail::write_seismic_index_batched(
-            get_vectors(), config, cluster_parameter_,
-            {.id = fourcc(name),
-             .version = kFormatVersion,
-             .dimension = get_dimension()},
-            [this](IOWriter* io_writer) {
-                write_quantization_header(io_writer);
-                vectors_->serialize(io_writer);
-            },
-            batch.batch_file_output_path);
-        clustered_inverted_lists = detail::map_streamed_lists(
-            batch.batch_file_output_path, lists_offset, &batch_mapped_file_);
-        return;
-    }
-    clustered_inverted_lists = detail::build_inverted_lists_clusters(
-        get_vectors(), config, cluster_parameter_);
+    // The codes in `vectors_` are already quantized by add(), so the shared
+    // build needs no knowledge of the quantizer beyond its width.
+    clustered_inverted_lists = build_clustered_lists(
+        {.element_size = sq_.bytes_per_value(),
+         .dimension = static_cast<size_t>(get_dimension())},
+        cluster_parameter_);
 }
 
 auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,

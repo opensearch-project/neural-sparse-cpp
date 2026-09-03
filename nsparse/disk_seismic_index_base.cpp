@@ -12,11 +12,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -25,11 +23,8 @@
 #include "nsparse/disk_seismic_search.h"
 #include "nsparse/id_selector.h"
 #include "nsparse/index.h"
-#include "nsparse/io/file_io.h"
-#include "nsparse/io/index_io.h"
 #include "nsparse/io/inline_forward_index_io.h"
 #include "nsparse/io/seismic_invlists_writer.h"
-#include "nsparse/seismic_batched_build.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
 #include "nsparse/utils/checks.h"
@@ -37,35 +32,6 @@
 #include "nsparse/utils/mmap_file.h"
 
 namespace nsparse {
-namespace {
-
-// Where a batched build spills its clustered lists: alongside the index it is
-// writing, so it lands on whatever disk the caller chose for the output.
-constexpr const char* kSpillSuffix = ".lists";
-
-// Deletes the spill on the way out, whether the build finished or threw: it is
-// scratch the size of the clustered lists, and nothing outside build() knows it
-// exists. On the success path the build has already displaced the mapping of
-// it, which matters on Windows, where a mapped file cannot be unlinked.
-class SpillFile {
-public:
-    explicit SpillFile(std::string path) : path_(std::move(path)) {}
-    ~SpillFile() {
-        std::error_code ignored;
-        std::filesystem::remove(path_, ignored);
-    }
-    SpillFile(const SpillFile&) = delete;
-    SpillFile& operator=(const SpillFile&) = delete;
-    SpillFile(SpillFile&&) = delete;
-    SpillFile& operator=(SpillFile&&) = delete;
-
-    [[nodiscard]] const std::string& path() const { return path_; }
-
-private:
-    std::string path_;
-};
-
-}  // namespace
 
 DiskSeismicIndexBase::DiskSeismicIndexBase(int dim,
                                            SeismicClusterParameters parameter)
@@ -94,61 +60,10 @@ void DiskSeismicIndexBase::add(idx_t n, const idx_t* indptr,
 }
 
 void DiskSeismicIndexBase::build() {
-    const SparseVectorsConfig config = {
-        .element_size = code_element_size(),
-        .dimension = static_cast<size_t>(get_dimension())};
-    const auto& batch = cluster_parameter_.batch_clustering;
-    if (batch.batch_size > 1 && !batch.batch_file_output_path.empty()) {
-        build_streamed(config, batch.batch_file_output_path);
-        return;
-    }
-    // A single window is an ordinary build: it holds its own lists, and writing
-    // them out only to map them back would be work for nothing.
-    clustered_inverted_lists = detail::build_inverted_lists_clusters(
-        get_vectors(), config, cluster_parameter_);
-}
-
-void DiskSeismicIndexBase::build_streamed(const SparseVectorsConfig& config,
-                                          const std::string& out_path) {
-    // This payload cannot be streamed section by section the way the in-memory
-    // types' can. Theirs ends with its posting lists, so a window can be
-    // serialized and dropped; here the summaries are followed by an inline
-    // forward index whose blocks are laid out from the doc-id membership of
-    // every list, and that membership is not known until the last window is
-    // clustered.
-    //
-    // So the clustering still runs once, a window at a time, but into a spill;
-    // the lists come back borrowed from it, and the payload is written from
-    // that mapping. Neither phase holds more than one window of anonymous
-    // memory -- the forward index streams its blocks out as it lays them.
-    const SpillFile spill(out_path + kSpillSuffix);
-    clustered_inverted_lists =
-        detail::spill_clustered_lists(get_vectors(), config, cluster_parameter_,
-                                      spill.path(), &batch_mapped_file_);
-
-    size_t payload_offset = 0;
-    {
-        FileIOWriter writer(const_cast<char*>(out_path.c_str()));
-        detail::write_header({.id = fourcc(id()),
-                              .version = format_version(),
-                              .dimension = get_dimension()},
-                             &writer);
-        // Taken from the writer rather than from a constant, so the offset the
-        // mapping below skips to is the one the header actually occupied.
-        payload_offset = writer.pos();
-        write_index(&writer);
-        writer.close();
-    }
-
-    // Ends holding the index it wrote, rather than an object whose lists point
-    // into scratch that is about to be deleted. The output's mapping displaces
-    // the spill's, which is safe in that order: load_mapped_payload replaces
-    // the lists that borrowed from the spill before it commits the mapping.
-    MmapFile mapped(out_path);
-    MmapCursor cursor(mapped.data(), mapped.size());
-    cursor.skip(payload_offset);
-    read_mapped_payload_header(&cursor);
-    load_mapped_payload(&cursor, std::move(mapped), &batch_mapped_file_);
+    clustered_inverted_lists = build_clustered_lists(
+        {.element_size = code_element_size(),
+         .dimension = static_cast<size_t>(get_dimension())},
+        cluster_parameter_);
 }
 
 auto DiskSeismicIndexBase::search(idx_t n, const idx_t* indptr,
@@ -246,8 +161,9 @@ void DiskSeismicIndexBase::write_index(IOWriter* io_writer) {
     // Inline forward index, built from the same clusters + vectors. An empty
     // corpus uses a correctly-typed empty SparseVectors (element_size must be a
     // valid width even with zero vectors) so the section still round-trips.
-    SparseVectors empty_vectors({.element_size = code_element_size(),
-                                 .dimension = static_cast<size_t>(dimension_)});
+    SparseVectors empty_vectors(
+        {.element_size = code_element_size(),
+         .dimension = static_cast<size_t>(dimension_)});
     const SparseVectors& v = vectors_ != nullptr ? *vectors_ : empty_vectors;
     detail::InlineForwardIndex forward(clustered_inverted_lists, v);
     forward.serialize(io_writer);
@@ -264,8 +180,7 @@ void DiskSeismicIndexBase::read_index(IOReader* /*io_reader*/,
 }
 
 void DiskSeismicIndexBase::load_mapped_payload(MmapCursor* cursor,
-                                               MmapFile&& mapped,
-                                               MmapFile* slot) {
+                                               MmapFile&& mapped) {
     // Same order write_index wrote them (past any extra header the caller
     // already consumed): doc count, summaries, inline forward.
     num_vectors_ = cursor->read_scalar<uint64_t>();
@@ -274,18 +189,16 @@ void DiskSeismicIndexBase::load_mapped_payload(MmapCursor* cursor,
     detail::InlineForwardIndex forward;
     forward.mmap_deserialize(cursor);
 
-    // Before the mapping is committed below: whatever these replace may have
-    // been borrowing from what `slot` still holds -- a batched build's spill.
     clustered_inverted_lists = std::move(inv_list_writer.release());
     fwd_ = std::move(forward);
     // Now that the summaries and forward index are populated (still borrowing
-    // from `mapped`, which is alive here), let the concrete index reject a
-    // width mismatch before we commit.
+    // from `mapped`, which is alive here), let the concrete index reject a width
+    // mismatch before we commit.
     validate_mapped_payload();
 
-    // The mapping last: the summaries and the forward index borrow from it, and
+    // mapped_file_ last: the summaries and the forward index borrow from it, and
     // moving it does not move the mapping.
-    *slot = std::move(mapped);
+    mapped_file_ = std::move(mapped);
 }
 
 }  // namespace nsparse

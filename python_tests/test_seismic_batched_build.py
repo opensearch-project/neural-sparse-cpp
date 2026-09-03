@@ -9,10 +9,10 @@
 
 Batching is a build option rather than a separate entry point, so there is
 nothing new to wrap: it is reached through the factory description, the same way
-lambda and beta are. `inverted_list_batch_size` bounds the build's memory;
-with more than one window, `batch_file_output_path` is where the index is streamed
-as it is built, and its posting lists are then borrowed back from that file --
-which is the path a corpus too large for RAM needs.
+lambda and beta are. `inverted_list_batch_size` splits the term space, and
+`batch_file_output_path` is a directory the build may spill windows into --
+scratch, not output. build() writes no index and leaves nothing behind; the
+index is serialized with write_index, exactly as an unbatched one is.
 """
 
 import numpy as np
@@ -32,23 +32,32 @@ BASE = f"lambda={LAMBDA}|beta={BETA}|alpha={ALPHA}|seed={SEED}"
 RECALL_FLOOR = 0.80
 
 
-def streamed(corpus, out_path, batch_size, kind="seismic"):
-    """Build straight to `out_path`; returns nothing, the file is the index."""
+def scratch_dir(tmp_path, name="scratch"):
+    """An existing directory for the build to spill into."""
+    path = tmp_path / name
+    path.mkdir(exist_ok=True)
+    return path
+
+
+def batched_index(corpus, tmp_path, batch_size, kind="seismic", name="scratch"):
+    """A build whose windows are spilled to scratch, ready to serve or write."""
     spec = (
         f"{kind},{BASE}|inverted_list_batch_size={batch_size}"
-        f"|batch_file_output_path={out_path}"
+        f"|batch_file_output_path={scratch_dir(tmp_path, name)}"
     )
     index = nsparse.index_factory(corpus.dim, spec)
     add_corpus(index, corpus)
     index.build()
-    return str(out_path)
+    return index
 
 
-# Batching starts at 2: one window is an ordinary build and writes no file.
+# Batching starts at 2: one window is an ordinary build with nothing to spill.
 @pytest.mark.parametrize("batch_size", [2, 4, 32])
 def test_happy_case(batch_size, corpus, queries, oracle, tmp_path):
-    """build -> read back mapped -> query -> accuracy, at several splits."""
-    path = streamed(corpus, tmp_path / "batched.idx", batch_size)
+    """build -> write_index -> read back mapped -> query -> accuracy."""
+    path = str(tmp_path / "batched.idx")
+    nsparse.write_index(batched_index(corpus, tmp_path, batch_size), path)
+
     index = nsparse.read_index(path, nsparse.kUseMmap)
     assert index.num_vectors() == corpus.n
     assert index.get_dimension() == corpus.dim
@@ -66,72 +75,65 @@ def test_happy_case(batch_size, corpus, queries, oracle, tmp_path):
     "kind", ["seismic", "seismic_sq", "disk_seismic", "disk_seismic_sq"]
 )
 def test_matches_in_memory_build(kind, corpus, tmp_path):
-    """At a fixed seed a streamed build is the in-memory build, byte for byte.
+    """At a fixed seed a batched build serializes to the in-memory build's file.
 
     Over all four types in the family: float and quantizing, since the shared
     build only needs the code width (add() has already encoded the values), and
-    in-memory and disk-resident, which get there differently -- the disk types'
-    payload cannot be streamed section by section, so they spill their clustered
-    lists and write from that mapping instead.
+    in-memory and disk-resident, which have different payloads to write from the
+    same lists.
     """
     in_memory = tmp_path / "memory.idx"
     nsparse.write_index(make_index(f"{kind},{BASE}", corpus), str(in_memory))
-    batched = streamed(corpus, tmp_path / "batched.idx", 4, kind=kind)
 
-    assert in_memory.read_bytes() == open(batched, "rb").read()
-    # The spill the disk types take is scratch, deleted with the build.
-    assert not (tmp_path / "batched.idx.lists").exists()
+    spilled = tmp_path / "batched.idx"
+    nsparse.write_index(batched_index(corpus, tmp_path, 4, kind=kind), str(spilled))
+
+    assert in_memory.read_bytes() == spilled.read_bytes()
 
 
-@pytest.mark.parametrize("kind", ["disk_seismic", "disk_seismic_sq"])
-def test_streamed_disk_index_is_searchable_after_build(
+def test_scratch_directory_is_left_empty(corpus, tmp_path):
+    """The spill is scratch: unlinked as soon as it is mapped.
+
+    The lists stay readable from the mapping, so the index is still servable
+    while the directory the caller lent is already empty again.
+    """
+    scratch = scratch_dir(tmp_path)
+    index = batched_index(corpus, tmp_path, 8)
+
+    assert list(scratch.iterdir()) == []
+    assert index.num_vectors() == corpus.n
+    nsparse.write_index(index, str(tmp_path / "out.idx"))
+    assert (tmp_path / "out.idx").stat().st_size > 0
+
+
+@pytest.mark.parametrize("kind", ["seismic", "disk_seismic"])
+def test_batched_index_is_searchable_after_build(
     kind, corpus, queries, oracle, tmp_path
 ):
-    """A batched disk build serves from the file it wrote.
+    """build() leaves an index that serves, not an empty object.
 
-    Its summaries and its inline forward index are borrowed from that mapping,
-    so there is no reopening by path -- and nothing left pointing at the spill.
+    Its posting lists are borrowed from the spill's mapping, so there is no
+    reopening by path and they are never copied onto the heap.
     """
-    index = nsparse.index_factory(
-        corpus.dim,
-        f"{kind},{BASE}|inverted_list_batch_size=8"
-        f"|batch_file_output_path={tmp_path / 'streamed.idx'}",
-    )
-    add_corpus(index, corpus)
-    index.build()
-
+    index = batched_index(corpus, tmp_path, 8, kind=kind)
     assert index.num_vectors() == corpus.n
-    params = nsparse.DiskSeismicSearchParameters(8, 200)
+
+    params = (
+        nsparse.DiskSeismicSearchParameters(8, 200)
+        if kind == "disk_seismic"
+        else None
+    )
     _, labels = search(index, queries, params=params)
     want_labels, _ = oracle
     assert recall_at_k(labels, want_labels) >= RECALL_FLOOR
 
 
-def test_streamed_index_is_searchable_after_build(corpus, queries, oracle, tmp_path):
-    """build() leaves a usable index, not an empty object.
-
-    The lists are borrowed back from the file it just wrote, so there is no
-    reopening by path and they are never copied onto the heap.
-    """
-    spec = (
-        f"seismic,{BASE}|inverted_list_batch_size=8"
-        f"|batch_file_output_path={tmp_path / 'streamed.idx'}"
-    )
-    index = nsparse.index_factory(corpus.dim, spec)
-    add_corpus(index, corpus)
-    index.build()
-
-    assert index.num_vectors() == corpus.n
-    _, labels = search(index, queries)
-    want_labels, _ = oracle
-    assert recall_at_k(labels, want_labels) >= RECALL_FLOOR
-
-
 def test_batch_size_alone_leaves_the_index_in_memory(corpus, queries, tmp_path):
-    """Without an output path, batching only bounds the build's intermediates.
+    """Without a scratch directory the window count is ignored, not half-applied.
 
-    The index is still usable in memory and still the same index -- this is the
-    path every index type gets from build(), including the disk-resident ones.
+    Splitting the term space with nowhere to spill the windows would leave the
+    clustered lists accumulating anyway, for a corpus pass per window, so the
+    build runs as one window and produces the same index it always did.
     """
     unbatched = make_index(f"seismic,{BASE}", corpus)
     batched = make_index(f"seismic,{BASE}|inverted_list_batch_size=8", corpus)
@@ -144,17 +146,14 @@ def test_batch_size_alone_leaves_the_index_in_memory(corpus, queries, tmp_path):
 
 
 def test_batch_count_is_not_observable(corpus, queries, tmp_path):
-    """The split is a memory knob: at a fixed seed it cannot change the results.
-
-    Against an unbatched build, which writes its file the ordinary way since one
-    window streams nothing.
-    """
+    """The split is a memory knob: at a fixed seed it cannot change the results."""
     plain = tmp_path / "plain.idx"
     nsparse.write_index(make_index(f"seismic,{BASE}", corpus), str(plain))
-    many = streamed(corpus, tmp_path / "many.idx", 16)
+    many = tmp_path / "many.idx"
+    nsparse.write_index(batched_index(corpus, tmp_path, 16), str(many))
 
     want_d, want_l = search(nsparse.read_index(str(plain)), queries)
-    got_d, got_l = search(nsparse.read_index(many), queries)
+    got_d, got_l = search(nsparse.read_index(str(many)), queries)
     np.testing.assert_array_equal(got_l, want_l)
     np.testing.assert_allclose(got_d, want_d, rtol=1e-6, atol=1e-6)
 
@@ -163,9 +162,23 @@ def test_rejects_dimension_smaller_than_corpus(corpus, tmp_path):
     """A term the declared dimension does not cover is an error, not a silent drop."""
     spec = (
         f"seismic,{BASE}|inverted_list_batch_size=4"
-        f"|batch_file_output_path={tmp_path / 'bad.idx'}"
+        f"|batch_file_output_path={scratch_dir(tmp_path)}"
     )
     index = nsparse.index_factory(corpus.dim // 2, spec)
+    add_corpus(index, corpus)
+    with pytest.raises(ValueError):
+        index.build()
+
+
+def test_rejects_a_scratch_path_that_is_not_a_directory(corpus, tmp_path):
+    """Somewhere to spill is the caller's to provide."""
+    not_a_dir = tmp_path / "regular-file"
+    not_a_dir.write_bytes(b"")
+    spec = (
+        f"seismic,{BASE}|inverted_list_batch_size=4"
+        f"|batch_file_output_path={not_a_dir}"
+    )
+    index = nsparse.index_factory(corpus.dim, spec)
     add_corpus(index, corpus)
     with pytest.raises(ValueError):
         index.build()

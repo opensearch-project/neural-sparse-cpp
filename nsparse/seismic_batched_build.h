@@ -10,102 +10,62 @@
 #ifndef SEISMIC_BATCHED_BUILD_H
 #define SEISMIC_BATCHED_BUILD_H
 
-#include <functional>
-#include <memory>
 #include <string>
 #include <vector>
 
 #include "nsparse/cluster/inverted_list_clusters.h"
-#include "nsparse/index.h"
-#include "nsparse/io/io.h"
 #include "nsparse/seismic_common.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/utils/mmap_file.h"
 
 namespace nsparse::detail {
 
-// Builds a seismic-family index and writes it straight to `out_path`, one term
-// window at a time, without ever holding the whole index in memory.
+// What a spilled build hands back.
+struct SpilledLists {
+    // Every term's clustered posting list, in term order -- the same thing
+    // build_inverted_lists_clusters returns, borrowed from the spill's mapping
+    // rather than allocated.
+    std::vector<InvertedListClusters> lists;
+    // The spill file, when it is still on disk to be removed. Empty when it was
+    // unlinked as soon as it was mapped, which is what happens wherever a
+    // mapped file can be unlinked; where it cannot (Windows), whoever holds the
+    // mapping has to remove this after releasing it.
+    std::string scratch_path;
+};
+
+// Clusters the corpus one contiguous term window at a time, spilling each
+// window's lists to a temporary file in `scratch_dir` and mapping them back, so
+// the caller ends up holding every list without two windows ever having been
+// resident at once.
 //
 // The usual build holds two whole-corpus intermediates -- the inverted lists
-// and then the clustered posting lists -- so its peak memory scales with the
-// corpus's non-zeros, and a corpus whose posting lists do not fit in RAM cannot
-// be indexed at all. for_each_clustered_window bounds the first to one window;
-// serializing each window and dropping it, which is what this does, bounds the
-// second. What is left resident is the forward corpus (which the caller already
-// holds, at whatever residency SparseVectors was given) plus one window.
+// (every posting) and then the clustered posting lists -- so its peak memory
+// scales with the corpus's non-zeros, and a corpus whose posting lists do not
+// fit in RAM cannot be indexed at all. for_each_clustered_window bounds the
+// first to one window; spilling each window's clusters and dropping them, which
+// is what this does, bounds the second. What is left resident is the forward
+// corpus (which the caller already holds, at whatever residency SparseVectors
+// was given) plus one window.
 //
-// Reached through an index's build(), by setting
-// SeismicClusterParameters::batch_clustering.batch_file_output_path. The build
-// then maps the file back (see map_streamed_lists) rather than dropping it, so
-// it ends holding the index it wrote.
-//
-// `header` and `write_prefix` are what make this work for every type whose
-// payload ends with its posting lists, rather than just SEIS. `write_prefix`
-// writes whatever the type puts
-// between the header and its posting lists -- the forward vectors, and for a
-// quantizing index its quantization header first. The lists then follow in the
-// byte-for-byte layout SeismicInvertedListsWriter produces, so the file is an
-// ordinary index of that type: read it back with read_index, mapped or copying,
-// exactly as if it had been built in memory and written with write_index.
+// The spill is scratch, not an index: it carries the posting-list section and
+// nothing else -- no index header, no forward vectors -- and nothing outside
+// this build ever reads it. Writing an index file remains write_index's job,
+// from the lists this returns; a build that borrows its lists from scratch
+// serializes byte-for-byte what a whole-corpus build would have.
 //
 // Identical to the unbatched build for a fixed `params.seed`, and identical
-// whatever batch_size is, because every list's k-means seed comes from its own
-// global term id -- see for_each_clustered_window.
+// whatever the window count is, because every list's k-means seed comes from
+// its own global term id -- see for_each_clustered_window.
 //
-// Returns the absolute byte offset of the posting-list section, so the lists
-// can be mapped back in without re-parsing everything before them -- see
-// map_streamed_lists.
-//
-// Throws if the corpus is empty: there would be no windows to stream, and a
-// header-only file is not a readable index.
-size_t write_seismic_index_batched(
-    const SparseVectors* vectors, const SparseVectorsConfig& config,
-    const SeismicClusterParameters& params, const IndexHeader& header,
-    const std::function<void(IOWriter*)>& write_prefix,
-    const std::string& out_path);
-
-// Streams every window's clustered posting lists to `path` and then maps them
-// back, so the caller ends up holding all of them without two windows ever
-// having been resident at once.
-//
-// For the index types whose payload ends with its posting lists,
-// write_seismic_index_batched writes the index itself and there is nothing to
-// spill. A DiskSeismic payload is not one of those: its summaries precede an
-// inline forward index whose blocks are laid out from the doc-id membership of
-// every list, so no window's lists can be dropped before the last window is
-// clustered. What can be dropped is their *residency* -- which is what this is
-// for. `path` gets the lists in the same [count][list...] layout
-// SeismicInvertedListsWriter produces, doc ids included (an index's own section
-// writes them empty; the forward index is what needs them here), and the
-// returned lists borrow from the mapping handed to `into` rather than the heap.
-//
-// The spill is scratch, not an index: it carries no header, nothing else reads
-// it, and deleting it is the caller's job. It must outlive the returned lists.
-//
-// Throws if the corpus is empty, for the same reason as
-// write_seismic_index_batched: there would be no windows to stream.
-std::vector<InvertedListClusters> spill_clustered_lists(
-    const SparseVectors* vectors, const SparseVectorsConfig& config,
-    const SeismicClusterParameters& params, const std::string& path,
-    MmapFile* into);
-
-// Maps the file a streamed build just wrote and borrows its posting lists out
-// of it, so the build ends holding a usable index without ever having held all
-// of the lists at once.
-//
-// Only the lists. The forward vectors in the file are a copy of ones the index
-// already has, at whatever residency the caller chose for them, so re-reading
-// them would be work for nothing -- and it is why the corpus mapping can be
-// left alone rather than swapped out. `lists_offset` is what
-// write_seismic_index_batched returned, which saves parsing past the vectors to
-// find where the lists start.
-//
-// The mapping is handed to `into`, which must outlive the returned lists: they
-// point into it.
-std::vector<InvertedListClusters> map_streamed_lists(const std::string& path,
-                                                     size_t lists_offset,
-                                                     MmapFile* into);
+// `into` takes the mapping the returned lists borrow from, and so must outlive
+// them. Throws if `scratch_dir` is not a directory, or if the corpus is empty:
+// there would be no windows to spill, and an empty spill maps back to no lists
+// at all.
+SpilledLists spill_clustered_lists(const SparseVectors* vectors,
+                                   const SparseVectorsConfig& config,
+                                   const SeismicClusterParameters& params,
+                                   const std::string& scratch_dir,
+                                   MmapFile* into);
 
 }  // namespace nsparse::detail
 

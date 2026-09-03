@@ -17,19 +17,18 @@
 //   batched_build_mem_bench baseline <interchange_csr> <lambda> <beta> \
 //                           <alpha> [out_index] [index_type]
 //   batched_build_mem_bench batched <inmem|mmap> <csr> <lambda> <beta> \
-//                           <alpha> <num_batches> <out_dir> [index_type]
+//                           <alpha> <num_batches> <scratch_dir> [index_type]
 //
 // "convert" produces the native CSR the mapped read wants. "baseline" builds
 // the index whole (streaming add of the interchange CSR, like the other
 // benchmarks) -- the memory this feature exists to avoid. "batched" runs the
-// term-batched build at the given batch count.
+// term-batched build at the given batch count, spilling its windows into
+// <scratch_dir>; only the build is measured, and the index is written
+// afterwards only to report its size.
 //
-// `index_type` is any seismic-family factory name, default "seismic". The two
-// disk-resident ones are worth measuring separately: they cannot stream their
-// payload out window by window, so their batched build spills the clustered
-// lists and writes from that mapping instead (see build_streamed), and whether
-// that holds anonymous memory down is exactly what this reports. A quantized
-// type gets the factory's default range, which is fine for a memory figure.
+// `index_type` is any seismic-family factory name, default "seismic". A
+// quantized type gets the factory's default range, which is fine for a memory
+// figure.
 //
 // Compare "batched inmem" against "baseline": both hold the corpus on the heap
 // via the same streaming_add, so the difference between them is the batching
@@ -38,8 +37,8 @@
 // from the residency rather than from batching, so it is not the baseline's
 // counterpart.
 //
-// Point <out_dir> at a real disk: on a tmpfs such as /tmp the index is RAM, and
-// the numbers are meaningless.
+// Point <scratch_dir> at a real disk: on a tmpfs such as /tmp the spill is RAM,
+// and the numbers are meaningless.
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -255,18 +254,19 @@ void streaming_add(nsparse::Index* index, const std::string& path) {
 // The index under test, named rather than constructed, so every type in the
 // family is reachable from the command line. The cluster knobs go through the
 // factory description, which is also how a caller sets them (see
-// parse_cluster_params); `out_path` empty leaves the batched output path unset.
+// parse_cluster_params); `scratch_dir` empty leaves the spill directory unset,
+// which is what makes it an unbatched build.
 std::unique_ptr<nsparse::Index> make_index(
     const std::string& index_type, int dimension,
     const nsparse::SeismicClusterParameters& params,
-    const std::string& out_path) {
+    const std::string& scratch_dir) {
     std::string desc = index_type + ",lambda=" + std::to_string(params.lambda) +
                        "|beta=" + std::to_string(params.beta) +
                        "|alpha=" + std::to_string(params.alpha) +
                        "|inverted_list_batch_size=" +
                        std::to_string(params.batch_clustering.batch_size);
-    if (!out_path.empty()) {
-        desc += "|batch_file_output_path=" + out_path;
+    if (!scratch_dir.empty()) {
+        desc += "|batch_file_output_path=" + scratch_dir;
     }
     return std::unique_ptr<nsparse::Index>(
         nsparse::index_factory(dimension, desc.c_str()));
@@ -358,7 +358,7 @@ int run_baseline(int argc, char** argv) {
 int run_batched(int argc, char** argv) {
     if (argc < 9) {
         std::cerr << "batched <inmem|mmap> <csr> <lambda> <beta> <alpha> "
-                     "<num_batches> <out_dir> [index_type]\n";
+                     "<num_batches> <scratch_dir> [index_type]\n";
         return 2;
     }
     const std::string corpus_residency = argv[2];
@@ -368,8 +368,8 @@ int run_batched(int argc, char** argv) {
         .lambda = std::atoi(argv[4]),
         .beta = std::atoi(argv[5]),
         .alpha = static_cast<float>(std::atof(argv[6]))};
-    const std::string out =
-        std::string(argv[8]) + "/index." + index_type + ".dat";
+    const std::string scratch_dir = argv[8];
+    const std::string out = scratch_dir + "/index." + index_type + ".dat";
     batched_params.batch_clustering.batch_size =
         static_cast<size_t>(std::atoi(argv[7]));
 
@@ -382,7 +382,7 @@ int run_batched(int argc, char** argv) {
     //            not comparable to the baseline, because the saving is the
     //            residency rather than the batching.
     std::unique_ptr<nsparse::Index> index =
-        make_index(index_type, csr_dimension(csr), batched_params, out);
+        make_index(index_type, csr_dimension(csr), batched_params, scratch_dir);
     if (corpus_residency == "inmem") {
         streaming_add(index.get(), csr);
     } else if (corpus_residency == "mmap") {
@@ -397,9 +397,9 @@ int run_batched(int argc, char** argv) {
     reset_vm_hwm();
     PeakRssSampler sampler;
     const double started = now_seconds();
-    // batch_file_output_path is set, so build() writes the index out as it goes
-    // rather than assembling it in memory -- the same call an ordinary build
-    // makes.
+    // batch_file_output_path is set, so build() clusters into windows and
+    // spills them there rather than holding them all -- the same call an
+    // ordinary build makes.
     index->build();
     const double build_s = now_seconds() - started;
 
@@ -407,8 +407,11 @@ int run_batched(int argc, char** argv) {
            "type=" + index_type + " corpus=" + corpus_residency + " batches=" +
                std::to_string(batched_params.batch_clustering.batch_size),
            build_s, load_hwm, start_anon, sampler);
-    // One window writes no file: it is an ordinary build, holding its own
-    // lists.
+
+    // Written after the peaks are read, and only to report the size: build()
+    // produces no index file, so serializing one is the caller's step and not
+    // part of what is being measured.
+    nsparse::write_index(index.get(), const_cast<char*>(out.c_str()));
     if (std::ifstream file(out, std::ios::binary | std::ios::ate); file) {
         std::cout << "index_bytes=" << file.tellg() << "\n";
     }

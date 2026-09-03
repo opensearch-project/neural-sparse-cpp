@@ -288,7 +288,7 @@ void for_each_clustered_window(const SparseVectors* vectors,
 
     const size_t dim = config.dimension;
     const size_t batches =
-        std::max<size_t>(1, std::min(params.batch_clustering.batch_size, dim));
+        std::min(params.batch_clustering.effective_batch_size(), dim);
 
     const int lambda = calculate_lambda(params.lambda, vectors->num_vectors());
     const ResolvedParameters resolved = {

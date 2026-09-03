@@ -111,6 +111,18 @@ std::string id_to_string(uint32_t id_val) {
     return chars;
 }
 
+void write_header(const IndexHeader& header, IOWriter* io_writer) {
+    // write index type
+    uint32_t id_val = header.id;
+    io_writer->write(&id_val, sizeof(uint32_t), 1);
+    // write payload layout version
+    uint32_t version = header.version;
+    io_writer->write(&version, sizeof(uint32_t), 1);
+    // write dimension
+    int dimension = header.dimension;
+    io_writer->write(&dimension, sizeof(int), 1);
+}
+
 IndexHeader read_header(IOReader* io_reader) {
     IndexHeader header;
     io_reader->read(&header.id, sizeof(uint32_t), 1);
@@ -159,18 +171,6 @@ void throw_if_version_unsupported(const IndexHeader& header,
 }  // namespace
 
 namespace detail {
-void write_header(const IndexHeader& header, IOWriter* io_writer) {
-    // write index type
-    uint32_t id_val = header.id;
-    io_writer->write(&id_val, sizeof(uint32_t), 1);
-    // write payload layout version
-    uint32_t version = header.version;
-    io_writer->write(&version, sizeof(uint32_t), 1);
-    // write dimension
-    int dimension = header.dimension;
-    io_writer->write(&dimension, sizeof(int), 1);
-}
-
 void write_index(Index* index, IOWriter* io_writer, bool keep_open) {
     auto* index_io = dynamic_cast<IndexIO*>(index);
     StreamCloser closer(io_writer, keep_open);
