@@ -11,11 +11,13 @@
 #define SEISMIC_BATCHED_BUILD_H
 
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "nsparse/cluster/inverted_list_clusters.h"
+#include "nsparse/io/io.h"
 #include "nsparse/seismic_common.h"
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/utils/mmap_file.h"
@@ -46,17 +48,23 @@ public:
         return *this;
     }
 
-    // Takes a spill this build just wrote and maps it. `path` is unlinked here
-    // when the platform allows it while mapped, so a crash cannot strand
-    // scratch; otherwise it is remembered and removed on release().
-    void adopt(const std::string& path);
+    // Creates a spill in `dir`, hands it to `write_section`, and maps what was
+    // written.
+    //
+    // The file is owned from the moment it is created, so a throw anywhere in
+    // `write_section` -- a corpus the dimension does not cover, a full disk, a
+    // failed flush -- takes the partial spill with it. Once mapped it is
+    // unlinked where the platform allows that while mapped, which also covers a
+    // crash; where it does not, release() removes it.
+    void write_and_map(const std::string& dir,
+                       const std::function<void(IOWriter*)>& write_section);
 
     [[nodiscard]] const MmapFile& mapping() const { return mapping_; }
 
 private:
     // Unmaps, then removes the file -- in that order, since Windows cannot
-    // unlink a mapped file. Only ever a path adopt() created, and re-checked
-    // against the spill naming, because this deletes.
+    // unlink a mapped file. Only ever a path write_and_map created, and
+    // re-checked against the spill naming, because this deletes.
     void release();
 
     std::string path_;  // empty unless a removal is still owed

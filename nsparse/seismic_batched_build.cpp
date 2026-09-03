@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -89,15 +90,32 @@ void stream_clustered_lists(const SparseVectors* vectors, size_t dimension,
 
 }  // namespace
 
-void ClusteredListsSpill::adopt(const std::string& path) {
-    MmapFile mapped(path);
-    std::error_code failed;
-    std::filesystem::remove(path, failed);
-    // Committed after the mapping succeeded, so a failed open leaves nothing
-    // half-owned.
+void ClusteredListsSpill::write_and_map(
+    const std::string& dir,
+    const std::function<void(IOWriter*)>& write_section) {
     release();
-    mapping_ = std::move(mapped);
-    path_ = failed ? path : std::string();
+    // Owned before it exists, so every path out of here removes it.
+    path_ = spill_path(dir);
+    try {
+        {
+            // Closed before the file is mapped: the writer buffers, and close()
+            // is what reports a failed flush.
+            FileIOWriter writer(const_cast<char*>(path_.c_str()));
+            write_section(&writer);
+            writer.close();
+        }
+        mapping_ = MmapFile(path_);
+    } catch (...) {
+        release();
+        throw;
+    }
+    // Unlinked now rather than on release: the mapping keeps the bytes alive
+    // wherever that is allowed, so a crash cannot strand scratch either.
+    std::error_code failed;
+    std::filesystem::remove(path_, failed);
+    if (!failed) {
+        path_.clear();
+    }
 }
 
 void ClusteredListsSpill::release() {
@@ -140,14 +158,9 @@ std::vector<InvertedListClusters> spill_clustered_lists(
             "spill");
     }
 
-    const std::string path = spill_path(scratch_dir);
-    {
-        // Closed before the file is mapped: the writer buffers.
-        FileIOWriter writer(const_cast<char*>(path.c_str()));
-        stream_clustered_lists(vectors, dimension, params, &writer);
-        writer.close();
-    }
-    into->adopt(path);
+    into->write_and_map(scratch_dir, [&](IOWriter* writer) {
+        stream_clustered_lists(vectors, dimension, params, writer);
+    });
 
     // The section is the whole file, and absolute offsets are the ones
     // serialize() padded against, so the cursor starts where the writer did.

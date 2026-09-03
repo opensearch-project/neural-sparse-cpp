@@ -254,6 +254,25 @@ TEST(SeismicBatchedBuild, LeavesNothingInTheScratchDirectory) {
               in_memory(corpus, dir.file("mem.dat")));
 }
 
+// A build that throws part-way through spilling must not leave the half-written
+// spill behind. The corpus here has a term the declared dimension does not
+// cover, which the counting pass rejects after the spill file has been created.
+TEST(SeismicBatchedBuild, RemovesAPartialSpillWhenTheBuildThrows) {
+    Corpus corpus = make_corpus(/*n_docs=*/50, /*dim=*/32, /*seed=*/1);
+    TempDir dir("partial");
+    const std::string scratch = dir.scratch();
+
+    {
+        SeismicIndex narrow(corpus.dim / 2, params_for(4, scratch, kSeed));
+        narrow.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
+                   corpus.values.data());
+        EXPECT_THROW(narrow.build(), std::invalid_argument);
+        EXPECT_TRUE(std::filesystem::is_empty(scratch))
+            << "a failed build left scratch behind";
+    }
+    EXPECT_TRUE(std::filesystem::is_empty(scratch));
+}
+
 // The build deletes its own spill and nothing else. The directory is the
 // caller's, so whatever else lives in it -- including a file named like a
 // spill, which the build did not create -- has to still be there afterwards.
