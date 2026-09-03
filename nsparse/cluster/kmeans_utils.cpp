@@ -101,9 +101,9 @@ CentroidIndex<T> build_centroid_index(
 // centroid shares a term, instead of scoring the doc against a dense
 // dimension x n_clusters centroid matrix. Cost falls from
 // O(n_docs * doc_nnz * n_clusters) to O(shared postings), and scratch from
-// dimension * n_clusters floats to the centroids' non-zeros — the dense matrix
-// (255 MB at dimension=30522, beta=2087) was rebuilt for every posting list and
-// dominated build time.
+// dimension * n_clusters floats to the centroids' non-zeros — the dense matrix,
+// hundreds of megabytes at a realistic dimension and cluster count, was rebuilt
+// for every posting list and dominated build time.
 template <class T>
 void map_docs_to_clusters_typed(const SparseVectors* vectors,
                                 const std::vector<idx_t>& docs,

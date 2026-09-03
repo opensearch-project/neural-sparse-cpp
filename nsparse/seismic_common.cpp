@@ -36,40 +36,32 @@ struct TermWindow {
 
 // How much more a posting costs once clustered than while being scattered into
 // an inverted list, per unit. A window's memory has two peaks: filling it holds
-// every posting of its terms, and clustering it holds the pruned survivors as
-// clusters and summaries, which are far bulkier per posting -- on msmarco
-// base_full the finished lists come to 14.9GB for 115M pruned postings, against
-// 8 bytes each while filling.
+// every posting of its terms at a few bytes each, and clustering it holds the
+// pruned survivors as clusters and summaries, which are an order of magnitude
+// bulkier per posting.
 //
 // Only the ratio matters, and only roughly: the cost curve is a shallow basin,
-// so assuming 8x or 32x here instead of 16x costs about a fifth of the benefit
-// and still beats weighting either phase alone. It is deliberately not derived
-// from alpha/beta/dimension, which would be a model of summarize() that this
-// does not need to be right about.
+// so assuming 8x or 32x here instead of 16x costs a fraction of the benefit and
+// still beats weighting either phase alone. It is deliberately not derived from
+// alpha/beta/dimension, which would be a model of summarize() that this does not
+// need to be right about.
 constexpr size_t kClusterCostRatio = 16;
 
 // Cuts [0, dimension) into at most `batches` windows of near-equal estimated
 // memory, from the exact per-term counts.
 //
-// Equal width would not do, because term frequencies are heavily skewed: on
-// msmarco base_full the heaviest term holds 5.7M postings against a mean of
-// 37K, and the top 1% of terms hold 19% of them. Peak memory is set by the
-// largest window, not the average one, so an uneven split wastes most of what
-// batching could save.
+// Equal width would not do, because term frequencies are heavily skewed: a
+// natural-language corpus puts orders of magnitude more postings on its heaviest
+// term than on its mean one. Peak memory is set by the largest window, not the
+// average one, so an uneven split wastes most of what batching could save.
 //
 // What to even out is neither phase alone but their sum. Weighting raw counts
 // balances the fill and unbalances the clustering, which is the more expensive
-// phase, and measured worse than equal width. Weighting min(count, lambda) --
-// what survives pruning, and so what clustering holds -- balances that phase
-// perfectly but concentrates the heavy terms, leaving one window holding 3.7x
-// the mean raw postings, which then becomes the peak. Weighting both together
-// at their relative cost balances what is actually resident. Predicted peak of
-// the largest window at 10 windows on base_full:
-//
-//   equal width          2.76GB
-//   raw count            4.93GB
-//   min(count, lambda)   3.32GB
-//   both, as here        2.07GB
+// phase. Weighting min(count, lambda) -- what survives pruning, and so what
+// clustering holds -- balances that phase perfectly but concentrates the heavy
+// terms, leaving one window holding several times the mean raw postings, which
+// then becomes the peak. Weighting both together at their relative cost balances
+// what is actually resident, and measures best of the four on a skewed corpus.
 //
 // Windows stay contiguous and ascending, which is what lets the clustered lists
 // be appended to a file as each window finishes: the layout carries no per-list

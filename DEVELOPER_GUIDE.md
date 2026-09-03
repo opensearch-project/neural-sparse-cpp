@@ -292,103 +292,60 @@ cannot change what is produced.
 ### Choosing `inverted_list_batch_size`
 
 Windows are cut to equal estimated *memory*, not equal width. Term frequencies are
-heavily skewed — on msmarco base_full the heaviest term holds 5.7M postings
-against a mean of 37K — and peak memory is set by the largest window, so an uneven
-split wastes most of what batching could save.
+heavily skewed, and peak memory is set by the largest window, so an uneven split
+wastes most of what batching could save.
 
 A window has two memory peaks and the split has to weigh both. Filling it holds
 every posting of its terms; clustering it holds what survives pruning
-(`min(count, lambda)` per term, 10% of that corpus's postings) as clusters and
-summaries, roughly 16× bulkier per posting. Weighting either phase alone
-unbalances the other, both measurably worse than weighting their sum — see
-`make_windows` in `nsparse/seismic_common.cpp`, which records what each choice
-measured.
+(`min(count, lambda)` per term) as clusters and summaries, an order of magnitude
+bulkier per posting. Weighting either phase alone unbalances the other, both worse
+than weighting their sum — see `make_windows` in `nsparse/seismic_common.cpp`.
 
 `RssAnon` is the figure to watch, being what the process itself allocated;
 `RssFile` is pages it touched of a mapping, which the kernel can reclaim under
-pressure. On base_full (8.8M docs, dim 30109, 1.12B non-zeros, λ=6000 β=400
-α=0.4) on a 36-core/68GB host, with the corpus **mapped in every row**, so each
-figure is the build's own memory:
+pressure. Read as total RSS the win looks far smaller than it is: an index that
+maps its corpus, and then maps its own output back, keeps most of its residency in
+page cache, which total RSS counts and pressure reclaims. Batching moves the
+anonymous column, so report the split rather than the total.
 
-| windows | peak RssAnon | peak RSS | peak RssFile | build time |
-|---|---|---|---|---|
-| 1 (unbatched) | 10281 MB | 16732 MB | 6454 MB | 105 s |
-| 10 | 2816 MB | 12811 MB | 9820 MB | 111 s |
-| 20 | 1471 MB | 11465 MB | 9185 MB | 130 s |
-| 100 | 465 MB | 10396 MB | 9725 MB | 295 s |
+What to expect from the shape of it: anonymous memory falls faster than 1/N,
+because the split comes from the real per-term costs rather than from term ids,
+and build time is flat to around ten windows and then climbs, because every window
+makes its own pass over the corpus. Ten to twenty windows is usually the useful
+range — most of the memory saving for a few percent of build time. The floor is
+what the build cannot batch: one window plus whatever the corpus itself costs.
 
-The unbatched row writes no file and maps nothing back, which is why its `RssFile`
-is the corpus alone. Anonymous memory falls faster than 1/N — 3.7× at 10 windows
-and 22× at 100 —
-because the split comes from the real per-term costs rather than from term ids. At
-100 windows the build allocates 465 MB while indexing 1.12 billion postings. Total
-RSS barely moves, being dominated by page cache: the 6.45 GB mapped corpus plus
-~3.4 GB of the index touched when `build()` maps it back in. That is the whole
-reason to report the split — measured as RSS alone this looks like a 1.9× win
-rather than a 22× one, and neither figure in that column is memory the process
-would have to give up under pressure.
+The disk-resident pair behaves the same way, with two differences. Build time
+climbs sooner, since the spill is written and read back and the payload write is
+another pass over the lists; and `lambda` is the knob to watch for output size,
+because their inline forward index copies every pruned posting's whole doc
+vector — at a large `lambda` that section alone can dwarf the rest of the index,
+and the spill needs scratch disk beside it. `disk_seismic_sq` cannot map a float
+CSR (it searches over codes), so its corpus stays on the heap and shows up in the
+same column the build's own growth does; subtract the reported
+`start_rss_anon_mb`.
 
 Mapping the finished lists back in is nearly free in the column that matters:
-across those rows it costs about 4 s and leaves `RssAnon` unchanged (2816 MB at 10
-windows against 2820 MB without it). Borrowing a 14.9 GB index takes 0.19 s and
-8 MB of anonymous memory, against 11.2 s and 13.9 GB to copy it — the cursor only
-reads the size header before each array and skips the bulk, so it faults in about
-a quarter of the file as reclaimable page cache. That mapping is separate from the
-corpus's: an index that mapped its corpus with `read_csr` keeps doing so, since it
-still scores from it.
+borrowing an index costs a fraction of a second and single-digit megabytes of
+anonymous memory, against copying it, which costs its whole size — the cursor
+reads the size header before each array and skips the bulk, so it faults in part
+of the file as reclaimable page cache. That mapping is separate from the corpus's:
+an index that mapped its corpus with `read_csr` keeps doing so, since it still
+scores from it.
 
-Build time is flat to around ten windows and then climbs, because every window
-makes its own pass over the corpus. Ten to twenty is the useful range: 3.6–7.2×
-less allocated memory for at most a few percent of build time.
-
-The disk-resident pair spills rather than streams, and it holds up the same way.
-Same corpus and host, corpus mapped in every row, at λ=600 β=40 α=0.4 — a tenth
-of the λ above, because the inline forward index copies every pruned posting's
-whole doc vector, and at λ=6000 that section alone would be ~140 GB:
-
-| windows | peak RssAnon | build time | index |
-|---|---|---|---|
-| 1 (unbatched) | 8671 MB | 48 s | — |
-| 10 | 1440 MB | 94 s | 16.9 GB |
-| 20 | 774 MB | 210 s | 16.9 GB |
-| 100 | 434 MB | 375 s | 16.9 GB |
-
-20× less allocated memory at 100 windows, 6× at 10. Build time climbs sooner than
-it does for `seismic`: the spill is written and read back, and the payload write
-is a second pass over the lists on top of the per-window corpus passes. The
-unbatched row writes no index, so its build time is not comparable to the others'
-either — it is the memory it is there for.
-
-`disk_seismic_sq` cannot map a float CSR (it searches over codes), so its corpus
-sits on the heap and the figures include it: at 8-bit codes the corpus is 3242 MB
-resident, and the build grows 6862 MB on top of that unbatched against 1087 MB at
-10 windows.
-
-Those rows are comparable to each other but not to a build that loads the corpus
-instead of mapping it, and the difference is not just the corpus. The same
-1-window build measures 10274 MB mapped against 24084 MB with a streaming ingest —
-13.8 GB more for a 6.86 GB corpus — because the ingest stages a second copy of it
-(a 13.0 GB load peak) that the allocator retains rather than returning to the OS.
-How much of that overlaps the build's own peak depends on how much the build then
-asks for, so do not read a heap figure and a mapped figure as differing by a fixed
-offset.
-
-All of the above is measured from the start of the build, with the corpus already
-resident. Loading it costs more than holding it — a streaming ingest stages a
-second copy — so a whole-process high-water mark would report the loader (13.0 GB
-on this corpus, on the heap path) rather than the build, and hide everything below
-it. Peak RSS comes from `VmHWM`, a kernel counter; the anon and file peaks have no
+Compare like with like. A build that loads the corpus is not comparable to one
+that maps it, and the difference is more than the corpus: a streaming ingest
+stages a second copy that the allocator retains rather than returning to the OS,
+so do not read a heap figure and a mapped figure as differing by a fixed offset.
+Measure from the start of the build with the corpus already resident, or a
+whole-process high-water mark reports the loader and hides everything below it.
+Peak RSS comes from `VmHWM`, a kernel counter; the anon and file peaks have no
 such counter and are sampled, so they are lower bounds and can disagree with
 `VmHWM` by a hair.
 
-Query performance does not move, because the index is the same index. Two
-independent unseeded builds, whole-corpus against 10 windows, over 6980 msmarco
-dev queries at k=10, read in-memory:
-
-| index | QPS | p50 | p90 | p99 | recall@10 |
-|---|---|---|---|---|---|
-| whole corpus | 69332 | 0.290 ms | 0.601 ms | 1.000 ms | 0.8406 |
-| 10 windows | 70198 | 0.296 ms | 0.616 ms | 1.055 ms | 0.8432 |
+Query performance does not move, because the index is the same index: identical
+byte for byte at a fixed seed, and indistinguishable in latency, QPS and recall
+for the random-seeded default.
 
 Write the index to a real disk. On a tmpfs such as `/tmp` it is RAM, which
 defeats the point.
