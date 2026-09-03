@@ -29,41 +29,25 @@ namespace nsparse {
 
 // How a build bounds its own memory.
 //
-// Clustering the whole term space at once holds two intermediates for the whole
-// corpus: the inverted lists (every posting) and then the clustered lists. Both
-// scale with the corpus's non-zeros, which is what puts a ceiling on the corpus
-// an index can be built from. Splitting the term space into `batch_size`
-// contiguous windows and finishing one window before starting the next makes
-// the first of those proportional to a window instead.
+// A whole-corpus build holds two intermediates that scale with the corpus's
+// non-zeros -- the inverted lists, then the clustered lists -- which is what
+// caps the corpus an index can be built from. Windowing bounds the first to a
+// window; spilling each window's clusters bounds the second.
 //
-// `batch_file_output_path` bounds the second as well: with batch_size > 1, each
-// window's clustered lists are spilled to a temporary file there and freed as
-// they are produced, and the finished lists are then mapped back out of it, so
-// the build never holds more than one window's worth. See
-// spill_clustered_lists.
-//
-// The two knobs are therefore only useful together, and each is ignored without
-// the other -- see effective_batch_size.
+// Both knobs are needed for either to help, so each is ignored without the
+// other
+// -- see effective_batch_size and build_clustered_lists.
 struct BatchClusteringOption {
-    // Contiguous term windows. <= 1 means one window, i.e. no batching. Clamped
-    // to the dimension, since a window cannot be narrower than one term.
+    // Contiguous term windows. <= 1 means no batching; clamped to the
+    // dimension, a window being at least one term.
     size_t batch_size = 1;
-    // An existing directory the build may spill windows into. Scratch, not
-    // output: build() writes no index there and leaves nothing behind, and
-    // serializing an index remains write_index's job. Used only when batch_size
-    // > 1, a single window being an ordinary build with nothing to spill.
+    // An existing directory to spill windows into. Scratch, not output: build()
+    // writes no index and leaves nothing behind.
     std::string batch_file_output_path;
 
-    // Windows the build should actually run, which is 1 unless there is
-    // somewhere to write them.
-    //
-    // Splitting the term space without a path to write to bounds only the first
-    // intermediate: the clustered lists still accumulate for the whole corpus,
-    // and they are the bulkier of the two by roughly kClusterCostRatio. So it
-    // buys a fraction of the peak while costing a corpus pass per window, and
-    // the peak stays where an unbatched build's is. Not worth doing quietly on
-    // a caller's behalf, so `batch_size` alone is honoured as no batching at
-    // all.
+    // Windows to actually run: 1 unless there is somewhere to spill them, since
+    // windowing alone leaves the bulkier intermediate whole-corpus and costs a
+    // corpus pass per window.
     [[nodiscard]] size_t effective_batch_size() const {
         return batch_file_output_path.empty() ? 1
                                               : std::max<size_t>(1, batch_size);
@@ -184,43 +168,36 @@ inline int calculate_beta(int beta, int lambda) {
 }
 
 // Clusters and summarizes the posting lists of one term window at a time,
-// handing each window to `sink` in ascending term order.
+// handing each window to `sink` in ascending term order. The one place the
+// seismic family's build work lives: every index type reaches it, through
+// build_inverted_lists_clusters below or through build_clustered_lists.
 //
-// This is the one place the seismic family's build work lives: every index type
-// reaches it, either through build_inverted_lists_clusters below or through the
-// spilling build in seismic_batched_build.h. The element width comes from
-// `config`, so a quantizing index gets the same treatment as a float one -- the
-// values in `vectors` are already encoded by the time they arrive here.
+// `dimension` is the index's declared term space, which an empty corpus still
+// has; the element width comes from `vectors`, already encoded by add(), so a
+// quantizing index needs no special case.
 //
-// `sink` receives the window's global first term and its lists, and must not
-// hold on to them: they are freed as soon as it returns, which is what bounds
-// the memory. Windows come from
-// params.batch_clustering.effective_batch_size(), so a caller that set a batch
-// size but no output path gets one window -- see BatchClusteringOption.
+// `sink` must not hold on to what it is given: the window is freed as soon as
+// it returns, which is what bounds the memory. Windows come from
+// params.batch_clustering.effective_batch_size().
 //
 // Every window's lambda and beta are computed from the GLOBAL corpus, and every
 // list's k-means seed from its own GLOBAL term id, so the window count cannot
-// change what is produced -- see the batched-build tests, which assert file
-// equality against an unbatched build.
+// change what is produced.
 using ClusteredWindowSink = std::function<void(
     size_t term_begin, std::vector<InvertedListClusters>&& clusters)>;
 
-void for_each_clustered_window(const SparseVectors* vectors,
-                               const SparseVectorsConfig& config,
+void for_each_clustered_window(const SparseVectors* vectors, size_t dimension,
                                const SeismicClusterParameters& params,
                                const ClusteredWindowSink& sink);
 
-// Every term's clustered posting list, in term order. The whole-corpus form of
-// for_each_clustered_window, and so the unbatched build: the result is retained
-// in full, which is what bounds this by the clustered lists rather than by a
-// window. Callers reach it without an output path, which is why that is also
-// the case where the window count is dropped.
+// The whole-corpus form: every window retained, so this is bounded by the
+// clustered lists rather than by one window.
 inline std::vector<InvertedListClusters> build_inverted_lists_clusters(
-    const SparseVectors* vectors, const SparseVectorsConfig& config,
-    const SeismicClusterParameters& seismic_cluster_params) {
-    std::vector<InvertedListClusters> clustered(config.dimension);
+    const SparseVectors* vectors, size_t dimension,
+    const SeismicClusterParameters& params) {
+    std::vector<InvertedListClusters> clustered(dimension);
     for_each_clustered_window(
-        vectors, config, seismic_cluster_params,
+        vectors, dimension, params,
         [&clustered](size_t term_begin,
                      std::vector<InvertedListClusters>&& window) {
             std::move(window.begin(), window.end(),

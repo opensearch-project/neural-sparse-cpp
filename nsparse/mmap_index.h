@@ -17,11 +17,8 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <system_error>
 #include <utility>
-#include <vector>
 
-#include "nsparse/cluster/inverted_list_clusters.h"
 #include "nsparse/index.h"
 #include "nsparse/seismic_batched_build.h"
 #include "nsparse/seismic_common.h"
@@ -34,28 +31,6 @@ namespace nsparse {
 class MmapIndex : public Index {
 public:
     explicit MmapIndex(int dim = 0) : Index(dim) {}
-
-    ~MmapIndex() override {
-        // A batched build's spill outlives build(), because the posting lists
-        // borrow from it, so removing it falls to whoever holds them. Only
-        // reached where a mapped file cannot be unlinked (Windows); elsewhere
-        // spill_clustered_lists has already unlinked it and left this empty.
-        if (batch_scratch_path_.empty()) {
-            return;
-        }
-        // Unmapped here rather than left to the member's own destructor, which
-        // runs after this body: the file cannot go while it is still mapped.
-        // Whatever borrowed from it lives in a derived class, already
-        // destroyed.
-        batch_mapped_file_ = MmapFile{};
-        std::error_code ignored;
-        std::filesystem::remove(batch_scratch_path_, ignored);
-    }
-
-    MmapIndex(const MmapIndex&) = delete;
-    MmapIndex& operator=(const MmapIndex&) = delete;
-    MmapIndex(MmapIndex&&) = delete;
-    MmapIndex& operator=(MmapIndex&&) = delete;
 
     void read_csr(const char* file_path,
                   Residency residency = Residency::kInMemory) override {
@@ -76,31 +51,6 @@ public:
     }
 
 protected:
-    // The build every seismic-family type runs, so the batching decision is
-    // made once rather than per type.
-    //
-    // With both batch knobs set (see BatchClusteringOption) it clusters one
-    // term window at a time, spilling to scratch and borrowing the finished
-    // lists back from it, so the peak is one window rather than the whole
-    // corpus; otherwise it is the ordinary whole-corpus build. Either way the
-    // lists come back complete and in term order, and writing an index file
-    // stays write_index's job -- the spill is not one, and build() produces no
-    // file a caller keeps.
-    std::vector<InvertedListClusters> build_clustered_lists(
-        const SparseVectorsConfig& config,
-        const SeismicClusterParameters& params) {
-        if (params.batch_clustering.effective_batch_size() <= 1) {
-            return detail::build_inverted_lists_clusters(get_vectors(), config,
-                                                         params);
-        }
-        detail::SpilledLists spilled = detail::spill_clustered_lists(
-            get_vectors(), config, params,
-            params.batch_clustering.batch_file_output_path,
-            &batch_mapped_file_);
-        batch_scratch_path_ = std::move(spilled.scratch_path);
-        return std::move(spilled.lists);
-    }
-
     // The mapping borrowed buffers point into: a native CSR file via read_csr,
     // or a serialized index file. Those sources are mutually exclusive, so one
     // member serves both.
@@ -114,21 +64,13 @@ protected:
     // mapped_file_ when mapped. get_vectors() cannot tell the two apart.
     std::unique_ptr<SparseVectors> vectors_;
 
-    // A second mapping, for the spill a batched build wrote its clustered lists
-    // to and then borrows them back from. Separate from mapped_file_ rather
-    // than replacing it, because the two coexist: the corpus may itself be a
-    // mapping that vectors_ is still borrowing from, and giving that up would
-    // leave the index unable to score anything.
+    // A batched build's spill, which its posting lists borrow from. Separate
+    // from mapped_file_ because the two coexist: the corpus may itself be a
+    // mapping vectors_ is still borrowing from.
     //
-    // Whatever borrows from this lives in the derived class, and derived
-    // members are destroyed before base ones, so the borrowers are always gone
-    // first.
-    MmapFile batch_mapped_file_;
-
-    // The spill behind batch_mapped_file_, when the platform would not let it
-    // be unlinked while mapped. Empty otherwise, which is the usual case. See
-    // the destructor.
-    std::string batch_scratch_path_;
+    // Its borrowers live in the derived class, destroyed before base members,
+    // so they are always gone before the spill is released.
+    detail::ClusteredListsSpill batch_spill_;
 
 private:
     // Values are borrowed at their stored width, so a quantizing index cannot

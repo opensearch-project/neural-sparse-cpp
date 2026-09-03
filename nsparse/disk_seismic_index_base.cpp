@@ -48,9 +48,9 @@ void DiskSeismicIndexBase::add(idx_t n, const idx_t* indptr,
         // Fresh container: start the count at 0 so a stale num_vectors_ (e.g.
         // left by a prior mmap load, which has no vectors_) cannot accumulate.
         num_vectors_ = 0;
-        vectors_ = std::make_unique<SparseVectors>(SparseVectorsConfig{
-            .element_size = element_size,
-            .dimension = static_cast<size_t>(dimension_)});
+        vectors_ = std::make_unique<SparseVectors>(
+            SparseVectorsConfig{.element_size = element_size,
+                                .dimension = static_cast<size_t>(dimension_)});
     }
     std::vector<uint8_t> scratch;
     const uint8_t* codes = encode_values(values, nnz, scratch);
@@ -60,10 +60,9 @@ void DiskSeismicIndexBase::add(idx_t n, const idx_t* indptr,
 }
 
 void DiskSeismicIndexBase::build() {
-    clustered_inverted_lists = build_clustered_lists(
-        {.element_size = code_element_size(),
-         .dimension = static_cast<size_t>(get_dimension())},
-        cluster_parameter_);
+    clustered_inverted_lists = detail::build_clustered_lists(
+        get_vectors(), static_cast<size_t>(get_dimension()), cluster_parameter_,
+        &batch_spill_);
 }
 
 auto DiskSeismicIndexBase::search(idx_t n, const idx_t* indptr,
@@ -161,9 +160,8 @@ void DiskSeismicIndexBase::write_index(IOWriter* io_writer) {
     // Inline forward index, built from the same clusters + vectors. An empty
     // corpus uses a correctly-typed empty SparseVectors (element_size must be a
     // valid width even with zero vectors) so the section still round-trips.
-    SparseVectors empty_vectors(
-        {.element_size = code_element_size(),
-         .dimension = static_cast<size_t>(dimension_)});
+    SparseVectors empty_vectors({.element_size = code_element_size(),
+                                 .dimension = static_cast<size_t>(dimension_)});
     const SparseVectors& v = vectors_ != nullptr ? *vectors_ : empty_vectors;
     detail::InlineForwardIndex forward(clustered_inverted_lists, v);
     forward.serialize(io_writer);
@@ -192,12 +190,12 @@ void DiskSeismicIndexBase::load_mapped_payload(MmapCursor* cursor,
     clustered_inverted_lists = std::move(inv_list_writer.release());
     fwd_ = std::move(forward);
     // Now that the summaries and forward index are populated (still borrowing
-    // from `mapped`, which is alive here), let the concrete index reject a width
-    // mismatch before we commit.
+    // from `mapped`, which is alive here), let the concrete index reject a
+    // width mismatch before we commit.
     validate_mapped_payload();
 
-    // mapped_file_ last: the summaries and the forward index borrow from it, and
-    // moving it does not move the mapping.
+    // mapped_file_ last: the summaries and the forward index borrow from it,
+    // and moving it does not move the mapping.
     mapped_file_ = std::move(mapped);
 }
 

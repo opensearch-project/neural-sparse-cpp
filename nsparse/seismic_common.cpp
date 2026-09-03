@@ -35,39 +35,29 @@ struct TermWindow {
 };
 
 // How much more a posting costs once clustered than while being scattered into
-// an inverted list, per unit. A window's memory has two peaks: filling it holds
-// every posting of its terms at a few bytes each, and clustering it holds the
-// pruned survivors as clusters and summaries, which are an order of magnitude
-// bulkier per posting.
-//
-// Only the ratio matters, and only roughly: the cost curve is a shallow basin,
-// so assuming 8x or 32x here instead of 16x costs a fraction of the benefit and
-// still beats weighting either phase alone. It is deliberately not derived from
-// alpha/beta/dimension, which would be a model of summarize() that this does not
-// need to be right about.
+// an inverted list. Only the ratio matters, and only roughly: the cost curve is
+// a shallow basin, so 8x or 32x instead of 16x costs a fraction of the benefit
+// and still beats weighting either phase alone. Deliberately not derived from
+// alpha/beta/dimension, which would be a model of summarize() to keep correct.
 constexpr size_t kClusterCostRatio = 16;
 
 // Cuts [0, dimension) into at most `batches` windows of near-equal estimated
 // memory, from the exact per-term counts.
 //
-// Equal width would not do, because term frequencies are heavily skewed: a
-// natural-language corpus puts orders of magnitude more postings on its heaviest
-// term than on its mean one. Peak memory is set by the largest window, not the
-// average one, so an uneven split wastes most of what batching could save.
+// Not equal width, because term frequencies are heavily skewed and the peak is
+// set by the largest window, so an uneven split wastes most of what batching
+// could save.
 //
-// What to even out is neither phase alone but their sum. Weighting raw counts
-// balances the fill and unbalances the clustering, which is the more expensive
-// phase. Weighting min(count, lambda) -- what survives pruning, and so what
-// clustering holds -- balances that phase perfectly but concentrates the heavy
-// terms, leaving one window holding several times the mean raw postings, which
-// then becomes the peak. Weighting both together at their relative cost balances
-// what is actually resident, and measures best of the four on a skewed corpus.
+// What to even out is both phases' sum, not either alone: weighting raw counts
+// balances the fill and unbalances the costlier clustering, and weighting
+// min(count, lambda) balances clustering but concentrates the heavy terms,
+// whose fill then becomes the peak.
 //
-// Windows stay contiguous and ascending, which is what lets the clustered lists
-// be appended to a file as each window finishes: the layout carries no per-list
-// offsets, so a list's position in the file is its term order. Grouping terms
-// by a hash (term % batches) balances comparably, but scatters each window's
-// terms across the file, which the streaming write cannot express.
+// Windows stay contiguous and ascending, which is what lets each window's lists
+// be appended to the spill as it finishes: the layout carries no per-list
+// offsets, so a list's position in the file is its term order. Hashing terms
+// into windows balances comparably but scatters them, which the append cannot
+// express.
 //
 // Bounds are size_t, not term_t: dimension may be up to 65536 (term_t is
 // uint16), so a term_t window boundary would wrap and silently drop terms.
@@ -272,21 +262,15 @@ std::vector<InvertedListClusters> cluster_window(
 
 }  // namespace
 
-void for_each_clustered_window(const SparseVectors* vectors,
-                               const SparseVectorsConfig& config,
+void for_each_clustered_window(const SparseVectors* vectors, size_t dimension,
                                const SeismicClusterParameters& params,
                                const ClusteredWindowSink& sink) {
     if (vectors == nullptr || vectors->num_vectors() == 0) {
         return;
     }
-    if (vectors->get_element_size() != config.element_size) {
-        throw std::invalid_argument(
-            "for_each_clustered_window: corpus element width does not match "
-            "the "
-            "index's");
-    }
 
-    const size_t dim = config.dimension;
+    const size_t dim = dimension;
+    const size_t element_size = vectors->get_element_size();
     const size_t batches =
         std::min(params.batch_clustering.effective_batch_size(), dim);
 
@@ -312,8 +296,8 @@ void for_each_clustered_window(const SparseVectors* vectors,
 
     for (const TermWindow& window : make_windows(
              term_counts, static_cast<size_t>(resolved.lambda), batches)) {
-        WindowLists lists(term_counts, window, config.element_size);
-        fill_from_corpus(*vectors, window, config.element_size, &lists);
+        WindowLists lists(term_counts, window, element_size);
+        fill_from_corpus(*vectors, window, element_size, &lists);
         sink(window.begin,
              cluster_window(*vectors, lists.seal(), window, resolved));
         // The window's lists and clusters are freed here, before the next

@@ -10,7 +10,9 @@
 #ifndef SEISMIC_BATCHED_BUILD_H
 #define SEISMIC_BATCHED_BUILD_H
 
+#include <cstddef>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "nsparse/cluster/inverted_list_clusters.h"
@@ -20,52 +22,79 @@
 
 namespace nsparse::detail {
 
-// What a spilled build hands back.
-struct SpilledLists {
-    // Every term's clustered posting list, in term order -- the same thing
-    // build_inverted_lists_clusters returns, borrowed from the spill's mapping
-    // rather than allocated.
-    std::vector<InvertedListClusters> lists;
-    // The spill file, when it is still on disk to be removed. Empty when it was
-    // unlinked as soon as it was mapped, which is what happens wherever a
-    // mapped file can be unlinked; where it cannot (Windows), whoever holds the
-    // mapping has to remove this after releasing it.
-    std::string scratch_path;
+// The temporary file a batched build spilled its clustered lists to, and the
+// mapping those lists borrow from. Owns both, so an index that holds one keeps
+// its lists valid and cleans up after itself.
+class ClusteredListsSpill {
+public:
+    ClusteredListsSpill() = default;
+    ~ClusteredListsSpill() { release(); }
+
+    ClusteredListsSpill(const ClusteredListsSpill&) = delete;
+    ClusteredListsSpill& operator=(const ClusteredListsSpill&) = delete;
+    ClusteredListsSpill(ClusteredListsSpill&& other) noexcept
+        : path_(std::move(other.path_)), mapping_(std::move(other.mapping_)) {
+        other.path_.clear();
+    }
+    ClusteredListsSpill& operator=(ClusteredListsSpill&& other) noexcept {
+        if (this != &other) {
+            release();
+            path_ = std::move(other.path_);
+            mapping_ = std::move(other.mapping_);
+            other.path_.clear();
+        }
+        return *this;
+    }
+
+    // Takes a spill this build just wrote and maps it. `path` is unlinked here
+    // when the platform allows it while mapped, so a crash cannot strand
+    // scratch; otherwise it is remembered and removed on release().
+    void adopt(const std::string& path);
+
+    [[nodiscard]] const MmapFile& mapping() const { return mapping_; }
+
+private:
+    // Unmaps, then removes the file -- in that order, since Windows cannot
+    // unlink a mapped file. Only ever a path adopt() created, and re-checked
+    // against the spill naming, because this deletes.
+    void release();
+
+    std::string path_;  // empty unless a removal is still owed
+    MmapFile mapping_;
 };
 
-// Clusters the corpus one contiguous term window at a time, spilling each
-// window's lists to a temporary file in `scratch_dir` and mapping them back, so
-// the caller ends up holding every list without two windows ever having been
-// resident at once.
+// The build every seismic-family index runs, and the one place the batching
+// decision is made. Clusters one contiguous term window at a time into `spill`
+// when both batch knobs are set, whole-corpus otherwise; either way the lists
+// come back complete and in term order.
 //
-// The usual build holds two whole-corpus intermediates -- the inverted lists
-// (every posting) and then the clustered posting lists -- so its peak memory
-// scales with the corpus's non-zeros, and a corpus whose posting lists do not
-// fit in RAM cannot be indexed at all. for_each_clustered_window bounds the
-// first to one window; spilling each window's clusters and dropping them, which
-// is what this does, bounds the second. What is left resident is the forward
-// corpus (which the caller already holds, at whatever residency SparseVectors
-// was given) plus one window.
+// `dimension` is the index's, not the corpus's: it is the list count, and an
+// empty corpus still has one. The element width comes from `vectors`.
+std::vector<InvertedListClusters> build_clustered_lists(
+    const SparseVectors* vectors, size_t dimension,
+    const SeismicClusterParameters& params, ClusteredListsSpill* spill);
+
+// Clusters one term window at a time, spilling each window's lists into
+// `scratch_dir` and freeing them, then maps the finished lists back out.
 //
-// The spill is scratch, not an index: it carries the posting-list section and
-// nothing else -- no index header, no forward vectors -- and nothing outside
-// this build ever reads it. Writing an index file remains write_index's job,
-// from the lists this returns; a build that borrows its lists from scratch
-// serializes byte-for-byte what a whole-corpus build would have.
+// A whole-corpus build holds two intermediates that scale with the corpus's
+// non-zeros -- the inverted lists and then the clustered lists -- which is what
+// puts a ceiling on the corpus an index can be built from.
+// for_each_clustered_window bounds the first to a window; spilling bounds the
+// second. What stays resident is the corpus plus one window.
 //
-// Identical to the unbatched build for a fixed `params.seed`, and identical
-// whatever the window count is, because every list's k-means seed comes from
-// its own global term id -- see for_each_clustered_window.
+// The spill is scratch, not an index: posting lists only, no header, read by
+// nothing else. Serializing an index remains write_index's job, and at a fixed
+// `params.seed` what it then writes is byte-for-byte what a whole-corpus build
+// would have produced -- every list's k-means seed comes from its own global
+// term id, so the window count cannot leak into the output.
 //
-// `into` takes the mapping the returned lists borrow from, and so must outlive
-// them. Throws if `scratch_dir` is not a directory, or if the corpus is empty:
-// there would be no windows to spill, and an empty spill maps back to no lists
-// at all.
-SpilledLists spill_clustered_lists(const SparseVectors* vectors,
-                                   const SparseVectorsConfig& config,
-                                   const SeismicClusterParameters& params,
-                                   const std::string& scratch_dir,
-                                   MmapFile* into);
+// Throws if `scratch_dir` is not a directory, or if the corpus is empty: there
+// would be no windows to spill.
+std::vector<InvertedListClusters> spill_clustered_lists(
+    const SparseVectors* vectors, size_t dimension,
+    const SeismicClusterParameters& params, const std::string& scratch_dir,
+    ClusteredListsSpill* into);
 
 }  // namespace nsparse::detail
 

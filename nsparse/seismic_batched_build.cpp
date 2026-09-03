@@ -10,6 +10,7 @@
 #include "nsparse/seismic_batched_build.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <random>
 #include <stdexcept>
@@ -30,41 +31,42 @@
 namespace nsparse::detail {
 namespace {
 
-// A spill file of this build's own inside `dir`. Named uniquely rather than
-// fixed, so concurrent builds sharing a scratch directory cannot overwrite each
+// How a spill is named. Checked again before removal, so this code can only
+// ever delete a file it wrote.
+constexpr const char* kSpillPrefix = "nsparse-clustered-lists-";
+constexpr const char* kSpillSuffix = ".tmp";
+
+// Unique per build, so builds sharing a scratch directory cannot overwrite each
 // other's windows.
-std::string scratch_file_path(const std::string& dir) {
-    const auto token = static_cast<uint64_t>(std::random_device{}()) << 32U |
-                       std::random_device{}();
+std::string spill_path(const std::string& dir) {
+    std::random_device entropy;
+    const auto token = static_cast<uint64_t>(entropy()) << 32U | entropy();
     return (std::filesystem::path(dir) /
-            ("nsparse-clustered-lists-" + std::to_string(token) + ".tmp"))
+            (kSpillPrefix + std::to_string(token) + kSpillSuffix))
         .string();
 }
 
+bool is_spill_path(const std::string& path) {
+    const std::string name = std::filesystem::path(path).filename().string();
+    return name.starts_with(kSpillPrefix) && name.ends_with(kSpillSuffix);
+}
+
 // The posting-list section -- [count][list...], the layout
-// SeismicInvertedListsWriter produces -- streamed into `writer` one window at a
-// time.
-//
-// One writer for the whole section, windows serialized straight into it rather
-// than written separately and concatenated: serialize() pads each array
-// relative to the writer's current offset (see io/align.h), so bytes produced
-// by a writer that started at 0 carry the wrong padding once appended at some
-// other offset.
-void stream_clustered_lists(const SparseVectors* vectors,
-                            const SparseVectorsConfig& config,
+// SeismicInvertedListsWriter produces -- streamed into `writer` a window at a
+// time. One writer for the whole section: serialize() pads each array relative
+// to the writer's offset (io/align.h), so separately written windows would
+// carry the wrong padding once concatenated.
+void stream_clustered_lists(const SparseVectors* vectors, size_t dimension,
                             const SeismicClusterParameters& params,
                             IOWriter* writer) {
-    // The list count, exactly where SeismicInvertedListsWriter::serialize puts
-    // it. It is the whole dimension, known before any window is built, which is
-    // what lets the lists be streamed after it rather than counted first.
-    size_t n_lists = config.dimension;
+    // The whole dimension, known before any window is built, which is what lets
+    // the lists follow it rather than be counted first.
+    size_t n_lists = dimension;
     writer->write(&n_lists, sizeof(size_t), 1);
 
-    // Windows arrive in ascending term order, so appending each in turn
-    // produces the same byte sequence as writing every list at once.
     size_t next_term = 0;
     for_each_clustered_window(
-        vectors, config, params,
+        vectors, dimension, params,
         [&](size_t term_begin, std::vector<InvertedListClusters>&& clusters) {
             if (term_begin != next_term) {
                 // The layout carries no per-list offsets, so a gap or a repeat
@@ -78,20 +80,54 @@ void stream_clustered_lists(const SparseVectors* vectors,
             next_term = term_begin + clusters.size();
             // clusters freed on return, before the next window is built.
         });
-    if (next_term != config.dimension) {
-        throw std::runtime_error(
-            "spill_clustered_lists: spilled " + std::to_string(next_term) +
-            " of " + std::to_string(config.dimension) + " posting lists");
+    if (next_term != dimension) {
+        throw std::runtime_error("spill_clustered_lists: spilled " +
+                                 std::to_string(next_term) + " of " +
+                                 std::to_string(dimension) + " posting lists");
     }
 }
 
 }  // namespace
 
-SpilledLists spill_clustered_lists(const SparseVectors* vectors,
-                                   const SparseVectorsConfig& config,
-                                   const SeismicClusterParameters& params,
-                                   const std::string& scratch_dir,
-                                   MmapFile* into) {
+void ClusteredListsSpill::adopt(const std::string& path) {
+    MmapFile mapped(path);
+    std::error_code failed;
+    std::filesystem::remove(path, failed);
+    // Committed after the mapping succeeded, so a failed open leaves nothing
+    // half-owned.
+    release();
+    mapping_ = std::move(mapped);
+    path_ = failed ? path : std::string();
+}
+
+void ClusteredListsSpill::release() {
+    if (path_.empty()) {
+        return;
+    }
+    const std::string path = std::move(path_);
+    path_.clear();
+    mapping_ = MmapFile{};
+    if (is_spill_path(path)) {
+        std::error_code ignored;
+        std::filesystem::remove(path, ignored);
+    }
+}
+
+std::vector<InvertedListClusters> build_clustered_lists(
+    const SparseVectors* vectors, size_t dimension,
+    const SeismicClusterParameters& params, ClusteredListsSpill* spill) {
+    const auto& batch = params.batch_clustering;
+    if (batch.effective_batch_size() <= 1) {
+        return build_inverted_lists_clusters(vectors, dimension, params);
+    }
+    return spill_clustered_lists(vectors, dimension, params,
+                                 batch.batch_file_output_path, spill);
+}
+
+std::vector<InvertedListClusters> spill_clustered_lists(
+    const SparseVectors* vectors, size_t dimension,
+    const SeismicClusterParameters& params, const std::string& scratch_dir,
+    ClusteredListsSpill* into) {
     if (!std::filesystem::is_directory(scratch_dir)) {
         throw std::invalid_argument(
             "spill_clustered_lists: batch_file_output_path must be an existing "
@@ -104,38 +140,21 @@ SpilledLists spill_clustered_lists(const SparseVectors* vectors,
             "spill");
     }
 
-    const std::string path = scratch_file_path(scratch_dir);
+    const std::string path = spill_path(scratch_dir);
     {
-        // Closed before the mapping is taken: the writer buffers, and what is
-        // not flushed is not in the file to map.
+        // Closed before the file is mapped: the writer buffers.
         FileIOWriter writer(const_cast<char*>(path.c_str()));
-        stream_clustered_lists(vectors, config, params, &writer);
+        stream_clustered_lists(vectors, dimension, params, &writer);
         writer.close();
     }
+    into->adopt(path);
 
-    MmapFile mapped(path);
-    // The cursor starts at the section, which is the whole file: a spill has no
-    // header for it to sit behind. Absolute offsets are what serialize() padded
-    // against, and here they are the section's own.
-    MmapCursor cursor(mapped.data(), mapped.size());
+    // The section is the whole file, and absolute offsets are the ones
+    // serialize() padded against, so the cursor starts where the writer did.
+    MmapCursor cursor(into->mapping().data(), into->mapping().size());
     SeismicInvertedListsWriter lists;
     lists.mmap_deserialize(&cursor);
-
-    // Unlinked now rather than when the index is done with it: the mapping
-    // keeps the bytes alive wherever unlinking an open file is allowed, so
-    // scratch cannot outlive the process even if it dies mid-build. Where it is
-    // not allowed, the path goes back to the caller to remove after the
-    // mapping.
-    std::error_code failed;
-    std::filesystem::remove(path, failed);
-
-    SpilledLists spilled;
-    spilled.lists = std::move(lists.release());
-    spilled.scratch_path = failed ? path : std::string();
-    // Committed once the walk succeeded, so a truncated spill cannot leave the
-    // caller holding lists that point into a mapping it never took.
-    *into = std::move(mapped);
-    return spilled;
+    return std::move(lists.release());
 }
 
 }  // namespace nsparse::detail

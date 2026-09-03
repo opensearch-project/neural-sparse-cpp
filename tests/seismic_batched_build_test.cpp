@@ -245,6 +245,38 @@ TEST(SeismicBatchedBuild, LeavesNothingInTheScratchDirectory) {
               in_memory(corpus, dir.file("mem.dat")));
 }
 
+// The build deletes its own spill and nothing else. The directory is the
+// caller's, so whatever else lives in it -- including a file named like a
+// spill, which the build did not create -- has to still be there afterwards.
+TEST(SeismicBatchedBuild, LeavesOtherFilesInTheScratchDirectoryAlone) {
+    Corpus corpus = make_corpus(/*n_docs=*/1500, /*dim=*/200, /*seed=*/3);
+    TempDir dir("scratch_others");
+    const std::string scratch = dir.scratch();
+    const std::array<std::string, 3> bystanders = {
+        scratch + "/keep-me.txt", scratch + "/index.dat",
+        scratch + "/nsparse-clustered-lists-999.tmp"};
+    for (const std::string& path : bystanders) {
+        std::ofstream(path, std::ios::binary) << "not the build's";
+    }
+
+    {
+        SeismicIndex index(corpus.dim, params_for(8, scratch, kSeed));
+        index.add(corpus.n, corpus.indptr.data(), corpus.indices.data(),
+                  corpus.values.data());
+        index.build();
+        // Destroyed here, which is when a spill that could not be unlinked
+        // while mapped is removed.
+    }
+
+    for (const std::string& path : bystanders) {
+        EXPECT_TRUE(std::filesystem::exists(path)) << path;
+        EXPECT_EQ(std::filesystem::file_size(path), 15U) << path;
+    }
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(scratch),
+                            std::filesystem::directory_iterator{}),
+              static_cast<ptrdiff_t>(bystanders.size()));
+}
+
 // The two knobs are only useful together. A window count with nowhere to spill
 // the windows bounds the fill intermediate while leaving the clustered lists to
 // accumulate -- a corpus pass per window for a fraction of the peak -- so it is

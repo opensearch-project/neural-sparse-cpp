@@ -191,12 +191,11 @@ ScalarQuantizer SeismicScalarQuantizedIndex::query_quantizer(
 }
 
 void SeismicScalarQuantizedIndex::build() {
-    // The codes in `vectors_` are already quantized by add(), so the shared
-    // build needs no knowledge of the quantizer beyond its width.
-    clustered_inverted_lists = build_clustered_lists(
-        {.element_size = sq_.bytes_per_value(),
-         .dimension = static_cast<size_t>(get_dimension())},
-        cluster_parameter_);
+    // add() has already quantized the values, so the shared build reads their
+    // width off the corpus and needs to know nothing of the quantizer.
+    clustered_inverted_lists = detail::build_clustered_lists(
+        get_vectors(), static_cast<size_t>(get_dimension()), cluster_parameter_,
+        &batch_spill_);
 }
 
 auto SeismicScalarQuantizedIndex::search(idx_t n, const idx_t* indptr,
