@@ -62,18 +62,49 @@ def test_happy_case(batch_size, corpus, queries, oracle, tmp_path):
     assert recall_at_k(labels, want_labels) >= RECALL_FLOOR
 
 
-@pytest.mark.parametrize("kind", ["seismic", "seismic_sq"])
+@pytest.mark.parametrize(
+    "kind", ["seismic", "seismic_sq", "disk_seismic", "disk_seismic_sq"]
+)
 def test_matches_in_memory_build(kind, corpus, tmp_path):
     """At a fixed seed a streamed build is the in-memory build, byte for byte.
 
-    Parametrized over a float and a quantizing index, because the shared build
-    only needs the code width -- add() has already encoded the values.
+    Over all four types in the family: float and quantizing, since the shared
+    build only needs the code width (add() has already encoded the values), and
+    in-memory and disk-resident, which get there differently -- the disk types'
+    payload cannot be streamed section by section, so they spill their clustered
+    lists and write from that mapping instead.
     """
     in_memory = tmp_path / "memory.idx"
     nsparse.write_index(make_index(f"{kind},{BASE}", corpus), str(in_memory))
     batched = streamed(corpus, tmp_path / "batched.idx", 4, kind=kind)
 
     assert in_memory.read_bytes() == open(batched, "rb").read()
+    # The spill the disk types take is scratch, deleted with the build.
+    assert not (tmp_path / "batched.idx.lists").exists()
+
+
+@pytest.mark.parametrize("kind", ["disk_seismic", "disk_seismic_sq"])
+def test_streamed_disk_index_is_searchable_after_build(
+    kind, corpus, queries, oracle, tmp_path
+):
+    """A batched disk build serves from the file it wrote.
+
+    Its summaries and its inline forward index are borrowed from that mapping,
+    so there is no reopening by path -- and nothing left pointing at the spill.
+    """
+    index = nsparse.index_factory(
+        corpus.dim,
+        f"{kind},{BASE}|inverted_list_batch_size=8"
+        f"|batch_file_output_path={tmp_path / 'streamed.idx'}",
+    )
+    add_corpus(index, corpus)
+    index.build()
+
+    assert index.num_vectors() == corpus.n
+    params = nsparse.DiskSeismicSearchParameters(8, 200)
+    _, labels = search(index, queries, params=params)
+    want_labels, _ = oracle
+    assert recall_at_k(labels, want_labels) >= RECALL_FLOOR
 
 
 def test_streamed_index_is_searchable_after_build(corpus, queries, oracle, tmp_path):

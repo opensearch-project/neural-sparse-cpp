@@ -36,12 +36,13 @@ namespace nsparse::detail {
 // holds, at whatever residency SparseVectors was given) plus one window.
 //
 // Reached through an index's build(), by setting
-// SeismicClusterParameters::batch_clustering.batch_file_output_path. The index
-// is then the file, not the object: nothing is retained to serve or to
-// write_index afterwards.
+// SeismicClusterParameters::batch_clustering.batch_file_output_path. The build
+// then maps the file back (see map_streamed_lists) rather than dropping it, so
+// it ends holding the index it wrote.
 //
-// `header` and `write_prefix` are what make this work for every type in the
-// family rather than just SEIS. `write_prefix` writes whatever the type puts
+// `header` and `write_prefix` are what make this work for every type whose
+// payload ends with its posting lists, rather than just SEIS. `write_prefix`
+// writes whatever the type puts
 // between the header and its posting lists -- the forward vectors, and for a
 // quantizing index its quantization header first. The lists then follow in the
 // byte-for-byte layout SeismicInvertedListsWriter produces, so the file is an
@@ -63,6 +64,31 @@ size_t write_seismic_index_batched(
     const SeismicClusterParameters& params, const IndexHeader& header,
     const std::function<void(IOWriter*)>& write_prefix,
     const std::string& out_path);
+
+// Streams every window's clustered posting lists to `path` and then maps them
+// back, so the caller ends up holding all of them without two windows ever
+// having been resident at once.
+//
+// For the index types whose payload ends with its posting lists,
+// write_seismic_index_batched writes the index itself and there is nothing to
+// spill. A DiskSeismic payload is not one of those: its summaries precede an
+// inline forward index whose blocks are laid out from the doc-id membership of
+// every list, so no window's lists can be dropped before the last window is
+// clustered. What can be dropped is their *residency* -- which is what this is
+// for. `path` gets the lists in the same [count][list...] layout
+// SeismicInvertedListsWriter produces, doc ids included (an index's own section
+// writes them empty; the forward index is what needs them here), and the
+// returned lists borrow from the mapping handed to `into` rather than the heap.
+//
+// The spill is scratch, not an index: it carries no header, nothing else reads
+// it, and deleting it is the caller's job. It must outlive the returned lists.
+//
+// Throws if the corpus is empty, for the same reason as
+// write_seismic_index_batched: there would be no windows to stream.
+std::vector<InvertedListClusters> spill_clustered_lists(
+    const SparseVectors* vectors, const SparseVectorsConfig& config,
+    const SeismicClusterParameters& params, const std::string& path,
+    MmapFile* into);
 
 // Maps the file a streamed build just wrote and borrows its posting lists out
 // of it, so the build ends holding a usable index without ever having held all

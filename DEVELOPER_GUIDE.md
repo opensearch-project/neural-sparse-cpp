@@ -240,7 +240,16 @@ a separate entry point, so it is set in the factory description alongside
 | Option | Effect |
 |---|---|
 | `inverted_list_batch_size=N` | Build in `N` term windows. Bounds the inverted-list intermediate to one window; the index is still built in memory as usual. |
-| `batch_file_output_path=P` | With `N > 1`, serialize each window to `P` and free it, so the clustered lists are never all resident either, then borrow them back from `P` by mapping it. Unused at `N <= 1`, which is an ordinary build and already holds its own lists. |
+| `batch_file_output_path=P` | With `N > 1`, write the index to `P` as it is built rather than assembling it in memory, so the clustered lists are never all resident either, then borrow them back from `P` by mapping it. Unused at `N <= 1`, which is an ordinary build and already holds its own lists. |
+
+`seismic` and `seismic_sq` end their payload with their posting lists, so each
+window is serialized straight into `P` and dropped. The disk-resident pair cannot
+be written that way: their summaries are followed by an inline forward index whose
+blocks are laid out from the doc-id membership of *every* list, which is not known
+until the last window is clustered. They spill the clustered lists to `P.lists`
+instead, map them back, and write the payload from that mapping — same bound on
+anonymous memory, at the cost of scratch disk the size of the lists. The spill is
+deleted with the build; nothing else reads it.
 
 ```cpp
 auto* index = nsparse::index_factory(
@@ -275,10 +284,10 @@ dists, labels = index.search(n, indptr, indices, values, k)
 
 The file is an ordinary index of its type — byte-for-byte what `write_index`
 would have produced from the equivalent whole-corpus build. That is asserted
-rather than assumed: at a fixed `seed` the two are compared as files, for both a
-float and a quantizing index. Each posting list's k-means seed comes from its own
-*global* term id and `lambda`/`beta` are resolved once from the whole corpus, so
-the window count cannot change what is produced.
+rather than assumed: at a fixed `seed` the two are compared as files, for all four
+types. Each posting list's k-means seed comes from its own *global* term id and
+`lambda`/`beta` are resolved once from the whole corpus, so the window count
+cannot change what is produced.
 
 ### Choosing `inverted_list_batch_size`
 
@@ -332,6 +341,29 @@ Build time is flat to around ten windows and then climbs, because every window
 makes its own pass over the corpus. Ten to twenty is the useful range: 3.6–7.2×
 less allocated memory for at most a few percent of build time.
 
+The disk-resident pair spills rather than streams, and it holds up the same way.
+Same corpus and host, corpus mapped in every row, at λ=600 β=40 α=0.4 — a tenth
+of the λ above, because the inline forward index copies every pruned posting's
+whole doc vector, and at λ=6000 that section alone would be ~140 GB:
+
+| windows | peak RssAnon | build time | index |
+|---|---|---|---|
+| 1 (unbatched) | 8671 MB | 48 s | — |
+| 10 | 1440 MB | 94 s | 16.9 GB |
+| 20 | 774 MB | 210 s | 16.9 GB |
+| 100 | 434 MB | 375 s | 16.9 GB |
+
+20× less allocated memory at 100 windows, 6× at 10. Build time climbs sooner than
+it does for `seismic`: the spill is written and read back, and the payload write
+is a second pass over the lists on top of the per-window corpus passes. The
+unbatched row writes no index, so its build time is not comparable to the others'
+either — it is the memory it is there for.
+
+`disk_seismic_sq` cannot map a float CSR (it searches over codes), so its corpus
+sits on the heap and the figures include it: at 8-bit codes the corpus is 3242 MB
+resident, and the build grows 6862 MB on top of that unbatched against 1087 MB at
+10 windows.
+
 Those rows are comparable to each other but not to a build that loads the corpus
 instead of mapping it, and the difference is not just the corpus. The same
 1-window build measures 10274 MB mapped against 24084 MB with a streaming ingest —
@@ -376,6 +408,11 @@ $B convert corpus.csr corpus.mcsr
 $B baseline corpus.csr 6000 400 0.4               # whole-corpus build, for reference
 $B batched inmem corpus.csr 6000 400 0.4 10 /data # 10 windows, same corpus residency
 $B batched mmap corpus.mcsr 6000 400 0.4 10 /data # ... or with the corpus mapped
+
+# Any type in the family, as its factory name. Both arms need it, and the
+# baseline's index path is positional -- pass "" to skip writing one.
+$B baseline corpus.csr 6000 400 0.4 "" disk_seismic
+$B batched mmap corpus.mcsr 6000 400 0.4 10 /data disk_seismic
 ```
 
 ## Python Bindings

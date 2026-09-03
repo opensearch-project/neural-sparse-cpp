@@ -142,6 +142,14 @@ void DiskSeismicScalarQuantizedIndex::write_payload_header(
     io_writer->write(&vmax, sizeof(float), 1);
 }
 
+void DiskSeismicScalarQuantizedIndex::read_mapped_payload_header(
+    MmapCursor* cursor) {
+    const auto sq_type = cursor->read_scalar<QuantizerType>();
+    const auto vmin = cursor->read_scalar<float>();
+    const auto vmax = cursor->read_scalar<float>();
+    sq_ = make_scalar_quantizer(sq_type, vmin, vmax);
+}
+
 void DiskSeismicScalarQuantizedIndex::validate_mapped_payload() const {
     throw_if_forward_width_mismatch(fwd_, sq_);
     throw_if_summary_width_mismatch(clustered_inverted_lists, sq_);
@@ -159,11 +167,7 @@ DiskSeismicScalarQuantizedIndex* DiskSeismicScalarQuantizedIndex::mmap_index(
 
     // The quantization header opens the payload; the shared loader reads the
     // rest and calls validate_mapped_payload() against this quantizer.
-    const auto sq_type = cursor.read_scalar<QuantizerType>();
-    const auto vmin = cursor.read_scalar<float>();
-    const auto vmax = cursor.read_scalar<float>();
-    index->sq_ = make_scalar_quantizer(sq_type, vmin, vmax);
-
+    index->read_mapped_payload_header(&cursor);
     index->load_mapped_payload(&cursor, std::move(mmap_file));
     return index.release();
 }

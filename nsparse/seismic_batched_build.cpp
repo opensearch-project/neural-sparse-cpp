@@ -27,38 +27,41 @@
 #include "nsparse/utils/mmap_file.h"
 
 namespace nsparse::detail {
+namespace {
 
-size_t write_seismic_index_batched(
-    const SparseVectors* vectors, const SparseVectorsConfig& config,
-    const SeismicClusterParameters& params, const IndexHeader& header,
-    const std::function<void(IOWriter*)>& write_prefix,
-    const std::string& out_path) {
-    if (out_path.empty()) {
-        throw std::invalid_argument(
-            "write_seismic_index_batched: output path must not be empty");
+// Both entry points below refuse the same two inputs: nowhere to write to, and
+// a corpus with no postings to write.
+void throw_if_not_streamable(const SparseVectors* vectors,
+                             const std::string& path, const char* who) {
+    if (path.empty()) {
+        throw std::invalid_argument(std::string(who) +
+                                    ": output path must not be empty");
     }
     if (vectors == nullptr || vectors->num_vectors() == 0) {
         throw std::invalid_argument(
-            "write_seismic_index_batched: corpus is empty; there is nothing to "
-            "stream");
+            std::string(who) + ": corpus is empty; there is nothing to stream");
     }
+}
 
-    // One writer for the whole file, windows serialized straight into it rather
-    // than spilled and concatenated: serialize() pads each array relative to
-    // the writer's current offset (see io/align.h), so bytes produced by a
-    // writer that started at 0 carry the wrong padding once appended at some
-    // other offset. Streaming through a single writer keeps pos() the true
-    // absolute offset.
-    FileIOWriter writer(const_cast<char*>(out_path.c_str()));
-    write_header(header, &writer);
-    write_prefix(&writer);
-
+// The posting-list section -- [count][list...], the layout
+// SeismicInvertedListsWriter produces -- streamed into `writer` one window at a
+// time, starting wherever the writer has reached.
+//
+// The writer is the one the whole file is being written through, rather than a
+// per-window one whose output is concatenated: serialize() pads each array
+// relative to the writer's current offset (see io/align.h), so bytes produced
+// by a writer that started at 0 carry the wrong padding once appended at some
+// other offset. Streaming through a single writer keeps pos() the true absolute
+// offset.
+void stream_clustered_lists(const SparseVectors* vectors,
+                            const SparseVectorsConfig& config,
+                            const SeismicClusterParameters& params,
+                            IOWriter* writer) {
     // The list count, exactly where SeismicInvertedListsWriter::serialize puts
     // it. It is the whole dimension, known before any window is built, which is
     // what lets the lists be streamed after it rather than counted first.
-    const size_t lists_offset = writer.pos();
     size_t n_lists = config.dimension;
-    writer.write(&n_lists, sizeof(size_t), 1);
+    writer->write(&n_lists, sizeof(size_t), 1);
 
     // Windows arrive in ascending term order, so appending each in turn
     // produces the same byte sequence as writing every list at once.
@@ -70,22 +73,55 @@ size_t write_seismic_index_batched(
                 // The layout carries no per-list offsets, so a gap or a repeat
                 // would silently shift every list after it.
                 throw std::runtime_error(
-                    "write_seismic_index_batched: windows arrived out of "
-                    "order");
+                    "stream_clustered_lists: windows arrived out of order");
             }
             for (const auto& list : clusters) {
-                list.serialize(&writer);
+                list.serialize(writer);
             }
             next_term = term_begin + clusters.size();
             // clusters freed on return, before the next window is built.
         });
     if (next_term != config.dimension) {
         throw std::runtime_error(
-            "write_seismic_index_batched: wrote " + std::to_string(next_term) +
+            "stream_clustered_lists: wrote " + std::to_string(next_term) +
             " of " + std::to_string(config.dimension) + " posting lists");
     }
+}
+
+}  // namespace
+
+size_t write_seismic_index_batched(
+    const SparseVectors* vectors, const SparseVectorsConfig& config,
+    const SeismicClusterParameters& params, const IndexHeader& header,
+    const std::function<void(IOWriter*)>& write_prefix,
+    const std::string& out_path) {
+    throw_if_not_streamable(vectors, out_path, "write_seismic_index_batched");
+
+    FileIOWriter writer(const_cast<char*>(out_path.c_str()));
+    write_header(header, &writer);
+    write_prefix(&writer);
+
+    const size_t lists_offset = writer.pos();
+    stream_clustered_lists(vectors, config, params, &writer);
     writer.close();
     return lists_offset;
+}
+
+std::vector<InvertedListClusters> spill_clustered_lists(
+    const SparseVectors* vectors, const SparseVectorsConfig& config,
+    const SeismicClusterParameters& params, const std::string& path,
+    MmapFile* into) {
+    throw_if_not_streamable(vectors, path, "spill_clustered_lists");
+    {
+        // Closed before the mapping is taken: the writer buffers, and what is
+        // not flushed is not in the file to map.
+        FileIOWriter writer(const_cast<char*>(path.c_str()));
+        stream_clustered_lists(vectors, config, params, &writer);
+        writer.close();
+    }
+    // Offset 0: a spill is the section and nothing else, with no header for it
+    // to sit behind.
+    return map_streamed_lists(path, /*lists_offset=*/0, into);
 }
 
 std::vector<InvertedListClusters> map_streamed_lists(const std::string& path,
