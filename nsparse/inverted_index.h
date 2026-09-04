@@ -34,6 +34,23 @@ public:
              const float* values) override;
     void build() override;
     size_t num_vectors() const override { return num_vectors_; }
+
+    // read_mcsr (the kMmap path) borrows vectors_ from the mapping without
+    // going through add(), which is otherwise the only thing besides build()
+    // that maintains num_vectors_. IDMapIndex::read_csr_and_ids cross-checks
+    // this count against the id file's as soon as the delegate's read_csr
+    // returns -- before build() runs -- so a mapped build reported 0 vectors
+    // and every id map was rejected. Sync it here, as DiskSeismicIndexBase
+    // does. (kInMemory routes through add(), which already set it, so
+    // re-reading get_vectors() is then a harmless no-op.)
+    void read_csr(const char* file_path,
+                  Residency residency = Residency::kInMemory) override {
+        MmapIndex::read_csr(file_path, residency);
+        const auto* vectors = get_vectors();
+        if (vectors != nullptr) {
+            num_vectors_ = vectors->num_vectors();
+        }
+    }
     std::array<char, 4> id() const override { return name; }
     static constexpr std::array<char, 4> name = {'I', 'N', 'V', 'T'};
     // Bump whenever write_index's payload layout changes.

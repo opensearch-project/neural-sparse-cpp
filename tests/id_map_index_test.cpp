@@ -565,6 +565,49 @@ TEST(IDMapReadCsrAndId, MatchesAddWithIdsBuildQuantized) {
     }
 }
 
+// read_csr_and_ids over an UNQUANTIZED, non-seismic delegate. InvertedIndex
+// overrides num_vectors() with a member that only add() and build() maintain,
+// so the mapped path -- which populates vectors_ without going through add() --
+// left it at 0 and read_csr_and_ids rejected every id map with a count
+// mismatch. The build is bit-exact to add_with_ids over the same corpus.
+TEST(IDMapReadCsrAndId, MatchesAddWithIdsBuildInverted) {
+    const Corpus corpus = make_corpus(300, kDim, /*seed=*/1);
+    const Corpus queries = make_corpus(20, kDim, /*seed=*/2);
+    const std::vector<idx_t> ids = make_external_ids(corpus.n);
+    constexpr int k = 10;
+
+    // Reference: add_with_ids() then build().
+    nsparse::IDMapIndex added(new nsparse::InvertedIndex(kDim));
+    added.add_with_ids(corpus.n, corpus.indptr.data(), corpus.indices.data(),
+                       corpus.values.data(), ids.data());
+    added.build();
+    const auto expected = search_corpus(added, queries, k);
+
+    // Under test: the same corpus borrowed from a mapped native CSR. Values
+    // stay float here, unlike the quantized case -- an inverted index reports
+    // the default 4-byte code_element_size and searches over floats.
+    nsparse::csr_test::TempCsrFiles csr("nsparse_idmap_inverted_src");
+    nsparse::csr_test::write_interchange_csr(csr.interchange(), corpus, kDim);
+    nsparse::csr_layout::convert(csr.interchange(), csr.native());
+    TempIdFile idfile("nsparse_idmap_inverted_src.ids");
+    nsparse::csr_test::write_id_map_file(idfile.path(), ids);
+
+    nsparse::IDMapIndex mapped(new nsparse::InvertedIndex(kDim));
+    mapped.read_csr_and_ids(csr.native().c_str(), idfile.path().c_str(),
+                            nsparse::Residency::kMmap);
+    // The count read_csr_and_ids checks the id file against, and what used to
+    // be 0 here.
+    ASSERT_EQ(mapped.num_vectors(), static_cast<size_t>(corpus.n));
+    mapped.build();
+    const auto got = search_corpus(mapped, queries, k);
+
+    EXPECT_EQ(got.first, expected.first) << "external-id labels differ";
+    ASSERT_EQ(got.second.size(), expected.second.size());
+    for (size_t i = 0; i < got.second.size(); ++i) {
+        EXPECT_FLOAT_EQ(got.second[i], expected.second[i]) << "score at " << i;
+    }
+}
+
 // The id map is row-aligned with the CSR, so a count that disagrees with the
 // delegate's vector count is rejected.
 TEST(IDMapReadCsrAndId, CountMismatchThrows) {
