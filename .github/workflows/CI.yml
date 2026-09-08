@@ -112,6 +112,53 @@ jobs:
         if: steps.detect-simd.outputs.opt_level != ''
         run: ctest --test-dir build --output-on-failure
 
+  # nsparse deserializes binary index files that may be truncated or corrupt, and
+  # the ~120 negative-path assertions only prove an exception was thrown -- not
+  # that no out-of-bounds read, overflow or misaligned access happened first. The
+  # jobs above build Release with no sanitizers, so nothing checks that today.
+  #
+  # UBSan carries as much weight as ASan here: overflow and misalignment are what
+  # binary parsing produces. RelWithDebInfo, because -O0 changes which code the
+  # optimizer would have folded away and the reports need line numbers.
+  #
+  # generic, and only generic: tests/CMakeLists.txt registers the per-ISA
+  # distance_kernel_equivalence_test binaries (and builds nsparse_avx2 /
+  # nsparse_avx512 to link them) at every NSPARSE_OPT_LEVEL, so this one job
+  # already runs the vectorized kernels -- where tail-element OOB would live --
+  # under ASan. A second SIMD-configured job would only re-cover them.
+  #
+  # Not in the container the other Linux jobs use: this needs the libasan/libubsan
+  # runtimes, which ubuntu-latest ships with gcc and the CI image does not
+  # promise.
+  Sanitize-nsparse-Linux:
+    name: ASan and UBSan nsparse on Linux
+    needs: check-files
+    if: needs.check-files.outputs.RUN_BUILD_AND_TEST == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DNSPARSE_ENABLE_TESTS=ON \
+            -DNSPARSE_OPT_LEVEL=generic \
+            -DNSPARSE_ENABLE_SANITIZERS=ON \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      # print_stacktrace turns a UBSan one-liner into something you can act on;
+      # without it the report names the source line but not the caller that
+      # reached it.
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:strict_string_checks=1:check_initialization_order=1:strict_init_order=1
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure
+
   Build-nsparse-Python-Linux:
     name: Build and Test nsparse Python bindings on Linux
     needs: check-files
@@ -260,7 +307,7 @@ jobs:
         run: ctest --test-dir build --build-config Release --output-on-failure
 
   check-results:
-    needs: [check-files, Build-nsparse-Linux, Build-nsparse-Python-Linux, Build-nsparse-MacOS, Build-nsparse-Windows]
+    needs: [check-files, Build-nsparse-Linux, Sanitize-nsparse-Linux, Build-nsparse-Python-Linux, Build-nsparse-MacOS, Build-nsparse-Windows]
     if: always()
     name: Check results
     runs-on: ubuntu-latest
@@ -268,5 +315,5 @@ jobs:
       - name: Fail if build or test failed
         if: |
           needs.check-files.outputs.RUN_BUILD_AND_TEST == 'true' &&
-          (needs.Build-nsparse-Linux.result == 'failure' || needs.Build-nsparse-Python-Linux.result == 'failure' || needs.Build-nsparse-MacOS.result == 'failure' || needs.Build-nsparse-Windows.result == 'failure')
+          (needs.Build-nsparse-Linux.result == 'failure' || needs.Sanitize-nsparse-Linux.result == 'failure' || needs.Build-nsparse-Python-Linux.result == 'failure' || needs.Build-nsparse-MacOS.result == 'failure' || needs.Build-nsparse-Windows.result == 'failure')
         run: exit 1

@@ -23,6 +23,10 @@ if(WIN32)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
+# Sanitizers, if requested. Included before any target exists so the flags reach
+# every one of them, third-party dependencies included.
+include(cmake/sanitizers.cmake)
+
 # Third party dependencies
 include(cmake/third_party.cmake)
 

@@ -9,6 +9,8 @@
     - [SIMD Optimization Levels](#simd-optimization-levels)
     - [GPU Acceleration](#gpu-acceleration)
   - [Run Tests](#run-tests)
+    - [Python integration tests](#python-integration-tests)
+    - [Sanitizers](#sanitizers)
   - [Run Benchmarks](#run-benchmarks)
   - [Python Bindings](#python-bindings)
     - [Build Python Bindings](#build-python-bindings)
@@ -98,6 +100,7 @@ cmake --build build -j
 | `NSPARSE_ENABLE_TESTS` | `OFF` | Build unit tests |
 | `NSPARSE_ENABLE_BENCHMARKS` | `OFF` | Build benchmarks |
 | `NSPARSE_ENABLE_GPU` | `OFF` | GPU-accelerate index building via cuSPARSE (see [GPU Acceleration](#gpu-acceleration)) |
+| `NSPARSE_ENABLE_SANITIZERS` | `OFF` | Build with ASan and UBSan (see [Sanitizers](#sanitizers)) |
 
 Example with multiple options:
 ```bash
@@ -211,6 +214,37 @@ schedule the lists in.
 `test_threading.py` runs each case under several `OMP_NUM_THREADS` values in
 subprocesses, which is required because the OpenMP runtime reads that variable
 when it initialises.
+
+### Sanitizers
+
+`NSPARSE_ENABLE_SANITIZERS=ON` instruments the whole build with AddressSanitizer
+and UndefinedBehaviorSanitizer. This matters most for the index-file readers: the
+negative-path tests assert that a truncated or corrupt file raises an exception,
+but only a sanitizer can tell you no out-of-bounds read, overflow or misaligned
+access happened on the way to that exception.
+
+```bash
+cmake -S . -B build -DNSPARSE_ENABLE_TESTS=ON -DNSPARSE_ENABLE_SANITIZERS=ON \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build -j
+UBSAN_OPTIONS=print_stacktrace=1 ctest --test-dir build --output-on-failure
+```
+
+GCC and Clang only; you need the matching runtimes (`libasan`/`libubsan`, part of
+`gcc` on Debian/Ubuntu, separate packages on Amazon Linux and RHEL). Findings
+abort the process rather than print and continue, so any one of them fails the
+test that hit it. `-DNSPARSE_SANITIZERS=<list>` overrides the default
+`address,undefined` for a different `-fsanitize` set, e.g. `thread`.
+
+Under GCC, the `null` check and the two nonnull-attribute checks are dropped:
+they make the address of a function template instantiation non-constant, which
+breaks abseil's `constexpr` hash-function dispatch in every translation unit that
+includes `flat_hash_map`. A null dereference still shows up, as an ASan SEGV
+report.
+
+This runs per-PR in CI at the `generic` optimization level. The per-ISA
+`distance_kernel_equivalence_test` binaries are built and run at every
+optimization level, so that one configuration also covers the SIMD kernels.
 
 ## Run Benchmarks
 
