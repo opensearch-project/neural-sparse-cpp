@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "nsparse/cluster/inverted_list_clusters.h"
@@ -116,6 +117,15 @@ protected:
     // cursor, validates it, and commits the mapping. Each concrete mmap_index
     // reads its own extra header first, then calls this.
     void load_mapped_payload(MmapCursor* cursor, MmapFile&& mapped);
+
+    // Maps a disk index file for querying. Every disk index is point-accessed
+    // (~k' small inline-forward blocks per query), so the mapping must use
+    // MADV_RANDOM. Concrete mmap_index() factories map through here so a new
+    // disk type cannot silently fall back to the scan/hugepage default.
+    static MmapFile map_index_file(const char* index_file) {
+        return MmapFile(std::string{index_file},
+                        MmapFile::AccessPattern::kPointLookup);
+    }
 
     // Borrowed from by score_summaries_transposed / the inline forward index, so
     // the concrete validate_mapped_payload can inspect their widths.

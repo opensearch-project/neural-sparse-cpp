@@ -24,6 +24,7 @@ set(NSPARSE_TEST_SRC
     inverted_lists_test.cpp
     kmeans_utils_test.cpp
     mmap_cursor_test.cpp
+    mmap_file_test.cpp
     mmap_index_test.cpp
     offset_width_test.cpp
     prefetch_test.cpp

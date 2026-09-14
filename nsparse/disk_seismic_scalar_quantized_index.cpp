@@ -143,7 +143,7 @@ DiskSeismicScalarQuantizedIndex* DiskSeismicScalarQuantizedIndex::mmap_index(
     auto index =
         std::make_unique<DiskSeismicScalarQuantizedIndex>(header.dimension);
 
-    MmapFile mmap_file(std::string{index_file});
+    MmapFile mmap_file = map_index_file(index_file);
     MmapCursor cursor(mmap_file.data(), mmap_file.size());
     cursor.skip(pos);
 

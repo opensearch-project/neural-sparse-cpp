@@ -49,8 +49,31 @@ namespace nsparse {
 // point their data structures directly into the returned bytes.
 class MmapFile {
 public:
+    // How the region is read, which picks the default madvise hint below.
+    // kScan expects broad reads over one forward index (MADV_HUGEPAGE, fewer
+    // TLB entries); kPointLookup expects scattered small reads (MADV_RANDOM, no
+    // readahead) -- what DiskSeismic's ~k' inline blocks per query need.
+    // NSPARSE_MMAP_ADVISE overrides this.
+    enum class AccessPattern { kScan, kPointLookup };
+
+    // The madvise mode for `access`, or `env` verbatim when it is non-null
+    // (NSPARSE_MMAP_ADVISE overrides the per-type default). Pure so the choice
+    // is unit-testable without a real mapping.
+    static std::string resolve_advise(AccessPattern access, const char* env) {
+        // An empty NSPARSE_MMAP_ADVISE (set but "") is treated as unset, so it
+        // does not silently override the per-type default with the "hugepage"
+        // fallback below.
+        if (env != nullptr && *env != '\0') {
+            return std::string(env);
+        }
+        return access == AccessPattern::kPointLookup ? "random" : "hugepage";
+    }
+
     MmapFile() = default;
-    explicit MmapFile(const std::string& path) { open(path); }
+    explicit MmapFile(const std::string& path,
+                      AccessPattern access = AccessPattern::kScan) {
+        open(path, access);
+    }
     ~MmapFile() { close(); }
 
     MmapFile(const MmapFile&) = delete;
@@ -67,7 +90,8 @@ public:
     const uint8_t* data() const { return data_; }
     size_t size() const { return size_; }
 
-    void open(const std::string& path) {
+    void open(const std::string& path,
+              AccessPattern access = AccessPattern::kScan) {
         close();
 #if defined(_WIN32)
         file_ = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
@@ -116,8 +140,11 @@ public:
             return;  // empty file: leave data_ null
         }
 
-        const char* advise = std::getenv("NSPARSE_MMAP_ADVISE");
-        std::string mode = (advise != nullptr) ? advise : "hugepage";
+        // NSPARSE_MMAP_ADVISE overrides everything; otherwise the access
+        // pattern picks the default: point lookups (DiskSeismic) suppress
+        // readahead (MADV_RANDOM), scans collapse to huge pages.
+        const std::string mode =
+            resolve_advise(access, std::getenv("NSPARSE_MMAP_ADVISE"));
 
         // "hugetlb": copy the file into an anonymous MAP_HUGETLB region so the
         // index data is backed by real, pre-reserved 2 MiB pages (vm.nr_hugepages
@@ -172,9 +199,9 @@ public:
         //   - MADV_HUGEPAGE lets the kernel back the region with 2 MiB pages,
         //     cutting TLB entries ~512x on the random-access dot-product path,
         //     at the cost of readahead the huge pages imply.
-        // Which wins is size-dependent, so the hint is selectable at runtime via
-        // NSPARSE_MMAP_ADVISE = "hugepage" | "random" | "normal" | "hugetlb"
-        // (default: hugepage, best for the large indexes this class targets).
+        // Which wins depends on the access pattern (see AccessPattern), so the
+        // default is per index type; NSPARSE_MMAP_ADVISE overrides it with
+        // "hugepage" | "random" | "normal" | "hugetlb".
         if (mode == "random") {
             ::madvise(addr, size_, MADV_RANDOM);
         } else if (mode == "normal") {

@@ -53,7 +53,7 @@ DiskSeismicIndex* DiskSeismicIndex::mmap_index(const IndexHeader& header,
     throw_if_null(index_file, "index_file must not be null");
     auto index = std::make_unique<DiskSeismicIndex>(header.dimension);
 
-    MmapFile mmap_file(std::string{index_file});
+    MmapFile mmap_file = map_index_file(index_file);
     MmapCursor cursor(mmap_file.data(), mmap_file.size());
     cursor.skip(pos);
 
