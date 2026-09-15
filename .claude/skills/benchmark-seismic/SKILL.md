@@ -182,12 +182,13 @@ recall = np.mean([len(set(map(int, results[i])) & set(map(int, correct[i])))
 
 ## Gotchas that have invalidated real runs
 
-- **The serialized `.dat` header carries no format version** — `write_header` writes only fourcc and
-  dimension. A new binary reading an old file throws `std::length_error` (loud), but an **old binary
-  reading a new file silently loads a garbage index** with the correct `num_vectors` and wrong
-  results. Any change to on-disk layout (e.g. the alignment padding in `nsparse/io/align.h`)
-  invalidates every cached `.dat`. Regenerate them whenever the tree changes, and distrust a
-  suspiciously large speedup — one apparent 100× win was a binary misparsing a stale file.
+- **A cached `.dat` is only as safe as its format version.** The header carries a per-index-type
+  version (`kFormatVersion`, checked by `read_index`), so a file from a layout this binary does not
+  know fails loudly — but only if the layout change also bumped the version. A layout change shipped
+  without a bump (e.g. to the alignment padding in `nsparse/io/align.h`) still **silently loads a
+  garbage index** with the correct `num_vectors` and wrong results. Regenerate cached `.dat` files
+  whenever the on-disk layout changes, and distrust a suspiciously large speedup — one apparent 100×
+  win was a binary misparsing a stale file.
 - **mmap requires the unquantized write path.** `seismic_sq` is not mmap-able, so enabling
   `kUseMmap` means writing plain `seismic` and losing 8-bit quantization — the index file roughly
   doubles. Do not attribute a latency change to residency when quantization moved with it.

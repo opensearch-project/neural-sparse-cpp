@@ -70,7 +70,8 @@ larger on disk but only its summaries stay resident) to expose the disk benefit.
 
 - **`base_small` is a smoke test, not a benchmark** — it fits in cache, so the
   memory-bound behavior that is the whole point disappears. Only report `base_full`.
-- Regenerate the `.dat` files whenever the source tree changes; the serialized format
-  carries no version and an old binary silently misreads a new file.
+- Regenerate the `.dat` files whenever the on-disk layout changes. The header carries a
+  per-type format version, so a mismatch is caught only if the change bumped
+  `kFormatVersion`; one that did not is misread silently.
 - Query threads are pinned to 1 (`OMP_NUM_THREADS=1`) — per-query cost is the metric
   and the workload is bandwidth-bound.
