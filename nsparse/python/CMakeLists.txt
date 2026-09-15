@@ -17,6 +17,20 @@ find_package(Python REQUIRED
   COMPONENTS Interpreter Development.Module NumPy
 )
 
+# The extension must be compiled against numpy 2.x headers. NumPy's C API is
+# backward compatible in that direction only: a module built against 2.x loads
+# on 1.26+ and 2.x (see NPY_TARGET_VERSION in swignsparse.swig), whereas one
+# built against 1.x refuses to import under 2.x. pyproject.toml's open-ended
+# numpy requirement relies on this, so enforce it here rather than trusting
+# requirements.txt to have been read.
+if(Python_NumPy_VERSION VERSION_LESS 2.0)
+  message(FATAL_ERROR
+    "nsparse Python bindings must be built against numpy>=2.0 headers; found "
+    "numpy ${Python_NumPy_VERSION} at ${Python_NumPy_INCLUDE_DIRS}. Install a "
+    "newer numpy for ${Python_EXECUTABLE} (pip install -r "
+    "nsparse/python/requirements.txt) and reconfigure.")
+endif()
+
 find_package(SWIG REQUIRED COMPONENTS python)
 include(${SWIG_USE_FILE})
 

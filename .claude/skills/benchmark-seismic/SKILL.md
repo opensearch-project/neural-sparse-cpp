@@ -157,9 +157,9 @@ OMP_NUM_THREADS=1 python demos/seismic_mmap.py \
   --reuse-index --keep
 ```
 
-Needs `numpy>=2.1` installed *over* the nsparse package: `pyproject.toml` pins `numpy<2.0`, which on
-Python 3.13+ resolves to a numpy older than the interpreter and silently corrupts arrays (`a - b`
-overwrites `a`) while every check still passes. Pin Python 3.12 or force the newer numpy.
+Install the bindings with `pip install build/nsparse/python`. They are built against numpy 2.x
+headers (`nsparse/python/CMakeLists.txt` enforces it) and run on numpy 1.26+ and 2.x alike, so no
+numpy override or interpreter pin is needed.
 
 ### Peak build memory — `disk_build_mem_bench`
 
