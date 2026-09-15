@@ -24,27 +24,24 @@ def supported_instruction_sets():
     """
 
     def is_sve_supported():
-        if platform.machine() != "aarch64":
+        # AT_HWCAP (16) from the kernel; HWCAP_SVE is bit 22 on aarch64.
+        if platform.machine() != "aarch64" or platform.system() != "Linux":
             return False
-        if platform.system() != "Linux":
-            return False
-        import numpy
+        import ctypes
 
-        if Version(numpy.__version__) >= Version("2.0"):
-            return False
-        try:
-            import numpy.distutils.cpuinfo
-
-            return (
-                "sve" in numpy.distutils.cpuinfo.cpu.info[0].get("Features", "").split()
-            )
-        except ImportError:
-            return bool(__import__("ctypes").CDLL(None).getauxval(16) & (1 << 22))
+        getauxval = ctypes.CDLL(None).getauxval
+        getauxval.restype = ctypes.c_ulong
+        getauxval.argtypes = [ctypes.c_ulong]
+        return bool(getauxval(16) & (1 << 22))
 
     import numpy
 
     if Version(numpy.__version__) >= Version("1.19"):
-        from numpy._core._multiarray_umath import __cpu_features__
+        try:
+            # numpy 2.x, and the shim numpy 1.26.1+ ships
+            from numpy._core._multiarray_umath import __cpu_features__
+        except ImportError:  # numpy 1.x up to 1.26.0
+            from numpy.core._multiarray_umath import __cpu_features__
 
         supported = {k for k, v in __cpu_features__.items() if v}
         if is_sve_supported():

@@ -11,12 +11,8 @@
 
 %{
 #define SWIG_FILE_WITH_INIT
-// Oldest numpy the built module loads on. Compiled against numpy 2.x headers
-// (CMakeLists.txt enforces this), the module runs on any numpy from this C-API
-// level up, 1.x and 2.x alike; numpy's import_array() rejects an older runtime
-// with a clear error rather than misbehaving. 1.25 is the C-API level numpy
-// 1.26 ships, matching the floor in pyproject.toml. Without this the floor
-// would silently follow whichever numpy 2.x happened to provide the headers.
+// Pin the C-API floor (the 1.25/1.26 level) rather than inherit whatever the
+// numpy 2.x providing the headers defaults to. The package floor is pyproject's.
 #define NPY_TARGET_VERSION NPY_1_25_API_VERSION
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 #include <new>

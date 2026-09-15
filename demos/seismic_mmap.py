@@ -35,9 +35,6 @@ the bindings do not hand out the raw CSR pointers.
 Usage:
     python demos/seismic_mmap.py <data.csr> <queries.csr> [options]
 
-Runs on whatever numpy the nsparse package is installed with, 1.26+ or 2.x: the
-extension is built against numpy 2.x headers and loads on either.
-
 Exits non-zero if any check fails.
 """
 

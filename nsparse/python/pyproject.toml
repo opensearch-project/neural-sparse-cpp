@@ -7,10 +7,6 @@ name = "nsparse"
 version = "0.1.0"
 description = "Python bindings for NSPARSE sparse vector search library"
 requires-python = ">=3.9"
-# No upper bound on numpy: the extension is compiled against numpy 2.x headers
-# (requirements.txt; enforced in CMakeLists.txt), and a module built that way
-# loads on numpy 1.26+ and 2.x alike. 1.26 is the floor because loader.py
-# imports numpy._core, which older 1.x releases do not provide.
 dependencies = ["numpy>=1.26", "packaging"]
 license = "MIT"
 

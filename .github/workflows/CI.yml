@@ -167,8 +167,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.13 has no numpy 1.x wheel, which is what used to make the numpy<2.0
-        # pin resolve to a source build older than the interpreter.
         python-version: ['3.12', '3.13']
     steps:
       - name: Checkout
@@ -185,10 +183,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # The extension is compiled against the numpy installed here, which must be
-      # 2.x (nsparse/python/requirements.txt; CMake refuses otherwise): a module
-      # built against 2.x headers loads on numpy 1.26+ and 2.x alike, whereas one
-      # built against 1.x cannot import under numpy 2.
       - name: Install build dependencies
         run: python -m pip install --upgrade pip -r nsparse/python/requirements.txt packaging setuptools wheel pytest
 
@@ -203,13 +197,10 @@ jobs:
       - name: Build
         run: cmake --build build -j$(nproc)
 
-      # --no-deps keeps the numpy installed above, so the first test run below
-      # uses the very numpy the extension was compiled against; the 1.x run then
-      # swaps it deliberately.
       - name: Install the built package
         run: |
           cd build/nsparse/python
-          python -m pip install --no-deps .
+          python -m pip install .
 
       - name: Import check
         run: python -c "import nsparse; print(nsparse.index_factory)"
@@ -221,14 +212,11 @@ jobs:
       - name: Run Python tests
         run: python -m pytest python_tests -v -rX
 
-      # A module built against numpy 2.x headers must keep loading and passing on
-      # the newest 1.x, the floor pyproject.toml declares. Only the 3.12 leg can
-      # exercise this: 3.13 has no numpy 1.x wheel.
-      - name: Run Python tests on numpy 1.x
+      # The floor pyproject.toml declares, exactly. 3.13 has no numpy 1.x wheel.
+      - name: Run Python tests on the numpy floor
         if: matrix.python-version == '3.12'
         run: |
-          python -m pip install "numpy<2.0"
-          python -c "import numpy; print('numpy', numpy.__version__)"
+          python -m pip install "numpy==1.26.0"
           python -m pytest python_tests -v -rX
 
   Build-nsparse-MacOS:

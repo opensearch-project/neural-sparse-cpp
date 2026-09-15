@@ -10,11 +10,6 @@
 Everything here goes through the installed extension module and the SWIG
 surface only. One harness guard runs before any test, because its failure mode
 is silent: a shadowed import gives an incomplete module rather than an error.
-
-No numpy guard is needed: the extension is built against numpy 2.x headers
-(nsparse/python/CMakeLists.txt enforces it) and loads on numpy 1.26+ and 2.x
-alike, while numpy's own import_array() refuses an incompatible runtime at
-import time instead of misbehaving.
 """
 
 import os
@@ -52,7 +47,7 @@ def pytest_configure(config):
     ):
         raise pytest.UsageError(
             f"nsparse resolved to an incomplete module ({nsparse.__file__!r}). "
-            "Install the built extension: pip install --no-deps "
+            "Install the built extension: pip install "
             "build/nsparse/python"
         )
 

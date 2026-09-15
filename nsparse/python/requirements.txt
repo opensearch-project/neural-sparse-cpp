@@ -1,5 +1,2 @@
-# Build-time requirement for the SWIG extension: compile against numpy 2.x
-# headers so the built module loads on numpy 1.26+ and 2.x alike (a module
-# built against 1.x headers cannot import under numpy 2). The runtime bound
-# lives in pyproject.toml.
+# Build-time headers only; the runtime bound is in pyproject.toml.
 numpy>=2.0

@@ -157,9 +157,7 @@ OMP_NUM_THREADS=1 python demos/seismic_mmap.py \
   --reuse-index --keep
 ```
 
-Install the bindings with `pip install build/nsparse/python`. They are built against numpy 2.x
-headers (`nsparse/python/CMakeLists.txt` enforces it) and run on numpy 1.26+ and 2.x alike, so no
-numpy override or interpreter pin is needed.
+Install the bindings with `pip install build/nsparse/python`; any numpy 1.26+ or 2.x works.
 
 ### Peak build memory — `disk_build_mem_bench`
 
