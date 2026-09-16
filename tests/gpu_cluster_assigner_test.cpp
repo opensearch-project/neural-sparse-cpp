@@ -473,5 +473,50 @@ TEST(GpuClusterAssignerTest, SummarizeListMaxpool8BitMatchesCpu) {
     }
 }
 
+// Regression for the int64 accumulator. With a large vocabulary a single doc
+// can overlap a centroid in enough max-value terms that the true int64 dot
+// exceeds INT32_MAX (255*255*overlap): an int32 accumulator wraps -- here the
+// larger score wraps negative -- and the argmax picks the wrong cluster, while
+// int64 matches the CPU reference. dim=40000 with a ~34000-term all-255 row is
+// what crosses the limit (34000*65025 = 2.21e9 > INT32_MAX).
+TEST(GpuClusterAssignerTest, Assign8BitInt64AccumulatorNoOverflow) {
+    if (!GpuClusterAssigner::available()) {
+        GTEST_SKIP() << "No CUDA-capable GPU available";
+    }
+    constexpr size_t kDim = 40000;
+    constexpr term_t kWide = 34000;    // 34000 * 255*255 = 2.21e9 > INT32_MAX
+    constexpr term_t kNarrow = 100;
+
+    SparseVectors vectors({.element_size = U8, .dimension = kDim});
+    auto add_row = [&](term_t hi) {  // terms [0, hi) all at code 255
+        std::vector<term_t> terms;
+        std::vector<uint8_t> codes;
+        for (term_t t = 0; t < hi; ++t) {
+            terms.push_back(t);
+            codes.push_back(255);
+        }
+        vectors.add_vector(terms.data(), terms.size(), codes.data(),
+                           codes.size());
+    };
+    add_row(kWide);    // doc 0: centroid A -- wide overlap with doc 2
+    add_row(kNarrow);  // doc 1: centroid B -- narrow overlap with doc 2
+    add_row(kWide);    // doc 2: assigned; true argmax is A, but B under int32
+
+    std::vector<idx_t> docs = {0, 1, 2};
+    auto expected =
+        cpu_reference_assign_u8(&vectors, docs, seed_clusters(docs, 2));
+    auto actual = seed_clusters(docs, 2);
+    GpuClusterAssigner::instance().assign(&vectors, docs, actual);
+
+    ASSERT_EQ(actual.size(), expected.size());
+    for (size_t j = 0; j < expected.size(); ++j) {
+        EXPECT_EQ(actual[j], expected[j]) << "cluster " << j << " differs";
+    }
+    // The int64 dot puts doc 2 with centroid A (cluster 0); an int32 sum would
+    // wrap A's score negative and mis-assign doc 2 to cluster 1.
+    EXPECT_EQ(actual[0], (std::vector<idx_t>{0, 2}));
+    EXPECT_EQ(actual[1], (std::vector<idx_t>{1}));
+}
+
 }  // namespace
 }  // namespace nsparse::detail
