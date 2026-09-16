@@ -169,11 +169,14 @@ void map_docs_to_clusters(const SparseVectors* vectors,
         return;
     }
 #ifdef NSPARSE_WITH_GPU
-    // GPU assignment (cuSPARSE) for float (U32) weights. It matches the CPU
-    // path below (skips centroids, ties to the lowest cluster index); on any
-    // failure we fall through to CPU. No AVX-512 exclusion is needed: there is
-    // now a single CPU path and it skips centroids like the GPU one.
-    if (vectors->get_element_size() == U32 &&
+    // GPU assignment (cuSPARSE) for float (U32) or 8-bit (U8) weights. It
+    // matches the CPU path below (skips centroids, ties to the lowest cluster
+    // index); on any failure we fall through to CPU. 8-bit uses int32
+    // accumulation on the GPU, which is exact for byte-sized products and so
+    // yields the same argmax as the CPU int64 path. 16-bit (U16) is not
+    // offloaded: its products need int64, which the GPU path does not do.
+    const auto gpu_element_size = vectors->get_element_size();
+    if ((gpu_element_size == U32 || gpu_element_size == U8) &&
         should_offload_assignment_to_gpu(docs.size(), clusters.size())) {
         try {
             GpuClusterAssigner::instance().assign(vectors, docs, clusters);

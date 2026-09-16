@@ -235,7 +235,8 @@ TEST(GpuClusterAssignerTest, SummarizeListMaxpoolMatchesCpu) {
             EXPECT_FLOAT_EQ(gc.values[order[i]], exp_vals[i])
                 << "cluster " << b << " value " << i;
         }
-        EXPECT_NEAR(gc.sum, exp_sum, exp_sum * 1e-5F + 1e-5F) << "cluster " << b;
+        EXPECT_NEAR(gc.sum, exp_sum, exp_sum * 1e-5F + 1e-5F)
+            << "cluster " << b;
     }
 }
 
@@ -272,6 +273,203 @@ TEST(GpuClusterAssignerTest, SummarizeListMaxpoolReuseIsClean) {
         cpu_reference_maxpool(&vectors, cluster, et, ev, es);
         EXPECT_EQ(out2[b].terms.size(), et.size()) << "cluster " << b;
         EXPECT_NEAR(out2[b].sum, es, es * 1e-5F + 1e-5F) << "cluster " << b;
+    }
+}
+
+// ---- 8-bit (scalar-quantized) parity ----
+
+// A corpus of unsigned 8-bit codes (element_size U8). Codes span [1, 255],
+// including values > 127, so the GPU path is exercised on codes that a signed
+// int8 read would misinterpret.
+SparseVectors make_random_corpus_u8(size_t n_docs, size_t dim,
+                                    size_t nnz_per_doc, unsigned seed) {
+    SparseVectors vectors({.element_size = U8, .dimension = dim});
+    std::mt19937 gen(seed);
+    std::uniform_int_distribution<int> term_dist(0, static_cast<int>(dim - 1));
+    std::uniform_int_distribution<int> code_dist(1, 255);
+    for (size_t d = 0; d < n_docs; ++d) {
+        std::vector<term_t> chosen;
+        for (size_t k = 0; k < nnz_per_doc; ++k) {
+            chosen.push_back(static_cast<term_t>(term_dist(gen)));
+        }
+        std::ranges::sort(chosen);
+        chosen.erase(std::unique(chosen.begin(), chosen.end()), chosen.end());
+        std::vector<term_t> terms;
+        std::vector<uint8_t> codes;
+        for (term_t t : chosen) {
+            terms.push_back(t);
+            codes.push_back(static_cast<uint8_t>(code_dist(gen)));
+        }
+        vectors.add_vector(terms.data(), terms.size(), codes.data(),
+                           codes.size());
+    }
+    return vectors;
+}
+
+// CPU reference for 8-bit assignment: int64 dot of unsigned codes (exact),
+// strict-greater argmax, centroids skipped -- mirrors the CPU int64 path the
+// GPU uint8 kernel must reproduce.
+std::vector<std::vector<idx_t>> cpu_reference_assign_u8(
+    const SparseVectors* vectors, const std::vector<idx_t>& docs,
+    std::vector<std::vector<idx_t>> clusters) {
+    const offset_t* indptr = vectors->indptr_data();
+    const term_t* indices = vectors->indices_data();
+    const uint8_t* values = vectors->values_data();
+    const size_t n_clusters = clusters.size();
+    for (size_t i = 0; i < docs.size(); ++i) {
+        const auto dense = vectors->get_dense_vector(docs[i]);
+        int64_t best = std::numeric_limits<int64_t>::lowest();
+        size_t best_j = 0;
+        bool is_centroid = false;
+        for (size_t j = 0; j < n_clusters; ++j) {
+            const idx_t c = clusters[j].front();
+            if (docs[i] == c) {
+                is_centroid = true;
+                break;
+            }
+            const offset_t start = indptr[c];
+            const size_t len = indptr[c + 1] - start;
+            int64_t score = 0;
+            for (size_t t = 0; t < len; ++t) {
+                score += static_cast<int64_t>(dense[indices[start + t]]) *
+                         static_cast<int64_t>(values[start + t]);
+            }
+            if (score > best) {
+                best = score;
+                best_j = j;
+            }
+        }
+        if (!is_centroid) {
+            clusters[best_j].push_back(docs[i]);
+        }
+    }
+    return clusters;
+}
+
+TEST(GpuClusterAssignerTest, MatchesCpuReference8Bit) {
+    if (!GpuClusterAssigner::available()) {
+        GTEST_SKIP() << "No CUDA-capable GPU available";
+    }
+    constexpr size_t kNumDocs = 6000;
+    constexpr size_t kDim = 2000;
+    constexpr size_t kNnz = 40;
+    constexpr size_t kNumClusters = 32;
+
+    SparseVectors vectors = make_random_corpus_u8(kNumDocs, kDim, kNnz, 1234);
+    std::vector<idx_t> docs(kNumDocs);
+    std::iota(docs.begin(), docs.end(), 0);
+
+    auto expected = cpu_reference_assign_u8(&vectors, docs,
+                                            seed_clusters(docs, kNumClusters));
+    auto actual = seed_clusters(docs, kNumClusters);
+    GpuClusterAssigner::instance().assign(&vectors, docs, actual);
+
+    ASSERT_EQ(actual.size(), expected.size());
+    for (size_t j = 0; j < expected.size(); ++j) {
+        EXPECT_EQ(actual[j], expected[j]) << "cluster " << j << " differs";
+    }
+}
+
+TEST(GpuClusterAssignerTest, AutoPathViaMapDocsMatchesReference8Bit) {
+    if (!GpuClusterAssigner::available()) {
+        GTEST_SKIP() << "No CUDA-capable GPU available";
+    }
+    constexpr size_t kNumDocs = 5000;
+    constexpr size_t kDim = 1500;
+    constexpr size_t kNnz = 30;
+    constexpr size_t kNumClusters = 16;
+
+    SparseVectors vectors = make_random_corpus_u8(kNumDocs, kDim, kNnz, 99);
+    std::vector<idx_t> docs(kNumDocs);
+    std::iota(docs.begin(), docs.end(), 0);
+
+    auto expected = cpu_reference_assign_u8(&vectors, docs,
+                                            seed_clusters(docs, kNumClusters));
+    auto actual = seed_clusters(docs, kNumClusters);
+    map_docs_to_clusters(&vectors, docs, actual);  // routes to GPU (U8)
+
+    ASSERT_EQ(actual.size(), expected.size());
+    for (size_t j = 0; j < expected.size(); ++j) {
+        EXPECT_EQ(actual[j], expected[j]) << "cluster " << j << " differs";
+    }
+}
+
+// CPU reference for the 8-bit max-pool: per-term max of unsigned codes (as
+// float, exact for 0..255), plus the sum of maxes, terms ascending.
+void cpu_reference_maxpool_u8(const SparseVectors* vectors,
+                             const std::vector<idx_t>& doc_ids,
+                             std::vector<term_t>& terms,
+                             std::vector<float>& values, float& sum) {
+    const offset_t* indptr = vectors->indptr_data();
+    const term_t* indices = vectors->indices_data();
+    const uint8_t* vals = vectors->values_data();
+    std::map<term_t, uint8_t> m;
+    for (idx_t d : doc_ids) {
+        for (offset_t j = indptr[d]; j < indptr[d + 1]; ++j) {
+            auto& v = m[indices[j]];
+            v = std::max(v, vals[j]);
+        }
+    }
+    sum = 0.0F;
+    terms.clear();
+    values.clear();
+    for (auto& [t, v] : m) {
+        terms.push_back(t);
+        values.push_back(static_cast<float>(v));
+        sum += static_cast<float>(v);
+    }
+}
+
+TEST(GpuClusterAssignerTest, SummarizeListMaxpool8BitMatchesCpu) {
+    if (!GpuSummarizer::available()) {
+        GTEST_SKIP() << "No CUDA-capable GPU available";
+    }
+    constexpr size_t kNumDocs = 8000;
+    constexpr size_t kDim = 3000;
+    constexpr size_t kNnz = 50;
+    SparseVectors vectors = make_random_corpus_u8(kNumDocs, kDim, kNnz, 7);
+
+    std::vector<idx_t> flat_docs;
+    std::vector<idx_t> offsets = {0};
+    const std::vector<size_t> sizes = {5, 137, 1, 900, 42, 2000};
+    idx_t d = 0;
+    for (size_t sz : sizes) {
+        for (size_t k = 0; k < sz && d < static_cast<idx_t>(kNumDocs); ++k) {
+            flat_docs.push_back(d++);
+        }
+        offsets.push_back(static_cast<idx_t>(flat_docs.size()));
+    }
+    const size_t n_clusters = offsets.size() - 1;
+
+    std::vector<GpuSummarizer::ClusterSummary> gpu_out;
+    ASSERT_TRUE(GpuSummarizer::instance().summarize_list(
+        &vectors, flat_docs.data(), offsets.data(), n_clusters, gpu_out));
+    ASSERT_EQ(gpu_out.size(), n_clusters);
+
+    for (size_t b = 0; b < n_clusters; ++b) {
+        std::vector<idx_t> cluster(flat_docs.begin() + offsets[b],
+                                   flat_docs.begin() + offsets[b + 1]);
+        std::vector<term_t> exp_terms;
+        std::vector<float> exp_vals;
+        float exp_sum = 0.0F;
+        cpu_reference_maxpool_u8(&vectors, cluster, exp_terms, exp_vals,
+                                 exp_sum);
+
+        const auto& gc = gpu_out[b];
+        std::vector<size_t> order(gc.terms.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::ranges::sort(order, [&](size_t a, size_t c) {
+            return gc.terms[a] < gc.terms[c];
+        });
+        ASSERT_EQ(gc.terms.size(), exp_terms.size()) << "cluster " << b;
+        for (size_t i = 0; i < order.size(); ++i) {
+            EXPECT_EQ(gc.terms[order[i]], exp_terms[i])
+                << "cluster " << b << " term " << i;
+            EXPECT_FLOAT_EQ(gc.values[order[i]], exp_vals[i])
+                << "cluster " << b << " value " << i;
+        }
+        EXPECT_NEAR(gc.sum, exp_sum, exp_sum * 1e-5F + 1e-5F)
+            << "cluster " << b;
     }
 }
 

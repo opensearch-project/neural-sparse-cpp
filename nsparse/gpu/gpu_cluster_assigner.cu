@@ -27,15 +27,18 @@ namespace {
 
 // One thread per document row: argmax over the row's n_clusters scores, ties
 // broken to the lowest cluster index (strict-greater) to match the CPU path.
-__global__ void row_argmax_kernel(const float* __restrict__ scores, int n_rows,
+// TScore is float for the unquantized path, int32_t for the 8-bit path (whose
+// products are exact in int32); the argmax is identical either way.
+template <class TScore>
+__global__ void row_argmax_kernel(const TScore* __restrict__ scores, int n_rows,
                                   int n_clusters,
                                   int32_t* __restrict__ best_cluster) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n_rows) {
         return;
     }
-    const float* row_scores = scores + static_cast<size_t>(row) * n_clusters;
-    float best = row_scores[0];
+    const TScore* row_scores = scores + static_cast<size_t>(row) * n_clusters;
+    TScore best = row_scores[0];
     int best_j = 0;
     for (int j = 1; j < n_clusters; ++j) {
         if (row_scores[j] > best) {
@@ -48,13 +51,15 @@ __global__ void row_argmax_kernel(const float* __restrict__ scores, int n_rows,
 
 // Gather the CSR of the document sub-matrix A from the resident corpus, so the
 // bulk doc data never re-crosses PCIe per list. One thread per output row.
+// TVal is the corpus value width (float or int8_t).
+template <class TVal>
 __global__ void gather_csr_kernel(const int32_t* __restrict__ corpus_indptr,
                                   const int32_t* __restrict__ corpus_indices,
-                                  const float* __restrict__ corpus_values,
+                                  const TVal* __restrict__ corpus_values,
                                   const int32_t* __restrict__ docs, int n_docs,
                                   const int32_t* __restrict__ a_row_ptr,
                                   int32_t* __restrict__ a_col,
-                                  float* __restrict__ a_val) {
+                                  TVal* __restrict__ a_val) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n_docs) {
         return;
@@ -71,13 +76,14 @@ __global__ void gather_csr_kernel(const int32_t* __restrict__ corpus_indptr,
 
 // Scatter centroid rows into the dense B matrix (dim x n_clusters, row-major,
 // ldb = n_clusters). One thread per centroid; each owns a disjoint column, so
-// no races. B must be zeroed first.
+// no races. B must be zeroed first. TVal is the corpus value width.
+template <class TVal>
 __global__ void scatter_dense_kernel(const int32_t* __restrict__ corpus_indptr,
                                      const int32_t* __restrict__ corpus_indices,
-                                     const float* __restrict__ corpus_values,
+                                     const TVal* __restrict__ corpus_values,
                                      const int32_t* __restrict__ centroids,
                                      int n_clusters, int ldb,
-                                     float* __restrict__ b) {
+                                     TVal* __restrict__ b) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n_clusters) {
         return;
@@ -88,6 +94,38 @@ __global__ void scatter_dense_kernel(const int32_t* __restrict__ corpus_indptr,
     for (int32_t t = 0; t < len; ++t) {
         const int32_t col = corpus_indices[src + t];
         b[static_cast<size_t>(col) * ldb + j] = corpus_values[src + t];
+    }
+}
+
+// int32 SpMM for 8-bit codes: C[row][j] = sum over doc row's corpus nonzeros of
+// code * B[col][j], read straight from the resident corpus (no CSR gather).
+// Used instead of cuSPARSE: its int8 SpMM is SIGNED and would misread the
+// unsigned [0,255] codes, and it offers no unsigned-int8 path. int32
+// accumulation is exact for byte-sized products, so the argmax matches the CPU
+// int64 reference. One block per doc row; threads stripe over the clusters.
+__global__ void assign_u8_spmm_kernel(
+    const int32_t* __restrict__ corpus_indptr,
+    const int32_t* __restrict__ corpus_indices,
+    const uint8_t* __restrict__ corpus_values,
+    const int32_t* __restrict__ docs, int n_docs,
+    const uint8_t* __restrict__ b, int n_clusters, int ldb,
+    int32_t* __restrict__ c) {
+    const int row = blockIdx.x;
+    if (row >= n_docs) {
+        return;
+    }
+    const int32_t d = docs[row];
+    const int32_t start = corpus_indptr[d];
+    const int32_t end = corpus_indptr[d + 1];
+    int32_t* c_row = c + static_cast<size_t>(row) * n_clusters;
+    for (int j = threadIdx.x; j < n_clusters; j += blockDim.x) {
+        int32_t acc = 0;
+        for (int32_t p = start; p < end; ++p) {
+            const int32_t col = corpus_indices[p];
+            acc += static_cast<int32_t>(corpus_values[p]) *
+                   static_cast<int32_t>(b[static_cast<size_t>(col) * ldb + j]);
+        }
+        c_row[j] = acc;
     }
 }
 
@@ -103,9 +141,10 @@ struct ThreadCtx {
     int32_t* d_centroids = nullptr;  size_t cent_cap = 0;
     int32_t* d_a_row_ptr = nullptr;  size_t rowptr_cap = 0;
     int32_t* d_a_col = nullptr;      size_t col_cap = 0;
-    float* d_a_val = nullptr;        size_t val_cap = 0;
-    float* d_b = nullptr;            size_t b_cap = 0;
-    float* d_c = nullptr;            size_t c_cap = 0;
+    // Value/dense/output scratch are byte-sized (float or int8/int32 per path).
+    void* d_a_val = nullptr;         size_t val_cap = 0;
+    void* d_b = nullptr;             size_t b_cap = 0;
+    void* d_c = nullptr;             size_t c_cap = 0;
     int32_t* d_best = nullptr;       size_t best_cap = 0;
     void* d_spmm = nullptr;          size_t spmm_cap = 0;
 
@@ -162,6 +201,120 @@ struct DnMatGuard {
     }
 };
 
+// cuSPARSE SpMM core for the unquantized (float) path: build dense B and CSR A,
+// run C = A * B, and argmax each row into ctx.d_best (copied to h_best).
+// Templated so the types are explicit, but instantiated only as <float,float>;
+// 8-bit codes cannot use cuSPARSE (its int8 SpMM is signed) and go through
+// assign_u8 instead. The d_docs, d_centroids and d_a_row_ptr scratch are
+// uploaded by the caller.
+template <class TVal, class TScore>
+void assign_spmm(const DeviceCorpus& corpus, ThreadCtx& ctx, int n_docs,
+                 int n_clusters, int dim, int64_t nnz_a,
+                 cudaDataType_t val_type, cudaDataType_t compute_type,
+                 std::vector<int32_t>& h_best) {
+    cudaStream_t stream = ctx.stream;
+    constexpr int kBlock = 256;
+
+    // Dense B (dim x n_clusters, row-major) from centroid rows.
+    const size_t b_bytes = static_cast<size_t>(dim) * n_clusters * sizeof(TVal);
+    ensure_capacity(reinterpret_cast<char**>(&ctx.d_b), ctx.b_cap, b_bytes);
+    NSPARSE_CUDA_CHECK(cudaMemsetAsync(ctx.d_b, 0, b_bytes, stream));
+    const int cent_grid = (n_clusters + kBlock - 1) / kBlock;
+    scatter_dense_kernel<TVal><<<cent_grid, kBlock, 0, stream>>>(
+        corpus.indptr, corpus.indices,
+        static_cast<const TVal*>(corpus.values), ctx.d_centroids, n_clusters,
+        n_clusters, static_cast<TVal*>(ctx.d_b));
+    NSPARSE_CUDA_CHECK(cudaGetLastError());
+
+    // CSR A gathered from the resident corpus, then C = A * B.
+    ensure_capacity(reinterpret_cast<char**>(&ctx.d_a_val), ctx.val_cap,
+                    static_cast<size_t>(nnz_a) * sizeof(TVal));
+    ensure_capacity(reinterpret_cast<char**>(&ctx.d_c), ctx.c_cap,
+                    static_cast<size_t>(n_docs) * n_clusters * sizeof(TScore));
+    const int docs_grid = (n_docs + kBlock - 1) / kBlock;
+    gather_csr_kernel<TVal><<<docs_grid, kBlock, 0, stream>>>(
+        corpus.indptr, corpus.indices,
+        static_cast<const TVal*>(corpus.values), ctx.d_docs, n_docs,
+        ctx.d_a_row_ptr, ctx.d_a_col, static_cast<TVal*>(ctx.d_a_val));
+    NSPARSE_CUDA_CHECK(cudaGetLastError());
+
+    SpMatGuard a_guard;
+    DnMatGuard b_guard;
+    DnMatGuard c_guard;
+    NSPARSE_CUSPARSE_CHECK(cusparseCreateCsr(
+        &a_guard.desc, n_docs, dim, nnz_a, ctx.d_a_row_ptr, ctx.d_a_col,
+        ctx.d_a_val, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+        CUSPARSE_INDEX_BASE_ZERO, val_type));
+    NSPARSE_CUSPARSE_CHECK(cusparseCreateDnMat(&b_guard.desc, dim, n_clusters,
+                                               n_clusters, ctx.d_b, val_type,
+                                               CUSPARSE_ORDER_ROW));
+    NSPARSE_CUSPARSE_CHECK(
+        cusparseCreateDnMat(&c_guard.desc, n_docs, n_clusters, n_clusters,
+                            ctx.d_c, compute_type, CUSPARSE_ORDER_ROW));
+
+    const TScore alpha_v = 1;
+    const TScore beta_v = 0;
+    size_t buffer_size = 0;
+    NSPARSE_CUSPARSE_CHECK(cusparseSpMM_bufferSize(
+        ctx.handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+        CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha_v, a_guard.desc, b_guard.desc,
+        &beta_v, c_guard.desc, compute_type, CUSPARSE_SPMM_ALG_DEFAULT,
+        &buffer_size));
+    ensure_capacity(reinterpret_cast<char**>(&ctx.d_spmm), ctx.spmm_cap,
+                    buffer_size == 0 ? 1 : buffer_size);
+    NSPARSE_CUSPARSE_CHECK(cusparseSpMM(
+        ctx.handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+        CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha_v, a_guard.desc, b_guard.desc,
+        &beta_v, c_guard.desc, compute_type, CUSPARSE_SPMM_ALG_DEFAULT,
+        ctx.d_spmm));
+
+    row_argmax_kernel<TScore><<<docs_grid, kBlock, 0, stream>>>(
+        static_cast<const TScore*>(ctx.d_c), n_docs, n_clusters, ctx.d_best);
+    NSPARSE_CUDA_CHECK(cudaGetLastError());
+    NSPARSE_CUDA_CHECK(cudaMemcpyAsync(h_best.data(), ctx.d_best,
+                                       static_cast<size_t>(n_docs) *
+                                           sizeof(int32_t),
+                                       cudaMemcpyDeviceToHost, stream));
+    NSPARSE_CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+// 8-bit path: dense B (uint8) from centroids + the custom int32 SpMM kernel +
+// argmax. Separate from assign_spmm because cuSPARSE cannot do unsigned int8.
+void assign_u8(const DeviceCorpus& corpus, ThreadCtx& ctx, int n_docs,
+               int n_clusters, int dim, std::vector<int32_t>& h_best) {
+    cudaStream_t stream = ctx.stream;
+    constexpr int kBlock = 256;
+
+    const size_t b_bytes = static_cast<size_t>(dim) * n_clusters;
+    ensure_capacity(reinterpret_cast<char**>(&ctx.d_b), ctx.b_cap, b_bytes);
+    NSPARSE_CUDA_CHECK(cudaMemsetAsync(ctx.d_b, 0, b_bytes, stream));
+    const int cent_grid = (n_clusters + kBlock - 1) / kBlock;
+    scatter_dense_kernel<uint8_t><<<cent_grid, kBlock, 0, stream>>>(
+        corpus.indptr, corpus.indices,
+        static_cast<const uint8_t*>(corpus.values), ctx.d_centroids, n_clusters,
+        n_clusters, static_cast<uint8_t*>(ctx.d_b));
+    NSPARSE_CUDA_CHECK(cudaGetLastError());
+
+    ensure_capacity(reinterpret_cast<char**>(&ctx.d_c), ctx.c_cap,
+                    static_cast<size_t>(n_docs) * n_clusters * sizeof(int32_t));
+    assign_u8_spmm_kernel<<<n_docs, kBlock, 0, stream>>>(
+        corpus.indptr, corpus.indices,
+        static_cast<const uint8_t*>(corpus.values), ctx.d_docs, n_docs,
+        static_cast<const uint8_t*>(ctx.d_b), n_clusters, n_clusters,
+        static_cast<int32_t*>(ctx.d_c));
+    NSPARSE_CUDA_CHECK(cudaGetLastError());
+
+    const int docs_grid = (n_docs + kBlock - 1) / kBlock;
+    row_argmax_kernel<int32_t><<<docs_grid, kBlock, 0, stream>>>(
+        static_cast<const int32_t*>(ctx.d_c), n_docs, n_clusters, ctx.d_best);
+    NSPARSE_CUDA_CHECK(cudaGetLastError());
+    NSPARSE_CUDA_CHECK(cudaMemcpyAsync(h_best.data(), ctx.d_best,
+                                       static_cast<size_t>(n_docs) *
+                                           sizeof(int32_t),
+                                       cudaMemcpyDeviceToHost, stream));
+    NSPARSE_CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 }  // namespace
 
 GpuClusterAssigner& GpuClusterAssigner::instance() {
@@ -209,11 +362,16 @@ void GpuClusterAssigner::assign(const SparseVectors* vectors,
     ThreadCtx& ctx = thread_ctx();
     cudaStream_t stream = ctx.stream;
 
-    // Upload only the small per-list metadata (doc/centroid ids).
+    // Upload the small per-list metadata (doc/centroid ids, row pointers) and
+    // size the index scratch; the value/dense/output buffers are sized per
+    // width inside assign_spmm.
     ensure_capacity(&ctx.d_docs, ctx.docs_cap, n_docs * sizeof(int32_t));
     ensure_capacity(&ctx.d_centroids, ctx.cent_cap, n_clusters * sizeof(int32_t));
     ensure_capacity(&ctx.d_best, ctx.best_cap, n_docs * sizeof(int32_t));
-    ensure_capacity(&ctx.d_b, ctx.b_cap, dim * n_clusters * sizeof(float));
+    ensure_capacity(&ctx.d_a_row_ptr, ctx.rowptr_cap,
+                    (n_docs + 1) * sizeof(int32_t));
+    ensure_capacity(&ctx.d_a_col, ctx.col_cap,
+                    static_cast<size_t>(nnz_a) * sizeof(int32_t));
 
     NSPARSE_CUDA_CHECK(cudaMemcpyAsync(ctx.d_docs, docs.data(),
                                        n_docs * sizeof(int32_t),
@@ -221,78 +379,23 @@ void GpuClusterAssigner::assign(const SparseVectors* vectors,
     NSPARSE_CUDA_CHECK(cudaMemcpyAsync(ctx.d_centroids, centroid_docs.data(),
                                        n_clusters * sizeof(int32_t),
                                        cudaMemcpyHostToDevice, stream));
-
-    // Build dense B (dim x n_clusters, row-major) from centroid rows.
-    constexpr int kBlock = 256;
-    NSPARSE_CUDA_CHECK(
-        cudaMemsetAsync(ctx.d_b, 0, dim * n_clusters * sizeof(float), stream));
-    const int cent_grid = static_cast<int>((n_clusters + kBlock - 1) / kBlock);
-    scatter_dense_kernel<<<cent_grid, kBlock, 0, stream>>>(
-        corpus.indptr, corpus.indices, corpus.values, ctx.d_centroids,
-        static_cast<int>(n_clusters), static_cast<int>(n_clusters), ctx.d_b);
-    NSPARSE_CUDA_CHECK(cudaGetLastError());
-
-    // Gather A's CSR, then C = A * B (SpMM) and per-row argmax.
-    ensure_capacity(&ctx.d_a_row_ptr, ctx.rowptr_cap,
-                    (n_docs + 1) * sizeof(int32_t));
-    ensure_capacity(&ctx.d_a_col, ctx.col_cap,
-                    static_cast<size_t>(nnz_a) * sizeof(int32_t));
-    ensure_capacity(&ctx.d_a_val, ctx.val_cap,
-                    static_cast<size_t>(nnz_a) * sizeof(float));
-    ensure_capacity(&ctx.d_c, ctx.c_cap, n_docs * n_clusters * sizeof(float));
-
     NSPARSE_CUDA_CHECK(cudaMemcpyAsync(ctx.d_a_row_ptr, h_a_row_ptr.data(),
                                        (n_docs + 1) * sizeof(int32_t),
                                        cudaMemcpyHostToDevice, stream));
-    const int docs_grid = static_cast<int>((n_docs + kBlock - 1) / kBlock);
-    gather_csr_kernel<<<docs_grid, kBlock, 0, stream>>>(
-        corpus.indptr, corpus.indices, corpus.values, ctx.d_docs,
-        static_cast<int>(n_docs), ctx.d_a_row_ptr, ctx.d_a_col, ctx.d_a_val);
-    NSPARSE_CUDA_CHECK(cudaGetLastError());
 
-    SpMatGuard a_guard;
-    DnMatGuard b_guard;
-    DnMatGuard c_guard;
-    cusparseSpMatDescr_t& mat_a = a_guard.desc;
-    cusparseDnMatDescr_t& mat_b = b_guard.desc;
-    cusparseDnMatDescr_t& mat_c = c_guard.desc;
-    NSPARSE_CUSPARSE_CHECK(cusparseCreateCsr(
-        &mat_a, static_cast<int64_t>(n_docs), static_cast<int64_t>(dim), nnz_a,
-        ctx.d_a_row_ptr, ctx.d_a_col, ctx.d_a_val, CUSPARSE_INDEX_32I,
-        CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F));
-    NSPARSE_CUSPARSE_CHECK(cusparseCreateDnMat(
-        &mat_b, static_cast<int64_t>(dim), static_cast<int64_t>(n_clusters),
-        static_cast<int64_t>(n_clusters), ctx.d_b, CUDA_R_32F,
-        CUSPARSE_ORDER_ROW));
-    NSPARSE_CUSPARSE_CHECK(cusparseCreateDnMat(
-        &mat_c, static_cast<int64_t>(n_docs), static_cast<int64_t>(n_clusters),
-        static_cast<int64_t>(n_clusters), ctx.d_c, CUDA_R_32F,
-        CUSPARSE_ORDER_ROW));
-
-    const float alpha_v = 1.0F;
-    const float beta_v = 0.0F;
-    size_t buffer_size = 0;
-    NSPARSE_CUSPARSE_CHECK(cusparseSpMM_bufferSize(
-        ctx.handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
-        CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha_v, mat_a, mat_b, &beta_v,
-        mat_c, CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT, &buffer_size));
-    ensure_capacity(reinterpret_cast<char**>(&ctx.d_spmm), ctx.spmm_cap,
-                    buffer_size == 0 ? 1 : buffer_size);
-    NSPARSE_CUSPARSE_CHECK(cusparseSpMM(
-        ctx.handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
-        CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha_v, mat_a, mat_b, &beta_v,
-        mat_c, CUDA_R_32F, CUSPARSE_SPMM_ALG_DEFAULT, ctx.d_spmm));
-
-    row_argmax_kernel<<<docs_grid, kBlock, 0, stream>>>(
-        ctx.d_c, static_cast<int>(n_docs), static_cast<int>(n_clusters),
-        ctx.d_best);
-    NSPARSE_CUDA_CHECK(cudaGetLastError());
-
+    // Float corpus -> cuSPARSE float SpMM; 8-bit codes -> the custom uint8
+    // int32-accumulate kernel (exact for 8-bit, so the argmax matches the CPU
+    // path). Only these two widths reach here (ensure_resident rejects others).
     std::vector<int32_t> h_best(n_docs);
-    NSPARSE_CUDA_CHECK(cudaMemcpyAsync(h_best.data(), ctx.d_best,
-                                       n_docs * sizeof(int32_t),
-                                       cudaMemcpyDeviceToHost, stream));
-    NSPARSE_CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (corpus.element_size == U32) {
+        assign_spmm<float, float>(corpus, ctx, static_cast<int>(n_docs),
+                                  static_cast<int>(n_clusters),
+                                  static_cast<int>(dim), nnz_a, CUDA_R_32F,
+                                  CUDA_R_32F, h_best);
+    } else {
+        assign_u8(corpus, ctx, static_cast<int>(n_docs),
+                  static_cast<int>(n_clusters), static_cast<int>(dim), h_best);
+    }
 
     // Append assignments, skipping docs that are themselves a centroid.
     for (size_t i = 0; i < n_docs; ++i) {

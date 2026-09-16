@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 #include "cuda_runtime.h"
@@ -35,10 +36,15 @@ namespace {
 //       are restored to zero before return.
 //   out_term / out_val : compacted results, per cluster at out_base[b].
 //   out_count[b] / out_sum[b] : distinct terms and sum of maxes for cluster b.
+// TVal is the corpus value width: float (unquantized) or uint8_t (8-bit codes).
+// Both accumulate a per-term max in an int32 slot -- float via its
+// order-preserving int bit-pattern (SPLADE weights >= 0), uint8 as the plain
+// unsigned integer. out_val is float either way (a 0..255 code is exact).
+template <class TVal>
 __global__ void summarize_list_kernel(
     const int32_t* __restrict__ corpus_indptr,
     const int32_t* __restrict__ corpus_indices,
-    const float* __restrict__ corpus_values,
+    const TVal* __restrict__ corpus_values,
     const int32_t* __restrict__ docs, const int32_t* __restrict__ offsets,
     const int32_t* __restrict__ out_base, int dim,
     int32_t* __restrict__ acc, int32_t* __restrict__ seen,
@@ -64,8 +70,12 @@ __global__ void summarize_list_kernel(
         const int32_t len = corpus_indptr[d + 1] - src;
         for (int32_t t = 0; t < len; ++t) {
             const int32_t term = corpus_indices[src + t];
-            const float v = corpus_values[src + t];
-            atomicMax(&acc[base + term], __float_as_int(v));
+            const TVal v = corpus_values[src + t];
+            if constexpr (std::is_same_v<TVal, float>) {
+                atomicMax(&acc[base + term], __float_as_int(v));
+            } else {
+                atomicMax(&acc[base + term], static_cast<int32_t>(v));
+            }
             if (atomicCAS(&seen[base + term], 0, 1) == 0) {
                 out_term[obase + atomicAdd(&s_count, 1)] = term;
             }
@@ -84,7 +94,9 @@ __global__ void summarize_list_kernel(
 
     for (int k = threadIdx.x; k < s_count; k += blockDim.x) {
         const int32_t term = out_term[obase + k];
-        const float v = __int_as_float(acc[base + term]);
+        const float v = std::is_same_v<TVal, float>
+                            ? __int_as_float(acc[base + term])
+                            : static_cast<float>(acc[base + term]);
         out_val[obase + k] = v;
         atomicAdd(&s_sum, v);
         acc[base + term] = 0;
@@ -243,10 +255,25 @@ bool summarize_list_impl(const SparseVectors* vectors, const idx_t* docs,
                                        cudaMemcpyHostToDevice, stream));
 
     constexpr int kBlock = 128;
-    summarize_list_kernel<<<static_cast<int>(n_clusters), kBlock, 0, stream>>>(
-        corpus.indptr, corpus.indices, corpus.values, ctx.d_docs, ctx.d_offsets,
-        ctx.d_out_base, static_cast<int>(dim), ctx.d_acc, ctx.d_seen,
-        ctx.d_out_term, ctx.d_out_val, ctx.d_out_count, ctx.d_out_sum);
+    const int grid = static_cast<int>(n_clusters);
+    // Float corpus -> float max-pool; 8-bit codes -> int8 max-pool. Only these
+    // two widths reach here (ensure_resident rejects others).
+    if (corpus.element_size == U32) {
+        summarize_list_kernel<float><<<grid, kBlock, 0, stream>>>(
+            corpus.indptr, corpus.indices,
+            static_cast<const float*>(corpus.values), ctx.d_docs, ctx.d_offsets,
+            ctx.d_out_base, static_cast<int>(dim), ctx.d_acc, ctx.d_seen,
+            ctx.d_out_term, ctx.d_out_val, ctx.d_out_count, ctx.d_out_sum);
+    } else {
+        // 8-bit codes are unsigned [0,255]; read as uint8_t so the max-pool
+        // int32 promotion is the true code value, not a sign-extended one.
+        summarize_list_kernel<uint8_t><<<grid, kBlock, 0, stream>>>(
+            corpus.indptr, corpus.indices,
+            static_cast<const uint8_t*>(corpus.values), ctx.d_docs,
+            ctx.d_offsets, ctx.d_out_base, static_cast<int>(dim), ctx.d_acc,
+            ctx.d_seen, ctx.d_out_term, ctx.d_out_val, ctx.d_out_count,
+            ctx.d_out_sum);
+    }
     NSPARSE_CUDA_CHECK(cudaGetLastError());
 
     std::vector<int32_t> h_term(total_nnz);

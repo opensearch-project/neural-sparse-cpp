@@ -125,14 +125,16 @@ SparseVectors summarize_with_cpu_(const SparseVectors* vectors,
 
 #ifdef NSPARSE_WITH_GPU
 // GPU per-term max-pool: one kernel launch for the whole list, then the shared
-// CPU sort/truncate. float (U32) only. Returns std::nullopt when the GPU
-// declines (unavailable / empty list) so the caller falls back to the CPU path.
+// CPU sort/truncate. float (U32) and 8-bit (uint8_t) only; a 0..255 code max is
+// exact in the float summary value. Returns std::nullopt when the GPU declines
+// (unavailable / empty list) or T is unsupported (e.g. uint16_t) so the caller
+// falls back to the CPU path.
 template <class T>
 std::optional<SparseVectors> summarize_with_gpu_(
     const SparseVectors* vectors, std::span<const idx_t> group_of_doc_ids,
     std::span<const idx_t> offsets, float alpha) {
-    if constexpr (!std::is_same_v<T, float>) {
-        return std::nullopt;  // GPU max-pool is float-only
+    if constexpr (!std::is_same_v<T, float> && !std::is_same_v<T, uint8_t>) {
+        return std::nullopt;  // GPU max-pool supports only float and 8-bit
     } else {
         const size_t n_clusters = offsets.size() - 1;
         std::vector<detail::GpuSummarizer::ClusterSummary> gpu_clusters;
