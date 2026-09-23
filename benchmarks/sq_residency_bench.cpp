@@ -18,7 +18,8 @@
 // silently.
 //
 //   build  <csr> <descriptor> <out.dat>
-//   search <dat> <queries.csr> <k> <reps> <inmem|mmap> [truth.txt]
+//   search <dat> <queries.csr> <k> <reps> <inmem|mmap> [truth.txt|-] [cut]
+//          [k_prime] [heap_factor] [labels_out.txt]
 
 #include <algorithm>
 #include <chrono>
@@ -186,7 +187,8 @@ int do_build(int argc, char** argv) {
 int do_search(int argc, char** argv) {
     if (argc < 7) {
         std::cerr << "search <dat> <queries.csr> <k> <reps> <inmem|mmap> "
-                     "[truth.txt|-] [cut] [k_prime] [heap_factor]\n";
+                     "[truth.txt|-] [cut] [k_prime] [heap_factor] "
+                     "[labels_out.txt]\n";
         return 2;
     }
     std::string dat_path = argv[2];
@@ -204,6 +206,9 @@ int do_search(int argc, char** argv) {
     // cluster_score*heap_factor < heap.peek, so LARGER = prune fewer = higher
     // recall + slower. Sweep this to raise SEISMIC recall for iso-recall points.
     const float heap_factor = argc > 10 ? static_cast<float>(std::atof(argv[10])) : 1.0F;
+    // Where to write the final labels, in the truth-file format, so another run
+    // can be scored against them.
+    const std::string labels_out_path = argc > 11 ? argv[11] : "";
 
     const int io_flags =
         residency == "mmap" ? nsparse::IndexIoFlag::kUseMmap : 0;
@@ -292,6 +297,24 @@ int do_search(int argc, char** argv) {
     if (!truth_path.empty()) {
         std::cout << "recall@" << k << " "
                   << recall_at_k(truth_path, labels, k, n_queries) << "\n";
+    }
+    // A format change that is meant to be lossless can be held to that: dump one
+    // build's labels in the truth-file format, then measure the other build's
+    // recall against them, where anything but 1.0 is a behaviour change.
+    if (!labels_out_path.empty()) {
+        std::ofstream out(labels_out_path);
+        if (!out.is_open()) {
+            throw std::runtime_error("Cannot write labels to " +
+                                     labels_out_path);
+        }
+        for (int qi = 0; qi < n_queries; ++qi) {
+            for (int ki = 0; ki < k; ++ki) {
+                out << (ki == 0 ? "" : ",")
+                    << labels[static_cast<size_t>(qi) * k + ki];
+            }
+            out << "\n";
+        }
+        std::cout << "labels_written " << labels_out_path << "\n";
     }
     print_memory("after_search");
     return 0;

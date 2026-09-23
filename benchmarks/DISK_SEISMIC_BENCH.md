@@ -66,6 +66,47 @@ larger on disk but only its summaries stay resident) to expose the disk benefit.
 - Memory split: V1 is almost all `RssAnon` (heap); V2/V3 are almost all `RssFile`
   (mapped, reclaimable), V3 with a small `RssAnon` for summaries.
 
+## Where the on-disk bytes go — `index_size_stats`
+
+`index_size_stats <index.dat>` re-parses a serialized `disk_seismic`/`disk_seismic_sq` file
+and prints the section split, the inline forward index's per-array split, and what a narrower
+encoding of each array would save. It only reads, so sizing a format change costs one pass
+over the file instead of a rebuild.
+
+That is how the block padding was found. A block holds about ten documents — a ~4.5 KB
+payload — and `InlineForwardIndex` was aligning each to 4096, so **a third of the file was
+padding nothing ever read**: 24.3 GiB of 74.2 on `base_full` at `lambda=6000 beta=400
+alpha=0.4`, 8-bit `disk_seismic_sq`. Packed placement (`InlineLayout::kPacked`, now the
+default) removes it. Same format either way — the header records the alignment and a reader
+honours whatever the file declares — so a file written before the default changed still
+loads, which is what let this A/B run one binary over two files:
+
+| | page-aligned | packed | |
+|---|---|---|---|
+| index file | 74.205 GiB | **49.967 GiB** | −32.7% |
+| inter-block padding | 24.273 GiB | 0.035 GiB | |
+| bytes per non-zero | 4.73 | 3.09 | |
+| first (cold) query pass | 982,994 ms | 888,829 ms | −9.6% |
+| warm batch, 6,980 queries | 1492.6 ms | 1464.3 ms | −1.9% |
+| warm p50 / p90 / p99 | 0.221 / 0.268 / 0.312 ms | 0.217 / 0.264 / 0.308 ms | −1.6% |
+| `VmHWM` / `RssFile` | 6.567 / 6.236 GiB | 6.042 / 5.712 GiB | −8.0% |
+| recall@10 | 0.9252 | 0.9261 | k-means seed noise |
+
+Padding cost storage and page cache, not page faults — a page-aligned block already spanned
+two pages and the padding sat in the tail of the second one. So removing it buys file size
+and a smaller resident set, and touches query CPU only to the extent that blocks now share
+pages. Warm latency came out marginally *better*, not worse.
+
+The recall difference is seed noise: the two indexes were built at different times without a
+fixed `seed=`. The layout change itself is exact, which `sq_residency_bench`'s trailing
+`labels_out.txt` argument is there to show — dump one build's labels, score the other against
+them, expect 1.0. With a fixed seed the two layouts' label files are byte-identical.
+
+What is left, per the same tool, if the file needs to shrink further: component ids are 64.8%
+of the inline forward index and delta coding would take 29.5 → 19.4 GiB, but decoding sits on
+the critical path of scoring a block and measured a 1.5× warm-latency cost, so it was not
+taken. 4-bit values would save 7.4 GiB and is lossy. `doc_id[]`/`off[]` are ~1% together.
+
 ## Caveats
 
 - **`base_small` is a smoke test, not a benchmark** — it fits in cache, so the

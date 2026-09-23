@@ -85,11 +85,11 @@ public:
 
     // Write mode. `lists`/`vectors` must outlive any serialize() call.
     // page_size: block alignment when page-aligned (power of two, >= header
-    // size); ignored when packed.
+    // size); ignored when packed, which is the default (see InlineLayout).
     InlineForwardIndex(const std::vector<InvertedListClusters>& lists,
                        const SparseVectors& vectors,
                        uint64_t page_size = kDefaultPageSize,
-                       InlineLayout layout = InlineLayout::kPageAligned);
+                       InlineLayout layout = InlineLayout::kPacked);
 
     // Explicit, not defaulted: Buf's move keeps the source's size()/data()
     // (only its owner moves), so the moved-from members are reset to stay

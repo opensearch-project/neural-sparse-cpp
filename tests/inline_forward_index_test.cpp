@@ -271,15 +271,70 @@ TEST(InlineForwardIndex, SerializeRejectsOutOfRangeDocId) {
     EXPECT_THROW(writer.serialize(&buffer), std::out_of_range);
 }
 
+// page_size only constrains the page-aligned layout, which has to be asked for:
+// packed is the default, and there the alignment is kMinBlockAlign and page_size
+// is ignored.
 TEST(InlineForwardIndex, RejectsInvalidPageSize) {
     auto vectors = sample_float_vectors();
-    EXPECT_THROW(InlineForwardIndex(build_lists(kLayout, vectors), vectors, 0),
+    EXPECT_THROW(InlineForwardIndex(build_lists(kLayout, vectors), vectors, 0,
+                                    InlineLayout::kPageAligned),
                  std::invalid_argument);
-    EXPECT_THROW(
-        InlineForwardIndex(build_lists(kLayout, vectors), vectors, 100),
-        std::invalid_argument);
+    EXPECT_THROW(InlineForwardIndex(build_lists(kLayout, vectors), vectors, 100,
+                                    InlineLayout::kPageAligned),
+                 std::invalid_argument);
+    EXPECT_NO_THROW(InlineForwardIndex(build_lists(kLayout, vectors), vectors,
+                                       64, InlineLayout::kPageAligned));
     EXPECT_NO_THROW(
-        InlineForwardIndex(build_lists(kLayout, vectors), vectors, 64));
+        InlineForwardIndex(build_lists(kLayout, vectors), vectors, 100));
+}
+
+// The two layouts are one format: the header records the alignment and a reader
+// honours whatever the file declares, so a page-aligned file written before the
+// default changed still loads, and loads to the same documents.
+TEST(InlineForwardIndex, BothLayoutsReadBackTheSameBlocks) {
+    auto vectors = sample_float_vectors();
+    auto lists = build_lists(kLayout, vectors);
+    const auto padded =
+        serialize_bytes(lists, vectors, InlineForwardIndex::kDefaultPageSize,
+                        InlineLayout::kPageAligned);
+    const auto packed =
+        serialize_bytes(lists, vectors, InlineForwardIndex::kDefaultPageSize,
+                        InlineLayout::kPacked);
+    auto padded_index = read_index(padded);
+    auto packed_index = read_index(packed);
+
+    ASSERT_EQ(padded_index.num_blocks(), packed_index.num_blocks());
+    ASSERT_EQ(padded_index.num_lists(), packed_index.num_lists());
+    for (uint32_t pl = 0; pl < padded_index.num_lists(); ++pl) {
+        const uint64_t blocks = padded_index.num_blocks_in_list(pl);
+        ASSERT_EQ(blocks, packed_index.num_blocks_in_list(pl));
+        for (uint32_t block = 0; block < blocks; ++block) {
+            verify_block(packed_index, packed_index.block(pl, block),
+                         kLayout[pl][block], vectors);
+            verify_block(padded_index, padded_index.block(pl, block),
+                         kLayout[pl][block], vectors);
+        }
+    }
+}
+
+// What a disk index gets when it does not ask: blocks packed on kMinBlockAlign,
+// not padded to a page. This is the whole of the padding change, so it is the one
+// thing a future edit to the default must trip over.
+TEST(InlineForwardIndex, DefaultsToThePackedLayout) {
+    auto vectors = sample_float_vectors();
+    auto lists = build_lists(kLayout, vectors);
+    InlineForwardIndex writer(lists, vectors);
+    nsparse::BufferedIOWriter buffer;
+    writer.serialize(&buffer);
+    const auto bin = buffer.data();
+
+    EXPECT_EQ(parse_header(bin).page_size, kMinBlockAlign);
+    // And it is smaller than the same lists written page-aligned -- padding is
+    // all that differs.
+    EXPECT_LT(bin.size(), serialize_bytes(lists, vectors,
+                                          InlineForwardIndex::kDefaultPageSize,
+                                          InlineLayout::kPageAligned)
+                              .size());
 }
 
 TEST(InlineForwardIndex, SerializeOnReadModeIndexThrows) {
