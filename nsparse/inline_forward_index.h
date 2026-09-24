@@ -39,10 +39,19 @@ namespace nsparse::detail {
  * Component: io/inline_forward_index_io.h.
  */
 
-// Block placement: page-aligned (padded to page_size, mmap-friendly; default)
-// or packed (blocks back-to-back on the minimum kMinBlockAlign boundary that
-// keeps the per-block arrays readable in place). The header page_size records
-// the effective alignment.
+// Block placement: page-aligned (padded to page_size) or packed (blocks
+// back-to-back on the minimum kMinBlockAlign boundary that keeps the per-block
+// arrays readable in place; the default). The header page_size records the
+// effective alignment, and a reader honours whichever the file declares, so the
+// two are the same format and either loads in a build that writes the other.
+//
+// Packed is the default because a block is far smaller than a page. At the
+// standard SEISMIC parameters a block holds about ten documents -- a ~4.5 KB
+// payload -- so page alignment spent about as many bytes on padding as on
+// values: a third of a `disk_seismic_sq` file over MS MARCO, 24.3 GiB of 74.2.
+// Those bytes were never read, only stored and cached, which is why packing them
+// out costs no query CPU and shows up as a smaller file and a smaller resident
+// set rather than as fewer page faults.
 enum class InlineLayout : uint8_t { kPageAligned, kPacked };
 
 // Minimum block-start alignment. Blocks begin on this boundary even when

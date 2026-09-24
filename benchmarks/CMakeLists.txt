@@ -82,6 +82,18 @@ target_link_libraries(nsparse_build_benchmark PRIVATE
     absl::flat_hash_map
 )
 
+# Read-only size accounting for a serialized disk_seismic(_sq) index: where the
+# bytes are and what each candidate encoding would save. Not a google-benchmark
+# target; it measures a file, not a run.
+add_executable(index_size_stats index_size_stats.cpp)
+target_include_directories(index_size_stats PRIVATE ${PROJECT_SOURCE_DIR})
+target_link_libraries(index_size_stats PRIVATE
+    ${NSPARSE_BENCH_LIB}
+    OpenMP::OpenMP_CXX
+    absl::flat_hash_set
+    absl::flat_hash_map
+)
+
 # Peak-RSS build-memory driver for the term-batched build. Not a
 # google-benchmark target: that harness reports throughput, and what matters here
 # is the high-water mark of a single build, one configuration per process.
