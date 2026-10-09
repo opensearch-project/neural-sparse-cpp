@@ -74,8 +74,9 @@ DiskSeismicScalarQuantizedIndex::DiskSeismicScalarQuantizedIndex(int dim)
 
 DiskSeismicScalarQuantizedIndex::DiskSeismicScalarQuantizedIndex(
     QuantizerType quantizer_type, float vmin, float vmax,
-    SeismicClusterParameters parameter, int dim)
-    : DiskSeismicIndexBase(dim, parameter), sq_(quantizer_type, vmin, vmax) {}
+    SeismicClusterParameters parameter, int dim, uint32_t inline_max_nnz)
+    : DiskSeismicIndexBase(dim, parameter, inline_max_nnz),
+      sq_(quantizer_type, vmin, vmax) {}
 
 size_t DiskSeismicScalarQuantizedIndex::code_element_size() const {
     return sq_.bytes_per_value();

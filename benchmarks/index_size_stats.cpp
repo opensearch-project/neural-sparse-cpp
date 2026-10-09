@@ -68,6 +68,9 @@ uint64_t vbyte_len(uint64_t value) {
     return bytes;
 }
 
+// Retention checkpoints for the per-doc "keep the T largest codes" policy.
+constexpr std::array<uint32_t, 6> kTopT = {16, 24, 32, 48, 64, 96};
+
 struct Stats {
     uint64_t n_blocks = 0;
     // Doc slots, i.e. postings: a doc counts once per block that holds it.
@@ -98,7 +101,49 @@ struct Stats {
     uint64_t blocks_docids_unsorted = 0;
     uint64_t vals_nonzero = 0;
     uint64_t vals_le15 = 0;  // would fit 4 bits as stored
+
+    // Lossy levers. The code histogram gives every code-threshold cut at once
+    // (how many values, and how much of the L1 mass, sit at or below a code);
+    // kept_nnz/kept_mass give the per-doc top-T cut. Both weight a doc once per
+    // block that holds it, which is what the stored bytes do.
+    std::array<uint64_t, 256> code_hist{};
+    uint64_t mass_total = 0;
+    std::array<uint64_t, kTopT.size()> kept_nnz{};
+    std::array<uint64_t, kTopT.size()> kept_mass{};
+
+    // Distinct component ids per block, i.e. what a per-block dictionary could
+    // fold away: the ratio to nnz bounds any transposed/dictionary layout.
+    uint64_t distinct_comps = 0;
 };
+
+// The T largest codes of one doc, by descending-code walk over a 256-bin
+// histogram: how many values that keeps (ties at the cut included, so >= T) and
+// how much of the doc's L1 mass they carry. O(nnz + 256) per doc, no sort.
+void size_doc_topt(const uint8_t* vals, uint32_t len, Stats* stats) {
+    std::array<uint32_t, 256> hist{};
+    uint64_t mass = 0;
+    for (uint32_t j = 0; j < len; ++j) {
+        hist[vals[j]] += 1;
+        mass += vals[j];
+    }
+    stats->mass_total += mass;
+    size_t next = 0;
+    uint64_t kept = 0;
+    uint64_t kept_mass = 0;
+    for (int code = 255; code >= 0 && next < kTopT.size(); --code) {
+        kept += hist[code];
+        kept_mass += static_cast<uint64_t>(hist[code]) *
+                     static_cast<uint64_t>(code);
+        // Every checkpoint this bin reached takes the totals as they stand: a
+        // partial bin cannot be split without ordering the ties, and rounding up
+        // to the whole bin is what a writer keeping >= T values would store.
+        while (next < kTopT.size() && (kept >= kTopT[next] || code == 0)) {
+            stats->kept_nnz[next] += std::min<uint64_t>(kept, len);
+            stats->kept_mass[next] += kept_mass;
+            ++next;
+        }
+    }
+}
 
 // Component ids of one doc: how much delta coding would buy, two ways, and
 // whether they ascend (which is what makes the deltas small).
@@ -130,6 +175,22 @@ void size_doc_comps(const nsparse::term_t* comps, uint32_t len, Stats* stats) {
     }
     stats->c_comps_vbyte += vbytes;
     stats->c_comps_flagged += flagged;
+}
+
+// Distinct component ids in a block, counted with a stamp array indexed by
+// component id: O(nnz), and no per-block clearing (the stamp is the block
+// ordinal). `seen` must be sized to the term space.
+uint64_t count_distinct(const BlockView& view, uint64_t total_nnz,
+                        uint64_t stamp, std::vector<uint64_t>* seen) {
+    uint64_t distinct = 0;
+    for (uint64_t j = 0; j < total_nnz; ++j) {
+        const uint32_t comp = view.comps[j];
+        if (comp < seen->size() && (*seen)[comp] != stamp) {
+            (*seen)[comp] = stamp;
+            ++distinct;
+        }
+    }
+    return distinct;
 }
 
 void accumulate(const BlockView& view, size_t element_size, uint64_t align,
@@ -194,6 +255,10 @@ void accumulate(const BlockView& view, size_t element_size, uint64_t align,
             const uint8_t value = view.vals[j];
             stats->vals_nonzero += value != 0 ? 1 : 0;
             stats->vals_le15 += value <= kFourBitMax ? 1 : 0;
+            stats->code_hist[value] += 1;
+        }
+        for (uint32_t i = 0; i < view.n_docs; ++i) {
+            size_doc_topt(view.doc_vals(i, 1), view.nnz(i), stats);
         }
     }
 }
@@ -260,6 +325,10 @@ int main(int argc, char** argv) {
 
     const uint64_t align = fwd.page_size();
     Stats stats;
+    // Stamped by block ordinal (from 1, so the zero-initialized state is "never
+    // seen"), which is why the per-block distinct count needs no clearing.
+    std::vector<uint64_t> seen(static_cast<size_t>(dimension) + 1, 0);
+    uint64_t stamp = 0;
     for (uint32_t pl = 0; pl < fwd.num_lists(); ++pl) {
         const uint64_t n_blocks = fwd.num_blocks_in_list(pl);
         for (uint32_t block = 0; block < n_blocks; ++block) {
@@ -268,6 +337,8 @@ int main(int argc, char** argv) {
                 continue;
             }
             accumulate(view, element_size, align, &stats);
+            stats.distinct_comps +=
+                count_distinct(view, view.offsets[view.n_docs], ++stamp, &seen);
         }
     }
     stats.b_dir = stats.n_blocks * sizeof(nsparse::detail::InlineDirEntry);
@@ -323,7 +394,73 @@ int main(int argc, char** argv) {
         saving("vals: 4-bit codes", stats.b_vals, stats.nnz / 2);
     }
 
+    // Fewer stored values, rather than fewer bits per value: comps + vals are
+    // ~3 bytes of every nnz, so dropping an nnz saves all three and also drops
+    // the dot-product term that reads it. Both cuts are lossy -- the sizes here
+    // say what they would buy, not whether recall survives them.
+    if (element_size == 1) {
+        const double all_nnz = static_cast<double>(stats.nnz);
+        const double all_mass = static_cast<double>(stats.mass_total);
+        std::printf(
+            "\n== dropping low-weight components (lossy; comps+vals = %.1f%% "
+            "of the file) ==\n",
+            100.0 * static_cast<double>(stats.b_comps + stats.b_vals) /
+                static_cast<double>(file_bytes));
+        std::printf("  keep code > threshold:\n");
+        uint64_t at_or_below = 0;
+        uint64_t mass_at_or_below = 0;
+        for (uint32_t code = 0; code < 256; ++code) {
+            at_or_below += stats.code_hist[code];
+            mass_at_or_below +=
+                stats.code_hist[code] * static_cast<uint64_t>(code);
+            // A few decades of the curve is enough to read its shape.
+            if (code != 0 && code != 1 && code != 2 && code != 4 &&
+                code != 8 && code != 16 && code != 32 && code != 64) {
+                continue;
+            }
+            const double kept = all_nnz - static_cast<double>(at_or_below);
+            std::printf(
+                "    > %3u   keep %5.1f%% of nnz, %5.1f%% of L1 mass   "
+                "file ~%7.3f GiB\n",
+                code, 100.0 * kept / all_nnz,
+                100.0 * (all_mass - static_cast<double>(mass_at_or_below)) /
+                    all_mass,
+                gib(file_bytes) -
+                    (gib(stats.b_comps + stats.b_vals) *
+                     (static_cast<double>(at_or_below) / all_nnz)));
+        }
+        std::printf("  keep the T largest codes per doc:\n");
+        for (size_t i = 0; i < kTopT.size(); ++i) {
+            const double kept = static_cast<double>(stats.kept_nnz[i]);
+            std::printf(
+                "    T = %3u  keep %5.1f%% of nnz, %5.1f%% of L1 mass   "
+                "file ~%7.3f GiB\n",
+                kTopT[i], 100.0 * kept / all_nnz,
+                100.0 * static_cast<double>(stats.kept_mass[i]) / all_mass,
+                gib(file_bytes) -
+                    (gib(stats.b_comps + stats.b_vals) * (1.0 - kept / all_nnz)));
+        }
+        // A deduplicated store costs one copy of the corpus; the inline layout
+        // stores one per block that holds the doc.
+        std::printf(
+            "  one shared copy per doc instead of %.2f inline copies: "
+            "%.3f -> %.3f GiB for comps+vals\n",
+            static_cast<double>(stats.n_docs) /
+                static_cast<double>(num_vectors),
+            gib(stats.b_comps + stats.b_vals),
+            gib(stats.b_comps + stats.b_vals) /
+                (static_cast<double>(stats.n_docs) /
+                 static_cast<double>(num_vectors)));
+    }
+
     std::printf("\n== diagnostics ==\n");
+    std::printf("  distinct comps per block: %.1f of %.1f nnz (%.2fx)\n",
+                static_cast<double>(stats.distinct_comps) /
+                    static_cast<double>(stats.n_blocks),
+                static_cast<double>(stats.nnz) /
+                    static_cast<double>(stats.n_blocks),
+                static_cast<double>(stats.nnz) /
+                    static_cast<double>(stats.distinct_comps));
     std::printf("  docs with non-ascending comps: %llu / %llu\n",
                 static_cast<unsigned long long>(stats.docs_comps_unsorted),
                 static_cast<unsigned long long>(stats.n_docs));

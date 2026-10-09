@@ -168,6 +168,45 @@ inline void expect_all_members_returned(const ScoreIds& got,
     }
 }
 
+// Same ranking, allowing docs with equal scores to come back in either order.
+// Quantized dot products are small integers, so ties at the k-th place are
+// routine and which tied doc lands inside k is not part of what a format change
+// promises. Scores must still match rank for rank; within each run of equal
+// scores the label sets must match, except the last run, which k may have cut
+// through -- there only the count is comparable.
+inline void expect_same_ranking_modulo_ties(const ScoreIds& a,
+                                           const ScoreIds& b) {
+    ASSERT_EQ(a.second.size(), b.second.size());
+    for (size_t q = 0; q < a.second.size(); ++q) {
+        ASSERT_EQ(a.first[q].size(), b.first[q].size());
+        for (size_t j = 0; j < a.first[q].size(); ++j) {
+            EXPECT_FLOAT_EQ(a.first[q][j], b.first[q][j])
+                << "score differs at query " << q << " rank " << j;
+        }
+        size_t run_start = 0;
+        for (size_t j = 1; j <= a.first[q].size(); ++j) {
+            const bool run_ends =
+                j == a.first[q].size() || a.first[q][j] != a.first[q][run_start];
+            if (!run_ends) {
+                continue;
+            }
+            const std::multiset<idx_t> got(a.second[q].begin() + run_start,
+                                           a.second[q].begin() + j);
+            const std::multiset<idx_t> want(b.second[q].begin() + run_start,
+                                            b.second[q].begin() + j);
+            if (j == a.first[q].size()) {
+                EXPECT_EQ(got.size(), want.size())
+                    << "trailing tie run differs in size at query " << q;
+            } else {
+                EXPECT_EQ(got, want)
+                    << "tie run at query " << q << " rank " << run_start
+                    << " holds different docs";
+            }
+            run_start = j;
+        }
+    }
+}
+
 inline void expect_same_results(const ScoreIds& a, const ScoreIds& b) {
     ASSERT_EQ(a.second.size(), b.second.size());
     for (size_t q = 0; q < a.second.size(); ++q) {

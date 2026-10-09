@@ -305,4 +305,38 @@ TEST(DiskSeismicIndex, FactoryCreatesIt) {
     EXPECT_EQ(index->id(), DiskSeismicIndex::name);
 }
 
+// The float disk index shares the truncation machinery but stores 4-byte values,
+// so it selects "the largest" over a different code width. Same anchor: with
+// everything re-scored the truncated index ranks exactly like the whole one.
+TEST(DiskSeismicIndex, TruncatedInlineMatchesWholeWhenEverythingIsRescored) {
+    const CSR corpus = make_corpus(1200, /*seed=*/1);
+    const CSR queries = make_corpus(30, /*seed=*/2);
+
+    DiskSeismicIndex whole(kDim, cluster_params());
+    add_corpus(whole, corpus);
+    whole.build();
+    TempIndexFile whole_file("nsparse_dsei_trunc_whole.idx");
+    write_index(&whole, whole_file.c_str());
+    std::unique_ptr<Index> whole_mapped(
+        read_index(whole_file.c_str(), IndexIoFlag::kUseMmap));
+    ASSERT_NE(whole_mapped, nullptr);
+
+    DiskSeismicIndex cut(kDim, cluster_params(), /*inline_max_nnz=*/6);
+    add_corpus(cut, corpus);
+    cut.build();
+    TempIndexFile cut_file("nsparse_dsei_trunc_cut.idx");
+    write_index(&cut, cut_file.c_str());
+    std::unique_ptr<Index> cut_mapped(
+        read_index(cut_file.c_str(), IndexIoFlag::kUseMmap));
+    ASSERT_NE(cut_mapped, nullptr);
+
+    DiskSeismicSearchParameters params(/*cut=*/10, /*k_prime=*/kAllBlocks);
+    DiskSeismicSearchParameters rescore_all(/*cut=*/10, /*k_prime=*/kAllBlocks,
+                                            /*rescore=*/100000);
+    expect_same_ranking_modulo_ties(
+        search_all(*cut_mapped, queries, 10, &rescore_all),
+        search_all(*whole_mapped, queries, 10, &params));
+    EXPECT_LT(cut_file.size(), whole_file.size());
+}
+
 }  // namespace nsparse

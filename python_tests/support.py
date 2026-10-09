@@ -123,3 +123,24 @@ def roundtrip(index, path, flag=0):
     """
     nsparse.write_index(index, str(path))
     return nsparse.read_index(str(path), flag)
+
+
+def assert_same_ranking_modulo_ties(got, want):
+    """Same scores rank for rank, and the same docs except where equal scores
+    leave the order (or, in the last run of ties, the cut at k) up to the
+    tie-break. Quantized scores are small integers, so ties are routine and
+    which tied doc wins is not part of any format's contract."""
+    got_d, got_l = got
+    want_d, want_l = want
+    np.testing.assert_allclose(got_d, want_d, rtol=1e-6, atol=1e-6)
+    for q in range(want_d.shape[0]):
+        row = want_d[q]
+        start = 0
+        for end in range(1, len(row) + 1):
+            if end < len(row) and np.isclose(row[end], row[start]):
+                continue
+            if end < len(row):
+                assert sorted(got_l[q, start:end]) == sorted(want_l[q, start:end]), (
+                    f"query {q}: tie run at rank {start} holds different docs"
+                )
+            start = end

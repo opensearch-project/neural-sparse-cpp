@@ -107,6 +107,105 @@ of the inline forward index and delta coding would take 29.5 → 19.4 GiB, but d
 the critical path of scoring a block and measured a 1.5× warm-latency cost, so it was not
 taken. 4-bit values would save 7.4 GiB and is lossy. `doc_id[]`/`off[]` are ~1% together.
 
+## Truncating the extra inline copies — `inline_max_nnz`
+
+Packing the blocks removed bytes nothing read. What remains is bytes that *are* read but are
+**duplicated**: `index_size_stats` puts the inline forward index at 45.6 of the 50.0 GiB, and
+a doc's vector is stored **12.97 times** over — once per posting list that retains it. One
+shared copy per doc would take `comps[] + vals[]` from 44.28 GiB to 3.42. That duplication is
+not waste, it is the whole design: it makes a block one contiguous read.
+
+`inline_max_nnz=T` splits the difference. One copy of each doc stays whole (the one the
+`DocLocator` directory already points at); every other copy keeps only its T largest codes.
+Block scores are then **lower bounds**, so search re-scores its `rescore` best candidates
+against the whole copies and re-ranks. Two knobs, one at build time and one per query:
+
+| | T=0 (baseline) | T=64 | T=48 | T=32 |
+|---|---|---|---|---|
+| index file | 49.967 GiB | 27.667 GiB | **22.971 GiB** | 18.246 GiB |
+| vs baseline | | −44.6% | **−54.0%** | −63.5% |
+| inline forward index | 45.570 GiB | 23.27 GiB | 18.574 GiB | 13.850 GiB |
+| stored nnz | 15.85 e9 | 7.78 e9 | 6.20 e9 | 4.51 e9 |
+| cluster summaries | 4.297 GiB (8.6%) | 4.297 (15.5%) | 4.297 (18.7%) | 4.297 (23.6%) |
+| build wall / peak RSS | 9:01 / 20.9 GiB | 11:20 / 20.9 | 11:12 / 20.9 | 8:36 / 20.9 |
+
+Latency and recall, `base_full` / λ=6000 β=400 α=0.4 / 8-bit / cut=3 k'=50 k=10 / 1 thread,
+`seismic-ec2`, one binary per round over all the files, caches dropped before each arm's first
+pass. `seed=42` on every build, so recall differences are the format's and not k-means noise:
+
+| arm | rescore | warm p50 | vs baseline | recall@10 | Δ recall |
+|---|---|---|---|---|---|
+| T=0 | — | 0.2157 ms | 1.00× | 0.926246 | — |
+| T=64 | 10 | 0.1698 ms | 0.79× | 0.844728 | −8.2 pp |
+| T=64 | 50 | 0.1899 ms | 0.88× | 0.924900 | −0.13 pp |
+| T=64 | 100 | **0.2117 ms** | **0.98×** | 0.925989 | −0.03 pp |
+| T=64 | 200 | 0.2565 ms | 1.19× | 0.926232 | −0.001 pp |
+| T=64 | 300 | 0.2986 ms | 1.38× | 0.926203 | −0.004 pp |
+| T=48 | none | 0.1569 ms | 0.73× | 0.784585 | −14.2 pp |
+| T=48 | 100 | 0.2033 ms | 0.94× | 0.924484 | −0.18 pp |
+| T=48 | 200 | **0.2470 ms** | **1.15×** | 0.925888 | −0.04 pp |
+| T=48 | 300 | 0.2877 ms | 1.33× | 0.926089 | −0.02 pp |
+| T=48 | 600 | 0.4046 ms | 1.88× | 0.926203 | −0.004 pp |
+| T=32 | 100 | 0.1936 ms | 0.90× | 0.915115 | −1.11 pp |
+| T=32 | 200 | 0.2359 ms | 1.09× | 0.922908 | −0.33 pp |
+| T=32 | 300 | 0.2760 ms | 1.28× | 0.924699 | −0.15 pp |
+
+Using it, from C++ or Python (the SWIG bindings expose the same names):
+
+```python
+index = nsparse.index_factory(dim, "disk_seismic_sq,quantizer=8bit|vmin=0|vmax=3|"
+                                   "lambda=6000|beta=400|alpha=0.4|inline_max_nnz=64")
+# ... add, build, write_index, read_index(path, nsparse.kUseMmap) ...
+params = nsparse.DiskSeismicSQSearchParameters(0.0, 3.0, 3, 50, 100)  # vmin vmax cut k' rescore
+params.rescore = 200            # per query; default nsparse.kDefaultRescoreDepth (200)
+```
+
+`inline_max_nnz` is fixed at build time and recorded in the file. `rescore` is ignored on an
+untruncated index, raised to k when smaller, and rejected when negative.
+
+Two points worth naming. **T=64 with rescore=100 is free**: 44.6% off the file at 0.98× the
+latency and a recall difference smaller than the ±0.1 pp a k-means seed causes on its own.
+**T=48 with rescore=200** buys another 9 points of file size for 1.15× latency, still at
+recall parity. Below T=48 recall starts to cost real ground, so T=32 is only worth it when disk
+is the binding constraint.
+
+Read the "none" row as the cost of the scan alone: with 39% of the nnz left inline, scoring the
+candidate blocks is **0.73×** the baseline. Everything above that is the second pass, and it is
+not arithmetic — at ~0.45 µs per re-scored doc it is ~1400 cycles to read 420 bytes, because
+reaching one whole copy is a four-deep chase (locator → directory → block header → slice)
+through tables far past any cache. That is why `rescore` is the latency knob and why
+`resolve_docs` walks the candidates through each step together, in bounded chunks, rather than
+one doc at a time: doing that took the per-doc cost from 0.68 µs to 0.45 µs (−34%) with
+bit-identical results at every depth.
+
+Two honest costs beyond latency:
+
+- **Cold first pass** 0.897 → 1.153 Ms (+28.5%) at T=48. The file is half the size but the
+  second pass touches ~300 additional scattered blocks per query, which is 6× the 50 the scan
+  reads, so a cold run faults in more distinct pages even though there are fewer bytes overall.
+- **Resident set** 6.04 → 7.56 GiB (+25%) at T=48, `RssFile` 5.71 → 7.23, for the same reason.
+  The smaller file does *not* buy a smaller working set here; it buys disk.
+
+What did **not** work, so nobody repeats it:
+
+- **Choosing the kept components per block instead of per doc.** The hypothesis was that a
+  query selecting a block correlates with that block's summary, so keeping the components with
+  the largest `code × block-max` should rank better than the doc's own largest codes.
+  Simulated over the real index it is a wash — T=48 at depth 100 gives 0.9249 against 0.9246,
+  T=32 0.9172 against 0.9175. The block max is usually the doc's own value for the components
+  that matter, so the ordering barely moves. More fundamentally: which components a query will
+  hit is query information, and no static choice can carry it.
+- **Bounding the second pass** so most candidates skip it. The dropped codes are all below the
+  doc's boundary code, which gives `truncated + boundary × query_L1` as an upper bound — two
+  orders of magnitude looser than the scores it would have to separate. It prunes nothing.
+
+`prune_sim <index.dat> <queries.csr> <truth.txt> <k> <cut> <k'> <T,...> <R,...> [criterion]`
+is what made this affordable: it reads an existing index and runs the real block-budget search
+over a *simulated* truncated layout, so a whole (T, rescore) grid costs one pass instead of a
+build per cell. Its T=0/R=0 row must reproduce the index's own measured recall — that is the
+control, and it does (0.926103 against 0.926074 measured). Trust it for recall only; it
+recomputes the truncation per query, so its timings mean nothing.
+
 ## Caveats
 
 - **`base_small` is a smoke test, not a benchmark** — it fits in cache, so the

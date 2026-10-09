@@ -10,6 +10,7 @@
 #ifndef INLINE_FORWARD_INDEX_H
 #define INLINE_FORWARD_INDEX_H
 
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
@@ -37,7 +38,33 @@ namespace nsparse::detail {
  * element types compute_similarity consumes; off[] is a u32 within-block CSR
  * offset, capped at INT32_MAX by the writer so it converts to idx_t losslessly.
  * Component: io/inline_forward_index_io.h.
+ *
+ * A doc's vector is duplicated into every block that holds it -- about 13 copies
+ * at the standard parameters -- which is what makes a block one contiguous read
+ * and also what makes the section the bulk of the file. The header's
+ * `max_doc_nnz` bounds the *extra* copies: when it is non-zero, one copy of each
+ * doc stays whole and every other copy keeps only its largest max_doc_nnz
+ * components. Blocks are then cheaper to score but their scores are lower bounds,
+ * so a reader that sees max_doc_nnz != 0 must re-score its best candidates
+ * against the whole copies (DocLocator finds them) before trusting the ranking.
+ * max_doc_nnz == 0 means every copy is whole and no re-scoring is needed.
  */
+
+// Locates the one copy of a doc's vector that is never truncated. When
+// posting_list == kRemainder the vector is row `block` of the remainder store
+// (docs that no block holds); otherwise it is slot `slot` of inline-forward
+// block (posting_list, block). Serialized as a per-doc array, so a format struct
+// rather than a search-side detail.
+struct DocLocator {
+    uint32_t posting_list;
+    uint32_t block;
+    uint32_t slot;
+    static constexpr uint32_t kRemainder = UINT32_MAX;
+};
+static_assert(sizeof(DocLocator) == 12,
+              "DocLocator is borrowed from the mapping");
+static_assert(std::is_standard_layout_v<DocLocator>);
+static_assert(std::is_trivially_copyable_v<DocLocator>);
 
 // Block placement: page-aligned (padded to page_size) or packed (blocks
 // back-to-back on the minimum kMinBlockAlign boundary that keeps the per-block
@@ -63,10 +90,17 @@ inline constexpr uint64_t kMinBlockAlign = 8;
 // to kMinBlockAlign when packed).
 struct InlineForwardIndexHeader {
     uint32_t element_size;  // 1, 2, or 4
+    // Components kept by a doc's truncated copies; 0 = every copy is whole.
+    // Sits in what was padding after element_size, so the header keeps its size
+    // and a file written before this field existed reads back as 0 (the writer
+    // value-initializes the header, so those bytes were already zero).
+    uint32_t max_doc_nnz;
     uint64_t n_blocks;
     uint64_t page_size;  // effective block alignment (>= kMinBlockAlign)
 };
 static_assert(sizeof(InlineForwardIndexHeader) == 24);
+static_assert(offsetof(InlineForwardIndexHeader, n_blocks) == 8,
+              "max_doc_nnz must occupy the old padding, not shift the fields");
 static_assert(std::is_standard_layout_v<InlineForwardIndexHeader>);
 static_assert(std::is_trivially_copyable_v<InlineForwardIndexHeader>);
 

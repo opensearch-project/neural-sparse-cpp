@@ -9,6 +9,7 @@
 
 #include "nsparse/index_factory.h"
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -66,6 +67,21 @@ SeismicClusterParameters parse_cluster_params(const GetParam& get_param) {
                              .batch_file_output_path =
                                  get_param("batch_file_output_path", "")},
         .seed = std::stoi(get_param("seed", std::to_string(kRandomSeed)))};
+}
+
+// How many components a doc's extra inline copies keep, for the two disk types
+// (0 = keep every copy whole). See inline_forward_index.h.
+template <class GetParam>
+uint32_t parse_inline_max_nnz(const GetParam& get_param) {
+    // Parsed signed: std::stoul accepts "-1" and wraps it to ULONG_MAX, which
+    // would silently build an untruncated index from a typo.
+    const std::string text = get_param("inline_max_nnz", "0");
+    const long long value = std::stoll(text);
+    if (value < 0 || value > static_cast<long long>(UINT32_MAX)) {
+        throw std::invalid_argument("inline_max_nnz must be in [0, 2^32), got " +
+                                    text);
+    }
+    return static_cast<uint32_t>(value);
 }
 
 struct QuantizerConfig {
@@ -149,13 +165,15 @@ Index* index_factory(int dimension, const char* description) {
     }
 
     if (index_type == "disk_seismic") {
-        return new DiskSeismicIndex(dimension, parse_cluster_params(get_param));
+        return new DiskSeismicIndex(dimension, parse_cluster_params(get_param),
+                                    parse_inline_max_nnz(get_param));
     }
 
     if (index_type == "disk_seismic_sq") {
         const QuantizerConfig q = parse_quantizer_config(get_param);
         return new DiskSeismicScalarQuantizedIndex(
-            q.type, q.vmin, q.vmax, parse_cluster_params(get_param), dimension);
+            q.type, q.vmin, q.vmax, parse_cluster_params(get_param), dimension,
+            parse_inline_max_nnz(get_param));
     }
 
     if (index_type == "seismic_sq") {

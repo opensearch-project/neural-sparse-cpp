@@ -24,12 +24,16 @@
 namespace nsparse {
 
 // Overrides the quantizer range a query is encoded with (the type is always the
-// index's); everything else is DiskSeismicSearchParameters (cut + k_prime).
+// index's); everything else is DiskSeismicSearchParameters (cut, k_prime, and
+// the re-scoring depth for an index built with inline_max_nnz).
 struct DiskSeismicSQSearchParameters : public DiskSeismicSearchParameters {
     float vmin;
     float vmax;
-    DiskSeismicSQSearchParameters(float vmin, float vmax, int cut, int k_prime)
-        : DiskSeismicSearchParameters(cut, k_prime), vmax(vmax), vmin(vmin) {}
+    DiskSeismicSQSearchParameters(float vmin, float vmax, int cut, int k_prime,
+                                  int rescore = kDefaultRescoreDepth)
+        : DiskSeismicSearchParameters(cut, k_prime, rescore),
+          vmax(vmax),
+          vmin(vmin) {}
 };
 
 // A DiskSeismicIndex over scalar-quantized codes: the forward vectors and the
@@ -44,14 +48,17 @@ struct DiskSeismicSQSearchParameters : public DiskSeismicSearchParameters {
 class DiskSeismicScalarQuantizedIndex : public DiskSeismicIndexBase {
 public:
     static constexpr std::array<char, 4> name = {'D', 'S', 'S', 'Q'};
-    // Bump whenever write_index's payload layout changes.
-    static constexpr uint32_t kFormatVersion = 1;
+    // Bump whenever write_index's payload layout changes. 2 added the
+    // truncated inline forward index: a v2 file may hold partial copies that a
+    // v1 reader would score as if whole. Reading v1 stays supported (nothing is
+    // truncated there), so only new files need the newer build.
+    static constexpr uint32_t kFormatVersion = 2;
 
     explicit DiskSeismicScalarQuantizedIndex(int dim);
     DiskSeismicScalarQuantizedIndex(QuantizerType quantizer_type, float vmin,
                                     float vmax,
-                                    SeismicClusterParameters parameter,
-                                    int dim);
+                                    SeismicClusterParameters parameter, int dim,
+                                    uint32_t inline_max_nnz = 0);
     ~DiskSeismicScalarQuantizedIndex() override = default;
     std::array<char, 4> id() const override { return name; }
 

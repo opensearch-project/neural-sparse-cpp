@@ -94,6 +94,18 @@ target_link_libraries(index_size_stats PRIVATE
     absl::flat_hash_map
 )
 
+# Recall of a narrower inline forward layout, simulated over an index already on
+# disk. Not a google-benchmark target: it reports recall for a grid of candidate
+# formats, and deliberately says nothing about latency.
+add_executable(prune_sim prune_sim.cpp)
+target_include_directories(prune_sim PRIVATE ${PROJECT_SOURCE_DIR})
+target_link_libraries(prune_sim PRIVATE
+    ${NSPARSE_BENCH_LIB}
+    OpenMP::OpenMP_CXX
+    absl::flat_hash_set
+    absl::flat_hash_map
+)
+
 # Peak-RSS build-memory driver for the term-batched build. Not a
 # google-benchmark target: that harness reports throughput, and what matters here
 # is the high-water mark of a single build, one configuration per process.

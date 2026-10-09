@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -21,6 +22,8 @@
 #include <vector>
 
 #include "nsparse/disk_seismic_index.h"
+#include "nsparse/disk_seismic_search.h"
+#include "nsparse/id_selector.h"
 #include "nsparse/index_factory.h"
 #include "nsparse/io/buffered_io.h"
 #include "nsparse/io/index_io.h"
@@ -509,6 +512,310 @@ TEST(DiskSeismicSQIndex, MmapCodesCsrBuildMatchesAddBuild) {
                                           cluster_params(), kDim);
     EXPECT_THROW(eight.read_csr(wrong.native().c_str(), Residency::kMmap),
                  std::invalid_argument);
+}
+
+// --- Truncated inline forward index (inline_max_nnz) ---
+
+// The anchor for the whole scheme: truncating the extra inline copies changes
+// only how candidates are *ranked* before re-scoring, so with every block
+// selected and a re-scoring depth past the candidate pool the result must be
+// bit-identical to keeping every copy whole.
+TEST(DiskSeismicSQIndex, TruncatedInlineMatchesWholeWhenEverythingIsRescored) {
+    const CSR corpus = make_corpus(1500, /*seed=*/1);
+    const CSR queries = make_corpus(40, /*seed=*/2);
+    // A limit well below the corpus's 5..25 nnz per doc, so most copies are cut.
+    constexpr uint32_t kInlineMaxNnz = 6;
+
+    DiskSeismicScalarQuantizedIndex whole(QuantizerType::QT_8bit, 0.0F, 1.0F,
+                                          cluster_params(), kDim);
+    add_corpus(whole, corpus);
+    whole.build();
+    TempIndexFile whole_file("nsparse_dssq_trunc_whole.idx");
+    write_index(&whole, whole_file.c_str());
+    std::unique_ptr<Index> whole_mapped(
+        read_index(whole_file.c_str(), IndexIoFlag::kUseMmap));
+    ASSERT_NE(whole_mapped, nullptr);
+
+    DiskSeismicScalarQuantizedIndex cut(QuantizerType::QT_8bit, 0.0F, 1.0F,
+                                        cluster_params(), kDim, kInlineMaxNnz);
+    add_corpus(cut, corpus);
+    cut.build();
+    TempIndexFile cut_file("nsparse_dssq_trunc_cut.idx");
+    write_index(&cut, cut_file.c_str());
+    std::unique_ptr<Index> cut_mapped(
+        read_index(cut_file.c_str(), IndexIoFlag::kUseMmap));
+    ASSERT_NE(cut_mapped, nullptr);
+
+    // Same clusters (fixed seed) and every block selected, so both see the same
+    // candidate pool.
+    DiskSeismicSearchParameters params(/*cut=*/10, /*k_prime=*/kAllBlocks);
+    DiskSeismicSearchParameters rescore_all(/*cut=*/10, /*k_prime=*/kAllBlocks,
+                                            /*rescore=*/100000);
+    expect_same_ranking_modulo_ties(
+        search_all(*cut_mapped, queries, 10, &rescore_all),
+        search_all(*whole_mapped, queries, 10, &params));
+    EXPECT_LT(cut_file.size(), whole_file.size());
+}
+
+// The whole point: the file gets smaller, and the truncation survives the round
+// trip so a reader knows it must re-score.
+TEST(DiskSeismicSQIndex, TruncatedInlineShrinksTheFile) {
+    const CSR corpus = make_corpus(1200, /*seed=*/7);
+    std::uintmax_t previous = 0;
+    // Tighter limits are monotonically smaller files; 0 keeps every copy whole.
+    for (const uint32_t limit : {0U, 12U, 6U, 3U}) {
+        DiskSeismicScalarQuantizedIndex index(QuantizerType::QT_8bit, 0.0F,
+                                              1.0F, cluster_params(), kDim,
+                                              limit);
+        add_corpus(index, corpus);
+        index.build();
+        TempIndexFile file("nsparse_dssq_trunc_size.idx");
+        write_index(&index, file.c_str());
+        if (previous != 0) {
+            EXPECT_LT(file.size(), previous) << "limit " << limit;
+        }
+        previous = file.size();
+        std::unique_ptr<Index> mapped(
+            read_index(file.c_str(), IndexIoFlag::kUseMmap));
+        ASSERT_NE(mapped, nullptr);
+        // Searching a truncated index still returns k results.
+        const CSR queries = make_corpus(5, /*seed=*/8);
+        DiskSeismicSearchParameters params(/*cut=*/10, /*k_prime=*/32);
+        const ScoreIds got = search_all(*mapped, queries, 10, &params);
+        for (const auto& ids : got.second) {
+            EXPECT_EQ(ids.size(), 10U);
+        }
+    }
+}
+
+// Docs that no block holds live in the remainder store, which is never
+// truncated -- so the exact-match path over them keeps working, and the
+// re-scoring pass can still resolve them.
+TEST(DiskSeismicSQIndex, TruncationLeavesRemainderDocsWhole) {
+    const CSR corpus = make_corpus_with_remainder(/*n_fillers=*/64,
+                                                  /*n_victims=*/3);
+    const std::vector<idx_t> victims = {64, 65, 66};
+    DiskSeismicScalarQuantizedIndex index(QuantizerType::QT_8bit, 0.0F, 1.0F,
+                                          cluster_params(), kDim,
+                                          /*inline_max_nnz=*/1);
+    add_corpus(index, corpus);
+    index.build();
+    TempIndexFile file("nsparse_dssq_trunc_remainder.idx");
+    write_index(&index, file.c_str());
+    std::unique_ptr<Index> mapped(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+    ASSERT_NE(mapped, nullptr);
+
+    CSR queries;
+    queries.n = 1;
+    queries.indptr = {0, 1};
+    queries.indices = {0};
+    queries.values = {1.0F};
+    SetIDSelector selector(victims.size(), victims.data());
+    DiskSeismicSearchParameters params(/*cut=*/10, /*k_prime=*/32);
+    params.set_id_selector(&selector);
+    expect_all_members_returned(search_all(*mapped, queries, 10, &params),
+                                victims);
+}
+
+// A truncated index built through the factory string, since that is how the
+// knob reaches production callers.
+TEST(DiskSeismicSQIndex, FactoryAcceptsInlineMaxNnz) {
+    const CSR corpus = make_corpus(600, /*seed=*/3);
+    std::unique_ptr<Index> index(index_factory(
+        kDim,
+        "disk_seismic_sq,quantizer=8bit|vmin=0.0|vmax=1.0|lambda=32|beta=8|"
+        "alpha=0.4|seed=42|inline_max_nnz=6"));
+    ASSERT_NE(index, nullptr);
+    add_corpus(*index, corpus);
+    index->build();
+    TempIndexFile file("nsparse_dssq_trunc_factory.idx");
+    write_index(index.get(), file.c_str());
+    std::unique_ptr<Index> mapped(
+        read_index(file.c_str(), IndexIoFlag::kUseMmap));
+    ASSERT_NE(mapped, nullptr);
+    EXPECT_EQ(mapped->num_vectors(), static_cast<size_t>(corpus.n));
+}
+
+// --- The rescore search parameter ---
+
+// Builds, writes, and mmap-reloads a seeded 8-bit index over `corpus`, with
+// inline_max_nnz = `limit` (0 = every copy whole). Truncation only exists on
+// disk, so every rescore test has to go through a reload.
+std::unique_ptr<Index> mapped_sq(const CSR& corpus, uint32_t limit,
+                                 TempIndexFile& file) {
+    DiskSeismicScalarQuantizedIndex index(QuantizerType::QT_8bit, 0.0F, 1.0F,
+                                          cluster_params(), kDim, limit);
+    add_corpus(index, corpus);
+    index.build();
+    write_index(&index, file.c_str());
+    return std::unique_ptr<Index>(read_index(file.c_str(), IndexIoFlag::kUseMmap));
+}
+
+TEST(DiskSeismicSearchParameters, CarriesRescoreDepth) {
+    EXPECT_EQ(DiskSeismicSearchParameters().rescore, kDefaultRescoreDepth);
+    EXPECT_EQ(DiskSeismicSearchParameters(3, 50).rescore, kDefaultRescoreDepth);
+    EXPECT_EQ(DiskSeismicSearchParameters(3, 50, 77).rescore, 77);
+    EXPECT_EQ(DiskSeismicSQSearchParameters(0.0F, 1.0F, 3, 50).rescore,
+              kDefaultRescoreDepth);
+    EXPECT_EQ(DiskSeismicSQSearchParameters(0.0F, 1.0F, 3, 50, 77).rescore, 77);
+
+    // resolve_cut_and_budget is what search reads it through: a disk parameter
+    // carries its own depth, anything else gets the default.
+    const DiskSeismicSQSearchParameters sq(0.0F, 1.0F, 4, 60, 77);
+    const detail::DiskSeismicCutBudget from_sq =
+        detail::resolve_cut_and_budget(&sq);
+    EXPECT_EQ(from_sq.cut, 4);
+    EXPECT_EQ(from_sq.k_prime, 60);
+    EXPECT_EQ(from_sq.rescore, 77);
+    const SeismicSearchParameters plain(5, 1.0F);
+    EXPECT_EQ(detail::resolve_cut_and_budget(&plain).rescore,
+              kDefaultRescoreDepth);
+    EXPECT_EQ(detail::resolve_cut_and_budget(nullptr).rescore,
+              kDefaultRescoreDepth);
+}
+
+// On an index whose copies are all whole there is nothing to re-score, so the
+// depth must not change a single result.
+TEST(DiskSeismicSQIndex, RescoreIsIgnoredWithoutTruncation) {
+    const CSR corpus = make_corpus(1200, /*seed=*/11);
+    const CSR queries = make_corpus(30, /*seed=*/12);
+    TempIndexFile file("nsparse_dssq_rescore_whole.idx");
+    std::unique_ptr<Index> mapped = mapped_sq(corpus, 0, file);
+    ASSERT_NE(mapped, nullptr);
+    DiskSeismicSearchParameters shallow(/*cut=*/10, /*k_prime=*/32, /*rescore=*/10);
+    DiskSeismicSearchParameters deep(/*cut=*/10, /*k_prime=*/32, /*rescore=*/100000);
+    expect_same_results(search_all(*mapped, queries, 10, &shallow),
+                        search_all(*mapped, queries, 10, &deep));
+}
+
+// After re-scoring, a returned score is the doc's true score, not the lower
+// bound its truncated copy gave -- even at depth k, where the second pass
+// cannot change which docs come back, only what they score.
+TEST(DiskSeismicSQIndex, RescoredScoresAreExact) {
+    const CSR corpus = make_corpus(1200, /*seed=*/13);
+    const CSR queries = make_corpus(20, /*seed=*/14);
+    constexpr int kK = 10;
+    TempIndexFile cut_file("nsparse_dssq_rescore_exact_cut.idx");
+    std::unique_ptr<Index> cut = mapped_sq(corpus, /*limit=*/4, cut_file);
+    TempIndexFile whole_file("nsparse_dssq_rescore_exact_whole.idx");
+    std::unique_ptr<Index> whole = mapped_sq(corpus, 0, whole_file);
+    ASSERT_NE(cut, nullptr);
+    ASSERT_NE(whole, nullptr);
+
+    for (const int depth : {kK, 50}) {
+        DiskSeismicSearchParameters params(/*cut=*/10, /*k_prime=*/32, depth);
+        const ScoreIds got = search_all(*cut, queries, kK, &params);
+        for (idx_t q = 0; q < queries.n; ++q) {
+            // An enumerable selector of size <= k takes the exact-match path,
+            // which scores exactly the named docs against their whole vectors
+            // in the untruncated index: an independent oracle.
+            std::vector<idx_t> members;
+            for (const idx_t id : got.second[q]) {
+                if (id != detail::INVALID_IDX) {
+                    members.push_back(id);
+                }
+            }
+            SetIDSelector selector(members.size(), members.data());
+            DiskSeismicSearchParameters exact(/*cut=*/10, /*k_prime=*/32);
+            exact.set_id_selector(&selector);
+            CSR one;
+            one.n = 1;
+            one.indptr = {0, queries.indptr[q + 1] - queries.indptr[q]};
+            one.indices.assign(queries.indices.begin() + queries.indptr[q],
+                               queries.indices.begin() + queries.indptr[q + 1]);
+            one.values.assign(queries.values.begin() + queries.indptr[q],
+                              queries.values.begin() + queries.indptr[q + 1]);
+            const ScoreIds want = search_all(*whole, one, kK, &exact);
+            for (size_t j = 0; j < members.size(); ++j) {
+                const auto at = std::find(want.second[0].begin(),
+                                          want.second[0].end(), members[j]);
+                ASSERT_NE(at, want.second[0].end());
+                EXPECT_FLOAT_EQ(got.first[q][j],
+                                want.first[0][at - want.second[0].begin()])
+                    << "depth " << depth << " query " << q << " doc "
+                    << members[j] << " returned a lower bound";
+            }
+        }
+    }
+}
+
+// Fewer than k re-scored candidates could not fill the result, so a depth below
+// k behaves exactly like depth k.
+TEST(DiskSeismicSQIndex, RescoreBelowKIsRaisedToK) {
+    const CSR corpus = make_corpus(1200, /*seed=*/15);
+    const CSR queries = make_corpus(30, /*seed=*/16);
+    TempIndexFile file("nsparse_dssq_rescore_floor.idx");
+    std::unique_ptr<Index> mapped = mapped_sq(corpus, /*limit=*/4, file);
+    ASSERT_NE(mapped, nullptr);
+    DiskSeismicSearchParameters at_k(/*cut=*/10, /*k_prime=*/32, /*rescore=*/10);
+    const ScoreIds want = search_all(*mapped, queries, 10, &at_k);
+    for (const int below : {0, 1, 9}) {
+        DiskSeismicSearchParameters params(/*cut=*/10, /*k_prime=*/32, below);
+        expect_same_results(search_all(*mapped, queries, 10, &params), want);
+    }
+}
+
+// A deeper second pass re-scores a superset of candidates, and the k best exact
+// scores of a superset are never worse -- so each query's summed top-k score is
+// non-decreasing in the depth. (Recall itself can only tie-break differently.)
+TEST(DiskSeismicSQIndex, DeeperRescoreNeverLowersTheResult) {
+    const CSR corpus = make_corpus(1500, /*seed=*/17);
+    const CSR queries = make_corpus(30, /*seed=*/18);
+    TempIndexFile file("nsparse_dssq_rescore_monotone.idx");
+    std::unique_ptr<Index> mapped = mapped_sq(corpus, /*limit=*/4, file);
+    ASSERT_NE(mapped, nullptr);
+    std::vector<double> previous(queries.n, -1.0);
+    for (const int depth : {10, 20, 50, 200, 100000}) {
+        DiskSeismicSearchParameters params(/*cut=*/10, /*k_prime=*/kAllBlocks,
+                                           depth);
+        const ScoreIds got = search_all(*mapped, queries, 10, &params);
+        for (idx_t q = 0; q < queries.n; ++q) {
+            double sum = 0.0;
+            for (const float score : got.first[q]) {
+                sum += score > 0.0F ? score : 0.0F;
+            }
+            EXPECT_GE(sum, previous[q] - 1e-4)
+                << "depth " << depth << " lowered query " << q;
+            previous[q] = sum;
+        }
+    }
+}
+
+// A negative depth is a caller bug, rejected on any disk index whether or not it
+// would have been used, like a non-positive k_prime.
+TEST(DiskSeismicSQIndex, RejectsNegativeRescore) {
+    const CSR corpus = make_corpus(600, /*seed=*/19);
+    const CSR queries = make_corpus(5, /*seed=*/20);
+    for (const uint32_t limit : {0U, 4U}) {
+        TempIndexFile file("nsparse_dssq_rescore_negative.idx");
+        std::unique_ptr<Index> mapped = mapped_sq(corpus, limit, file);
+        ASSERT_NE(mapped, nullptr);
+        DiskSeismicSearchParameters params(/*cut=*/10, /*k_prime=*/32,
+                                           /*rescore=*/-1);
+        EXPECT_THROW(search_all(*mapped, queries, 10, &params),
+                     std::invalid_argument)
+            << "inline_max_nnz " << limit;
+    }
+}
+
+// A malformed limit must fail the build spec, not quietly become "no
+// truncation" -- std::stoul alone would wrap "-1" to ULONG_MAX.
+TEST(DiskSeismicSQIndex, FactoryRejectsABadInlineMaxNnz) {
+    const std::string base =
+        "disk_seismic_sq,quantizer=8bit|vmin=0.0|vmax=1.0|lambda=32|beta=8|"
+        "inline_max_nnz=";
+    for (const char* bad : {"-1", "4294967296", "abc", ""}) {
+        EXPECT_THROW(std::unique_ptr<Index>(
+                         index_factory(kDim, (base + bad).c_str())),
+                     std::exception)
+            << "inline_max_nnz=" << bad;
+    }
+    EXPECT_NE(std::unique_ptr<Index>(index_factory(kDim, (base + "0").c_str())),
+              nullptr);
+    EXPECT_NE(std::unique_ptr<Index>(
+                  index_factory(kDim, (base + "4294967295").c_str())),
+              nullptr);
 }
 
 }  // namespace nsparse
