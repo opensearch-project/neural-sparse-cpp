@@ -28,20 +28,6 @@
 
 namespace nsparse {
 
-namespace detail {
-// Locates one full copy of a doc's vector. When posting_list == kRemainder the
-// vector is row `block` of the remainder store; otherwise it is slot `slot` of
-// inline-forward block (posting_list, block).
-struct DocLocator {
-    uint32_t posting_list;
-    uint32_t block;
-    uint32_t slot;
-    static constexpr uint32_t kRemainder = UINT32_MAX;
-};
-static_assert(sizeof(DocLocator) == 12,
-              "DocLocator is borrowed from the mapping");
-}  // namespace detail
-
 // Shared implementation of the two disk-resident SEISMIC indexes: the cluster
 // summaries live in RAM, the per-document forward vectors live on disk in the
 // block-contiguous (inline) layout and are borrowed via mmap at search time,
@@ -77,7 +63,12 @@ public:
     }
 
 protected:
-    DiskSeismicIndexBase(int dim, SeismicClusterParameters parameter);
+    // inline_max_nnz > 0 truncates the extra inline copies of each doc to their
+    // largest inline_max_nnz components and makes search re-score its best
+    // candidates against the whole copies; 0 keeps every copy whole. See
+    // inline_forward_index.h for the format and the trade.
+    DiskSeismicIndexBase(int dim, SeismicClusterParameters parameter,
+                         uint32_t inline_max_nnz = 0);
 
     // --- Hooks the concrete indexes implement. ---
 
@@ -142,23 +133,24 @@ private:
     void read_index(IOReader* io_reader, const IndexHeader& header,
                     int io_flags = 0) override;
 
-    // Appends the doc-locator directory and remainder vectors, built from the
-    // same clusters and vectors as the inline forward.
-    void write_doc_directory(IOWriter* io_writer,
-                             const SparseVectors& vectors) const;
+    // Which block holds each doc's whole copy: its first occurrence in
+    // (posting list, block, slot) order, or a remainder row for a doc no block
+    // holds. Computed once per write_index and used twice -- the inline forward
+    // writer needs it to know which copy to keep whole, and the serialized
+    // directory is the same table -- so the two cannot disagree about where a
+    // doc's whole vector is.
+    [[nodiscard]] std::vector<detail::DocLocator> build_doc_locators(
+        const SparseVectors& vectors) const;
 
-    // One doc's within-doc slice: component ids, element_size-wide codes, and
-    // the count. Borrowed from the live mapping or remainder_ (both outlive the
-    // call), so valid only within one search().
-    struct DocSlice {
-        const term_t* comps = nullptr;
-        const uint8_t* vals = nullptr;
-        size_t nnz = 0;
-    };
-    // Resolves one selected doc's full vector through the doc-locator
-    // directory: an inline-forward block slot, or a row of remainder_ when the
-    // doc was pruned from every block. Throws on a corrupt locator.
-    [[nodiscard]] DocSlice get_doc(idx_t doc_id, size_t element_size) const;
+    // Appends the doc-locator directory and the remainder vectors (the docs
+    // whose locator says kRemainder, in doc-id order).
+    void write_doc_directory(
+        IOWriter* io_writer, const SparseVectors& vectors,
+        const std::vector<detail::DocLocator>& locators) const;
+
+    // The store the re-scoring pass reads, or an empty one when this index has
+    // no locator table (a fresh in-RAM build).
+    [[nodiscard]] detail::FullVectorStore full_vector_store() const;
     // Scores every selected doc directly through the doc-locator directory, for
     // a mapped index. Requires doc_locators_ populated.
     [[nodiscard]] auto exact_match_directory(
@@ -168,9 +160,11 @@ private:
         -> pair_of_score_id_vectors_t;
 
     SeismicClusterParameters cluster_parameter_;
+    uint32_t inline_max_nnz_ = 0;
     size_t num_vectors_ = 0;
     // A borrowed per-doc locator table plus the full vectors of the docs that
-    // are missing from every block, used by the mapped-index exact match.
+    // are missing from every block. Reached by the mapped-index exact match and
+    // by the re-scoring pass, both of which need a doc's whole vector.
     const detail::DocLocator* doc_locators_ = nullptr;
     uint64_t num_locators_ = 0;
     SparseVectors remainder_;

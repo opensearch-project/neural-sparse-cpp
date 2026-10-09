@@ -27,8 +27,9 @@ namespace nsparse {
 DiskSeismicIndex::DiskSeismicIndex(int dim)
     : DiskSeismicIndexBase(dim, detail::kDefaultSeismicClusterParams) {}
 
-DiskSeismicIndex::DiskSeismicIndex(int dim, SeismicClusterParameters parameter)
-    : DiskSeismicIndexBase(dim, parameter) {}
+DiskSeismicIndex::DiskSeismicIndex(int dim, SeismicClusterParameters parameter,
+                                   uint32_t inline_max_nnz)
+    : DiskSeismicIndexBase(dim, parameter, inline_max_nnz) {}
 
 size_t DiskSeismicIndex::code_element_size() const { return U32; }
 

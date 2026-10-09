@@ -682,3 +682,323 @@ TEST(InlineForwardIndex, NullArgumentsRejected) {
     InlineForwardIndex reader;
     EXPECT_THROW(reader.mmap_deserialize(nullptr), std::invalid_argument);
 }
+
+// --- Truncated extra copies (header max_doc_nnz) ---
+
+// A doc in two blocks, truncated to its largest few components everywhere but
+// the one block its locator names -- which is what lets a re-scoring reader
+// recover the whole vector.
+TEST(InlineForwardIndex, KeepsOneWholeCopyAndTruncatesTheRest) {
+    constexpr uint32_t kKeep = 2;
+    // Doc 0 has 5 components with distinct values, so "the largest 2" is
+    // unambiguous: components 3 and 4 (values 0.9 and 0.8).
+    auto vectors = create_float_vectors(
+        {{0, 1, 2, 3, 4}, {1, 2}},
+        {{0.1F, 0.2F, 0.3F, 0.9F, 0.8F}, {0.5F, 0.6F}}, 10);
+    // Two posting lists, each with one block, both holding doc 0.
+    auto lists = build_lists({{{0, 1}}, {{0}}}, vectors);
+    // Doc 0's whole copy goes to list 0 block 0 slot 0, doc 1's to the same
+    // block at slot 1.
+    const std::vector<nsparse::detail::DocLocator> full_copies = {{0, 0, 0},
+                                                                 {0, 0, 1}};
+
+    InlineForwardIndex writer(lists, vectors,
+                              InlineForwardIndex::kDefaultPageSize,
+                              InlineLayout::kPacked, kKeep, &full_copies);
+    nsparse::BufferedIOWriter buffer;
+    writer.serialize(&buffer);
+    const std::vector<uint8_t> bin = buffer.data();
+    EXPECT_EQ(parse_header(bin).max_doc_nnz, kKeep);
+
+    auto index = read_index(bin);
+    EXPECT_EQ(index.max_doc_nnz(), kKeep);
+
+    // The named block keeps doc 0 whole.
+    const BlockView whole = index.block(0, 0);
+    ASSERT_FALSE(whole.absent());
+    ASSERT_EQ(whole.n_docs, 2U);
+    EXPECT_EQ(whole.nnz(0), 5U);
+    const std::vector<nsparse::term_t> all_comps(whole.doc_comps(0),
+                                                 whole.doc_comps(0) + 5);
+    EXPECT_EQ(all_comps, (std::vector<nsparse::term_t>{0, 1, 2, 3, 4}));
+    // Doc 1 is shorter than the limit, so it is whole wherever it appears.
+    EXPECT_EQ(whole.nnz(1), 2U);
+
+    // The other copy keeps only the two largest, still in ascending component
+    // order so the block stays readable as a CSR row.
+    const BlockView cut = index.block(1, 0);
+    ASSERT_FALSE(cut.absent());
+    ASSERT_EQ(cut.n_docs, 1U);
+    ASSERT_EQ(cut.nnz(0), kKeep);
+    const std::vector<nsparse::term_t> kept(cut.doc_comps(0),
+                                            cut.doc_comps(0) + kKeep);
+    EXPECT_EQ(kept, (std::vector<nsparse::term_t>{3, 4}));
+    const auto* kept_vals =
+        reinterpret_cast<const float*>(cut.doc_vals(0, nsparse::U32));
+    EXPECT_FLOAT_EQ(kept_vals[0], 0.9F);
+    EXPECT_FLOAT_EQ(kept_vals[1], 0.8F);
+}
+
+// Ties at the cut are taken in stored order, so exactly max_doc_nnz components
+// survive rather than every component that equals the boundary value.
+TEST(InlineForwardIndex, TruncationKeepsExactlyTheLimitAcrossTies) {
+    constexpr uint32_t kKeep = 3;
+    // All five values equal: every component is a tie at the boundary.
+    auto vectors = create_uint8_vectors({{0, 1, 2, 3, 4}, {7}},
+                                        {{5, 5, 5, 5, 5}, {9}}, 10);
+    auto lists = build_lists({{{0}}, {{0, 1}}}, vectors);
+    // Doc 0's whole copy is in list 1, so list 0's copy is the truncated one.
+    const std::vector<nsparse::detail::DocLocator> full_copies = {{1, 0, 0},
+                                                                 {1, 0, 1}};
+    InlineForwardIndex writer(lists, vectors,
+                              InlineForwardIndex::kDefaultPageSize,
+                              InlineLayout::kPacked, kKeep, &full_copies);
+    nsparse::BufferedIOWriter buffer;
+    writer.serialize(&buffer);
+    const std::vector<uint8_t> bin = buffer.data();
+    auto index = read_index(bin);
+
+    const BlockView cut = index.block(0, 0);
+    ASSERT_FALSE(cut.absent());
+    ASSERT_EQ(cut.nnz(0), kKeep);
+    const std::vector<nsparse::term_t> kept(cut.doc_comps(0),
+                                            cut.doc_comps(0) + kKeep);
+    EXPECT_EQ(kept, (std::vector<nsparse::term_t>{0, 1, 2}));
+    EXPECT_EQ(index.block(1, 0).nnz(0), 5U);  // the whole copy
+}
+
+// Truncating shrinks the section; the default writes nothing truncated.
+TEST(InlineForwardIndex, TruncationShrinksTheSectionAndDefaultsOff) {
+    auto vectors = create_float_vectors(
+        {{0, 1, 2, 3, 4, 5}, {0, 1, 2, 3, 4, 5}},
+        {{0.1F, 0.2F, 0.3F, 0.4F, 0.5F, 0.6F},
+         {0.6F, 0.5F, 0.4F, 0.3F, 0.2F, 0.1F}},
+        10);
+    auto lists = build_lists({{{0, 1}}, {{0, 1}}}, vectors);
+    const std::vector<nsparse::detail::DocLocator> full_copies = {{0, 0, 0},
+                                                                 {0, 0, 1}};
+
+    const auto whole =
+        serialize_bytes(lists, vectors, InlineForwardIndex::kDefaultPageSize,
+                        InlineLayout::kPacked);
+    EXPECT_EQ(parse_header(whole).max_doc_nnz, 0U);
+    EXPECT_EQ(read_index(whole).max_doc_nnz(), 0U);
+
+    InlineForwardIndex writer(lists, vectors,
+                              InlineForwardIndex::kDefaultPageSize,
+                              InlineLayout::kPacked, /*max_doc_nnz=*/2,
+                              &full_copies);
+    nsparse::BufferedIOWriter buffer;
+    writer.serialize(&buffer);
+    EXPECT_LT(buffer.data().size(), whole.size());
+}
+
+// The two truncation arguments are meaningless apart, so neither is accepted
+// alone, and a locator table has to cover every vector.
+TEST(InlineForwardIndex, RejectsInconsistentTruncationArguments) {
+    auto vectors = sample_float_vectors();
+    auto lists = build_lists(kLayout, vectors);
+    const std::vector<nsparse::detail::DocLocator> full_copies(
+        vectors.num_vectors(), {0, 0, 0});
+    const std::vector<nsparse::detail::DocLocator> too_short(1, {0, 0, 0});
+
+    EXPECT_THROW(InlineForwardIndex(lists, vectors,
+                                    InlineForwardIndex::kDefaultPageSize,
+                                    InlineLayout::kPacked, /*max_doc_nnz=*/2,
+                                    nullptr),
+                 std::invalid_argument);
+    EXPECT_THROW(InlineForwardIndex(lists, vectors,
+                                    InlineForwardIndex::kDefaultPageSize,
+                                    InlineLayout::kPacked, /*max_doc_nnz=*/0,
+                                    &full_copies),
+                 std::invalid_argument);
+    EXPECT_THROW(InlineForwardIndex(lists, vectors,
+                                    InlineForwardIndex::kDefaultPageSize,
+                                    InlineLayout::kPacked, /*max_doc_nnz=*/2,
+                                    &too_short),
+                 std::invalid_argument);
+}
+
+// --- Whole-copy resolution (resolve_doc / resolve_docs / doc_slice) ---
+
+// The locator table the index writer builds: each doc's first occurrence in
+// (pl, block, slot) order, which is the copy a truncating writer keeps whole.
+std::vector<nsparse::detail::DocLocator> first_occurrence_locators(
+    const std::vector<std::vector<std::vector<nsparse::idx_t>>>& layout,
+    size_t num_docs) {
+    using nsparse::detail::DocLocator;
+    std::vector<DocLocator> locators(num_docs,
+                                     {DocLocator::kRemainder, 0, 0});
+    std::vector<bool> seen(num_docs, false);
+    for (size_t pl = 0; pl < layout.size(); ++pl) {
+        for (size_t block = 0; block < layout[pl].size(); ++block) {
+            for (size_t slot = 0; slot < layout[pl][block].size(); ++slot) {
+                const auto doc = static_cast<size_t>(layout[pl][block][slot]);
+                if (!seen[doc]) {
+                    seen[doc] = true;
+                    locators[doc] = {static_cast<uint32_t>(pl),
+                                     static_cast<uint32_t>(block),
+                                     static_cast<uint32_t>(slot)};
+                }
+            }
+        }
+    }
+    return locators;
+}
+
+// 40 docs of 6 components each, every doc in three blocks, truncated to 2 --
+// enough docs to cross resolve_docs' internal chunk boundary several times.
+struct TruncatedFixture {
+    static constexpr size_t kDocs = 40;
+    static constexpr uint32_t kKeep = 2;
+    nsparse::SparseVectors vectors;
+    std::vector<std::vector<std::vector<nsparse::idx_t>>> layout;
+    std::vector<nsparse::detail::DocLocator> locators;
+    std::vector<uint8_t> bin;
+
+    TruncatedFixture()
+        : vectors(nsparse::SparseVectors(
+              {.element_size = nsparse::U32, .dimension = 64})) {
+        for (size_t doc = 0; doc < kDocs; ++doc) {
+            std::vector<nsparse::term_t> comps;
+            std::vector<float> vals;
+            for (nsparse::term_t c = 0; c < 6; ++c) {
+                comps.push_back(static_cast<nsparse::term_t>(doc % 8 + c * 9));
+                vals.push_back(0.1F * static_cast<float>(c + 1) +
+                               0.001F * static_cast<float>(doc));
+            }
+            vectors.add_vector(comps.data(), comps.size(),
+                               reinterpret_cast<const uint8_t*>(vals.data()),
+                               vals.size() * sizeof(float));
+        }
+        // Three lists; list p puts doc d in block (d + p) % 5.
+        for (size_t pl = 0; pl < 3; ++pl) {
+            std::vector<std::vector<nsparse::idx_t>> blocks(5);
+            for (size_t doc = 0; doc < kDocs; ++doc) {
+                blocks[(doc + pl) % 5].push_back(
+                    static_cast<nsparse::idx_t>(doc));
+            }
+            layout.push_back(std::move(blocks));
+        }
+        locators = first_occurrence_locators(layout, kDocs);
+        auto lists = build_lists(layout, vectors);
+        InlineForwardIndex writer(lists, vectors,
+                                  InlineForwardIndex::kDefaultPageSize,
+                                  InlineLayout::kPacked, kKeep, &locators);
+        nsparse::BufferedIOWriter buffer;
+        writer.serialize(&buffer);
+        bin = buffer.data();
+    }
+};
+
+TEST(InlineForwardIndex, ResolveDocReturnsTheWholeCopy) {
+    TruncatedFixture fx;
+    auto index = read_index(fx.bin);
+    const nsparse::detail::FullVectorStore store{
+        .fwd = &index,
+        .locators = fx.locators.data(),
+        .num_locators = fx.locators.size(),
+        .remainder = nullptr};
+    const auto* indptr = fx.vectors.indptr_data();
+    for (size_t doc = 0; doc < TruncatedFixture::kDocs; ++doc) {
+        const nsparse::detail::DocSlice slice = nsparse::detail::resolve_doc(
+            store, static_cast<nsparse::idx_t>(doc), nsparse::U32);
+        const auto start = indptr[doc];
+        ASSERT_EQ(slice.nnz, static_cast<size_t>(indptr[doc + 1] - start))
+            << "doc " << doc << " resolved to a truncated copy";
+        EXPECT_EQ(0, std::memcmp(slice.comps, fx.vectors.indices_data() + start,
+                                 slice.nnz * sizeof(nsparse::term_t)));
+        EXPECT_EQ(0, std::memcmp(slice.vals,
+                                 fx.vectors.values_data() +
+                                     static_cast<size_t>(start) * sizeof(float),
+                                 slice.nnz * sizeof(float)));
+    }
+}
+
+// The batched walk is an optimization of resolve_doc and must agree with it
+// exactly -- same slices, in the caller's order, duplicates included -- across
+// more docs than one internal chunk.
+TEST(InlineForwardIndex, ResolveDocsMatchesResolveDocOneByOne) {
+    TruncatedFixture fx;
+    auto index = read_index(fx.bin);
+    const nsparse::detail::FullVectorStore store{
+        .fwd = &index,
+        .locators = fx.locators.data(),
+        .num_locators = fx.locators.size(),
+        .remainder = nullptr};
+    std::vector<nsparse::idx_t> ids;
+    for (size_t i = 0; i < 3 * TruncatedFixture::kDocs; ++i) {
+        ids.push_back(static_cast<nsparse::idx_t>((i * 17) %
+                                                  TruncatedFixture::kDocs));
+    }
+    nsparse::detail::DocResolveScratch scratch;
+    std::vector<nsparse::detail::DocSlice> slices;
+    nsparse::detail::resolve_docs(store, ids.data(), ids.size(), nsparse::U32,
+                                  &scratch, &slices);
+    ASSERT_EQ(slices.size(), ids.size());
+    for (size_t i = 0; i < ids.size(); ++i) {
+        const auto one = nsparse::detail::resolve_doc(store, ids[i],
+                                                      nsparse::U32);
+        EXPECT_EQ(slices[i].comps, one.comps) << "position " << i;
+        EXPECT_EQ(slices[i].vals, one.vals) << "position " << i;
+        EXPECT_EQ(slices[i].nnz, one.nnz) << "position " << i;
+    }
+
+    // Reusing the scratch for a shorter batch must not leave stale entries.
+    nsparse::detail::resolve_docs(store, ids.data(), 3, nsparse::U32, &scratch,
+                                  &slices);
+    EXPECT_EQ(slices.size(), 3U);
+    nsparse::detail::resolve_docs(store, ids.data(), 0, nsparse::U32, &scratch,
+                                  &slices);
+    EXPECT_TRUE(slices.empty());
+}
+
+TEST(InlineForwardIndex, ResolveRejectsDocsOutsideTheDirectory) {
+    TruncatedFixture fx;
+    auto index = read_index(fx.bin);
+    const nsparse::detail::FullVectorStore store{
+        .fwd = &index,
+        .locators = fx.locators.data(),
+        .num_locators = fx.locators.size(),
+        .remainder = nullptr};
+    const auto past_end = static_cast<nsparse::idx_t>(TruncatedFixture::kDocs);
+    EXPECT_THROW(nsparse::detail::resolve_doc(store, past_end, nsparse::U32),
+                 std::out_of_range);
+    EXPECT_THROW(nsparse::detail::resolve_doc(store, -1, nsparse::U32),
+                 std::out_of_range);
+
+    const std::vector<nsparse::idx_t> ids = {0, 1, past_end};
+    nsparse::detail::DocResolveScratch scratch;
+    std::vector<nsparse::detail::DocSlice> slices;
+    EXPECT_THROW(nsparse::detail::resolve_docs(store, ids.data(), ids.size(),
+                                               nsparse::U32, &scratch, &slices),
+                 std::out_of_range);
+}
+
+// A locator naming a slot its block does not have is a corrupt directory; both
+// resolve paths must refuse it rather than read past the block.
+TEST(InlineForwardIndex, ResolveRejectsALocatorPastItsBlock) {
+    TruncatedFixture fx;
+    auto index = read_index(fx.bin);
+    std::vector<nsparse::detail::DocLocator> corrupt = fx.locators;
+    corrupt[0].slot = 1000;
+    const nsparse::detail::FullVectorStore store{
+        .fwd = &index,
+        .locators = corrupt.data(),
+        .num_locators = corrupt.size(),
+        .remainder = nullptr};
+    EXPECT_THROW(nsparse::detail::resolve_doc(store, 0, nsparse::U32),
+                 std::runtime_error);
+    const std::vector<nsparse::idx_t> ids = {0};
+    nsparse::detail::DocResolveScratch scratch;
+    std::vector<nsparse::detail::DocSlice> slices;
+    EXPECT_THROW(nsparse::detail::resolve_docs(store, ids.data(), ids.size(),
+                                               nsparse::U32, &scratch, &slices),
+                 std::runtime_error);
+
+    const nsparse::detail::InlineDirEntry* entry = index.dir_entry(0, 0);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_THROW(index.doc_slice(*entry, entry->n_docs), std::runtime_error);
+    EXPECT_EQ(index.dir_entry(0, 99), nullptr);
+    EXPECT_EQ(index.dir_entry(99, 0), nullptr);
+}

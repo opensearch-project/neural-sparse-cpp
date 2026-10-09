@@ -19,7 +19,7 @@
 //
 //   build  <csr> <descriptor> <out.dat>
 //   search <dat> <queries.csr> <k> <reps> <inmem|mmap> [truth.txt|-] [cut]
-//          [k_prime] [heap_factor] [labels_out.txt]
+//          [k_prime] [heap_factor] [labels_out.txt|-] [rescore]
 
 #include <algorithm>
 #include <chrono>
@@ -208,7 +208,12 @@ int do_search(int argc, char** argv) {
     const float heap_factor = argc > 10 ? static_cast<float>(std::atof(argv[10])) : 1.0F;
     // Where to write the final labels, in the truth-file format, so another run
     // can be scored against them.
-    const std::string labels_out_path = argc > 11 ? argv[11] : "";
+    const std::string labels_out_path =
+        (argc > 11 && std::strcmp(argv[11], "-") != 0) ? argv[11] : "";
+    // Candidates re-scored against their whole vectors, for an index whose
+    // inline copies are truncated (inline_max_nnz). 0 = the build's default; a
+    // whole-copy index ignores it either way.
+    const int rescore = argc > 12 ? std::atoi(argv[12]) : 0;
 
     const int io_flags =
         residency == "mmap" ? nsparse::IndexIoFlag::kUseMmap : 0;
@@ -237,8 +242,15 @@ int do_search(int argc, char** argv) {
 
     std::unique_ptr<nsparse::SeismicSearchParameters> params;
     if (k_prime > 0) {
-        params = std::make_unique<nsparse::DiskSeismicSearchParameters>(cut, k_prime);
-        std::cout << "search_params cut " << cut << " k_prime " << k_prime << "\n";
+        params = rescore > 0
+                     ? std::make_unique<nsparse::DiskSeismicSearchParameters>(
+                           cut, k_prime, rescore)
+                     : std::make_unique<nsparse::DiskSeismicSearchParameters>(
+                           cut, k_prime);
+        std::cout << "search_params cut " << cut << " k_prime " << k_prime
+                  << " rescore "
+                  << (rescore > 0 ? rescore : nsparse::kDefaultRescoreDepth)
+                  << "\n";
     } else {
         params = std::make_unique<nsparse::SeismicSearchParameters>(cut, heap_factor);
         std::cout << "search_params cut " << cut << " heap_factor " << heap_factor << "\n";

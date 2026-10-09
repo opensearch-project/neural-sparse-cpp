@@ -36,15 +36,27 @@ struct BlockCandidate {
     uint32_t cid;
 };
 
-// (cut, k_prime) resolved from search parameters, defaulting to
+// (cut, k_prime, rescore) resolved from search parameters, defaulting to
 // DiskSeismicSearchParameters. Each index still validates k_prime with its own
 // error message.
 struct DiskSeismicCutBudget {
     int cut;
     int k_prime;
+    int rescore;
 };
 DiskSeismicCutBudget resolve_cut_and_budget(
     const SearchParameters* search_parameters);
+
+// The second scoring pass, for an index whose inline copies are truncated: where
+// the whole vectors are, how many candidates to re-score, and the per-thread
+// scratch the batched resolve needs. One per query thread, reused across
+// queries.
+struct RescorePass {
+    FullVectorStore store;
+    int depth = 0;
+    DocResolveScratch scratch;
+    std::vector<DocSlice> slices;
+};
 
 // The `cut` highest-weighted query terms, read from `codes` at `element_size`
 // bytes per value (4 = float, 2 = uint16, 1 = uint8).
@@ -65,6 +77,12 @@ pair_of_score_id_vectors_t initialize_padded_results(idx_t n, int k);
 // it is non-null, else from the in-RAM `vectors` of a fresh build. Returns the
 // raw (undecoded) top-k scores + ids, unpadded: the caller decodes if it must
 // and pads to k.
+//
+// When `rescore` is non-null the blocks hold truncated copies, so block scores
+// are lower bounds and a second pass is required: its `depth` best candidates by
+// block score are scored again against their untruncated vectors and that
+// ranking is returned. Pass null when every copy is whole, which is the only
+// correct choice then -- a second pass would score the same bytes twice.
 pair_of_score_id_vector_t block_budget_query(
     uint8_t* dense, size_t element_size, absl::flat_hash_set<idx_t>& visited,
     std::vector<BlockCandidate>& candidates, std::vector<float>& score_scratch,
@@ -72,7 +90,7 @@ pair_of_score_id_vector_t block_budget_query(
     const std::vector<term_t>& cuts, int k, int k_prime,
     const std::vector<InvertedListClusters>& clusters,
     const InlineForwardIndex* fwd, const SparseVectors* vectors,
-    const IDSelector* id_selector);
+    const IDSelector* id_selector, RescorePass* rescore = nullptr);
 
 }  // namespace nsparse::detail
 

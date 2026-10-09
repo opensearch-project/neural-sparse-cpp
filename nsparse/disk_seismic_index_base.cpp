@@ -39,8 +39,11 @@
 namespace nsparse {
 
 DiskSeismicIndexBase::DiskSeismicIndexBase(int dim,
-                                           SeismicClusterParameters parameter)
-    : MmapIndex(dim), cluster_parameter_(parameter) {}
+                                           SeismicClusterParameters parameter,
+                                           uint32_t inline_max_nnz)
+    : MmapIndex(dim),
+      cluster_parameter_(parameter),
+      inline_max_nnz_(inline_max_nnz) {}
 
 void DiskSeismicIndexBase::add(idx_t n, const offset_t* indptr,
                                const term_t* indices, const float* values) {
@@ -139,6 +142,13 @@ auto DiskSeismicIndexBase::search(idx_t n, const offset_t* indptr,
         throw std::invalid_argument(
             "DiskSeismic index: k_prime (block budget) must be positive");
     }
+    // Checked even when the index is not truncated and the depth is unused, so
+    // a bad value fails the same way whichever index it is pointed at.
+    if (budget.rescore < 0) {
+        throw std::invalid_argument(
+            "DiskSeismic index: rescore (re-scoring depth) must be "
+            "non-negative");
+    }
 
     // Encode the whole query batch once at the stored width; a query's codes
     // start at query_batch + start * element_size.
@@ -156,6 +166,17 @@ auto DiskSeismicIndexBase::search(idx_t n, const offset_t* indptr,
     const detail::InlineForwardIndex* fwd =
         fwd_.num_blocks() > 0 ? &fwd_ : nullptr;
     const SparseVectors* vectors = fwd == nullptr ? vectors_.get() : nullptr;
+    // A truncated forward index makes block scores lower bounds, so the best
+    // candidates have to be scored again against the whole copies. Nothing to do
+    // when max_doc_nnz is 0 (including every pre-truncation file, which records
+    // 0) or for a fresh in-RAM build, whose vectors are the corpus itself.
+    const bool rescore_needed =
+        fwd != nullptr && fwd->max_doc_nnz() > 0 && doc_locators_ != nullptr;
+    // Re-scoring fewer than k candidates could not fill the result, so the depth
+    // is at least k; beyond the candidate pool it simply re-scores all of it.
+    const detail::FullVectorStore store =
+        rescore_needed ? full_vector_store() : detail::FullVectorStore{};
+    const int rescore_depth = rescore_needed ? std::max(budget.rescore, k) : 0;
     const IDSelector* id_selector = search_parameters == nullptr
                                         ? nullptr
                                         : search_parameters->get_id_selector();
@@ -171,6 +192,9 @@ auto DiskSeismicIndexBase::search(idx_t n, const offset_t* indptr,
         visited.reserve(static_cast<size_t>(std::max(k, 1)) * 4096);
         std::vector<detail::BlockCandidate> candidates;
         std::vector<float> score_scratch;
+        // Per-thread, so the batched whole-vector resolve reuses its buffers
+        // across the queries this thread handles.
+        detail::RescorePass rescore{.store = store, .depth = rescore_depth};
 
 #pragma omp for schedule(dynamic, 64)
         for (idx_t query_idx = 0; query_idx < n; ++query_idx) {
@@ -184,7 +208,8 @@ auto DiskSeismicIndexBase::search(idx_t n, const offset_t* indptr,
             auto [scores, ids] = detail::block_budget_query(
                 dense.data(), element_size, visited, candidates, score_scratch,
                 query_indices, query_codes, len, cuts, k, k_prime,
-                clustered_inverted_lists, fwd, vectors, id_selector);
+                clustered_inverted_lists, fwd, vectors, id_selector,
+                rescore_needed ? &rescore : nullptr);
             decode_scores(scores, search_parameters);
             scores.resize(k, -1.0F);
             ids.resize(k, detail::INVALID_IDX);
@@ -210,15 +235,21 @@ void DiskSeismicIndexBase::write_index(IOWriter* io_writer) {
     SparseVectors empty_vectors({.element_size = code_element_size(),
                                  .dimension = static_cast<size_t>(dimension_)});
     const SparseVectors& v = vectors_ != nullptr ? *vectors_ : empty_vectors;
-    detail::InlineForwardIndex forward(clustered_inverted_lists, v);
+    // One table, two readers: the inline writer needs it to leave exactly one
+    // copy of each doc whole, and the directory below persists it so search can
+    // find that copy again.
+    const std::vector<detail::DocLocator> locators = build_doc_locators(v);
+    detail::InlineForwardIndex forward(
+        clustered_inverted_lists, v, detail::InlineForwardIndex::kDefaultPageSize,
+        detail::InlineLayout::kPacked, inline_max_nnz_,
+        inline_max_nnz_ == 0 ? nullptr : &locators);
     forward.serialize(io_writer);
-    write_doc_directory(io_writer, v);
+    write_doc_directory(io_writer, v, locators);
 }
 
-void DiskSeismicIndexBase::write_doc_directory(
-    IOWriter* io_writer, const SparseVectors& vectors) const {
+auto DiskSeismicIndexBase::build_doc_locators(
+    const SparseVectors& vectors) const -> std::vector<detail::DocLocator> {
     const size_t num_docs = vectors.num_vectors();
-    const size_t element_size = vectors.get_element_size();
 
     // Default to remainder; the loop below overrides docs it finds in a block.
     std::vector<detail::DocLocator> locators(
@@ -226,7 +257,8 @@ void DiskSeismicIndexBase::write_doc_directory(
     std::vector<bool> covered(num_docs, false);
     // Must mirror InlineForwardIndex::write_body's block/slot iteration so the
     // recorded (posting_list, block, slot) match the blocks it writes.
-    // First occurrence wins; every copy of a doc's vector is identical.
+    // First occurrence wins; when nothing is truncated every copy of a doc's
+    // vector is identical, and when something is, this is the one left whole.
     for (size_t pl = 0; pl < clustered_inverted_lists.size(); ++pl) {
         const InvertedListClusters& list = clustered_inverted_lists[pl];
         const size_t n_clusters = list.cluster_size();
@@ -245,18 +277,34 @@ void DiskSeismicIndexBase::write_doc_directory(
             }
         }
     }
+    // Docs in no block get a remainder row, numbered in doc-id order --  the
+    // order write_doc_directory emits them in.
+    uint32_t remainder_row = 0;
+    for (size_t doc_id = 0; doc_id < num_docs; ++doc_id) {
+        if (!covered[doc_id]) {
+            locators[doc_id] = {detail::DocLocator::kRemainder, remainder_row,
+                                0};
+            ++remainder_row;
+        }
+    }
+    return locators;
+}
 
-    // Docs in no block, in doc-id order: keep their full vectors here and point
-    // the locator at the row.
+void DiskSeismicIndexBase::write_doc_directory(
+    IOWriter* io_writer, const SparseVectors& vectors,
+    const std::vector<detail::DocLocator>& locators) const {
+    const size_t num_docs = vectors.num_vectors();
+    const size_t element_size = vectors.get_element_size();
+
+    // The docs no block holds, in the doc-id order their rows were numbered in.
     SparseVectors remainder(
         {.element_size = element_size,
          .dimension = static_cast<size_t>(get_dimension())});
     const offset_t* indptr = vectors.indptr_data();
     const term_t* indices = vectors.indices_data();
     const uint8_t* values = vectors.values_data();
-    uint32_t remainder_row = 0;
     for (size_t doc_id = 0; doc_id < num_docs; ++doc_id) {
-        if (covered[doc_id]) {
+        if (locators[doc_id].posting_list != detail::DocLocator::kRemainder) {
             continue;
         }
         const offset_t start = indptr[doc_id];
@@ -266,8 +314,6 @@ void DiskSeismicIndexBase::write_doc_directory(
             row_indptr, 2, indices + start, nnz,
             values + static_cast<size_t>(start) * element_size,
             nnz * element_size);
-        locators[doc_id] = {detail::DocLocator::kRemainder, remainder_row, 0};
-        ++remainder_row;
     }
 
     // Aligned u64 doc count, then the locator array, then the remainder
@@ -326,29 +372,12 @@ void DiskSeismicIndexBase::load_mapped_payload(MmapCursor* cursor,
     index_mapping_ = std::move(mapped);
 }
 
-auto DiskSeismicIndexBase::get_doc(idx_t doc_id, size_t element_size) const
-    -> DocSlice {
-    const detail::DocLocator loc = doc_locators_[doc_id];
-    if (loc.posting_list == detail::DocLocator::kRemainder) {
-        if (loc.block >= remainder_.num_vectors()) {
-            throw std::runtime_error(
-                "DiskSeismic exact match: remainder locator out of range");
-        }
-        const offset_t* r_indptr = remainder_.indptr_data();
-        const offset_t r_start = r_indptr[loc.block];
-        return {remainder_.indices_data() + r_start,
-                remainder_.values_data() +
-                    static_cast<size_t>(r_start) * element_size,
-                static_cast<size_t>(r_indptr[loc.block + 1] - r_start)};
-    }
-    const detail::BlockView bv = fwd_.block(loc.posting_list, loc.block);
-    if (bv.absent() || loc.slot >= bv.n_docs ||
-        bv.doc_ids[loc.slot] != static_cast<uint32_t>(doc_id)) {
-        throw std::runtime_error(
-            "DiskSeismic exact match: doc locator does not resolve to its doc");
-    }
-    return {bv.doc_comps(loc.slot), bv.doc_vals(loc.slot, element_size),
-            bv.nnz(loc.slot)};
+auto DiskSeismicIndexBase::full_vector_store() const
+    -> detail::FullVectorStore {
+    return {.fwd = &fwd_,
+            .locators = doc_locators_,
+            .num_locators = num_locators_,
+            .remainder = &remainder_};
 }
 
 auto DiskSeismicIndexBase::exact_match_directory(
@@ -362,6 +391,7 @@ auto DiskSeismicIndexBase::exact_match_directory(
     const uint8_t* query_codes =
         encode_query(values, total_nnz, search_parameters, query_scratch);
     const std::vector<idx_t> ids = selector.ordered_ids();
+    const detail::FullVectorStore store = full_vector_store();
 
     std::vector<std::vector<float>> result_distances(n);
     std::vector<std::vector<idx_t>> result_labels(n);
@@ -393,7 +423,8 @@ auto DiskSeismicIndexBase::exact_match_directory(
                     static_cast<uint64_t>(doc_id) >= num_locators_) {
                     continue;  // out-of-range member: nothing to score
                 }
-                const DocSlice doc = get_doc(doc_id, element_size);
+                const detail::DocSlice doc =
+                    detail::resolve_doc(store, doc_id, element_size);
                 // Dot the doc's slice against the dense query via a 2-entry
                 // indptr.
                 const offset_t slice_indptr[2] = {

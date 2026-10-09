@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
@@ -19,15 +20,38 @@
 #include "nsparse/id_selector.h"
 #include "nsparse/index.h"
 #include "nsparse/io/inline_forward_index_io.h"
+#include "nsparse/seismic_common.h"  // compute_similarity
 #include "nsparse/seismic_index.h"  // SeismicSearchParameters
 #include "nsparse/sparse_vectors.h"
 #include "nsparse/types.h"
 #include "nsparse/utils/distance_simd.h"
+#include "nsparse/utils/prefetch.h"
 #include "nsparse/utils/ranker.h"
 #include "nsparse/utils/vector_process.h"
 
 namespace nsparse::detail {
 namespace {
+
+// Docs ahead to start fetching while the current one is being summed. Small
+// enough that the outstanding prefetches fit the core's line-fill buffers, large
+// enough to cover a DRAM hit at the ~200 cycles one doc's dot product takes.
+constexpr size_t kRescoreLookahead = 6;
+
+// Start the first cache lines of a doc's row at the stored value width.
+void prefetch_row_head(const DocSlice& doc, size_t element_size) {
+    constexpr size_t kRowLines = 2;
+    if (element_size == U32) {
+        prefetch_vector_head(doc.comps,
+                             reinterpret_cast<const float*>(doc.vals), doc.nnz,
+                             kRowLines);
+    } else if (element_size == U16) {
+        prefetch_vector_head(doc.comps,
+                             reinterpret_cast<const uint16_t*>(doc.vals),
+                             doc.nnz, kRowLines);
+    } else {
+        prefetch_vector_head(doc.comps, doc.vals, doc.nnz, kRowLines);
+    }
+}
 
 // Score one doc's vector against the dense query and push it, honoring
 // visited-dedup and the id selector. `dense` and `vals` are element_size bytes
@@ -95,22 +119,24 @@ void score_block(const InlineForwardIndex* fwd, const SparseVectors* vectors,
 DiskSeismicCutBudget resolve_cut_and_budget(
     const SearchParameters* search_parameters) {
     // A DiskSeismicSearchParameters (including a quantized subclass) carries
-    // k_prime; a plain SeismicSearchParameters (or null) uses the default
-    // budget.
+    // k_prime and the re-scoring depth; a plain SeismicSearchParameters (or
+    // null) uses the defaults.
     const DiskSeismicSearchParameters defaults;
     int cut = defaults.cut;
     int k_prime = defaults.k_prime;
+    int rescore = defaults.rescore;
     if (const auto* disk_parameters =
             dynamic_cast<const DiskSeismicSearchParameters*>(
                 search_parameters)) {
         cut = disk_parameters->cut;
         k_prime = disk_parameters->k_prime;
+        rescore = disk_parameters->rescore;
     } else if (const auto* seismic_parameters =
                    dynamic_cast<const SeismicSearchParameters*>(
                        search_parameters)) {
         cut = seismic_parameters->cut;
     }
-    return {cut, k_prime};
+    return {cut, k_prime, rescore};
 }
 
 std::vector<term_t> top_cut_tokens(const term_t* indices, const uint8_t* codes,
@@ -139,7 +165,7 @@ pair_of_score_id_vector_t block_budget_query(
     const std::vector<term_t>& cuts, int k, int k_prime,
     const std::vector<InvertedListClusters>& clusters,
     const InlineForwardIndex* fwd, const SparseVectors* vectors,
-    const IDSelector* id_selector) {
+    const IDSelector* id_selector, RescorePass* rescore) {
     // Scatter the query into the dense lookup table: element_size contiguous
     // bytes per non-zero dim.
     for (size_t i = 0; i < query_len; ++i) {
@@ -185,11 +211,50 @@ pair_of_score_id_vector_t block_budget_query(
         candidates.resize(budget);
     }
 
-    // Score the selected blocks; visited dedups docs shared across them.
-    TopKHolder<idx_t> holder(k);
+    // Score the selected blocks; visited dedups docs shared across them. With
+    // truncated blocks these scores only rank the candidate pool, so keep the
+    // best `rescore` of them rather than just the best k.
+    // Any depth at all is worth a second pass on a truncated index: at exactly k
+    // it cannot pull in a doc the block scores ranked out, but it still replaces
+    // k lower bounds with k exact scores. Skipping it would hand back the lower
+    // bounds as if they were scores.
+    const bool two_phase = rescore != nullptr && rescore->depth >= k;
+    TopKHolder<idx_t> holder(two_phase ? std::max(rescore->depth, k) : k);
     for (const BlockCandidate& candidate : candidates) {
         score_block(fwd, vectors, clusters, candidate.pl, candidate.cid, dense,
                     element_size, id_selector, holder, visited);
+    }
+
+    pair_of_score_id_vector_t result = holder.top_k_items_descending();
+    if (two_phase) {
+        // Second pass: the same docs against their untruncated vectors. Every
+        // block score is a lower bound on the true one, so a doc can only have
+        // been ranked too low here -- which is why the pool has to be wider
+        // than k, and why re-scoring it is enough to recover the ranking.
+        // Resolved in one batch: the walk to a whole vector is a pointer chase
+        // through tables far larger than cache, and doing it per doc would
+        // serialize those misses (see resolve_docs).
+        resolve_docs(rescore->store, result.second.data(),
+                     result.second.size(), element_size, &rescore->scratch,
+                     &rescore->slices);
+        TopKHolder<idx_t> exact(k);
+        for (size_t i = 0; i < result.second.size(); ++i) {
+            // Each row is a scattered read, so start the ones a few docs ahead
+            // while this one is being summed. Only the head: the row is
+            // contiguous, so the hardware prefetcher takes it from there, and
+            // asking for whole rows would exhaust the line-fill buffers.
+            if (i + kRescoreLookahead < rescore->slices.size()) {
+                const DocSlice& ahead = rescore->slices[i + kRescoreLookahead];
+                prefetch_row_head(ahead, element_size);
+            }
+            const DocSlice& doc = rescore->slices[i];
+            const offset_t slice_indptr[2] = {0,
+                                              static_cast<offset_t>(doc.nnz)};
+            exact.add(compute_similarity(0, slice_indptr, doc.comps, doc.vals,
+                                         dense, element_size),
+                      result.second[i]);
+        }
+        result = exact.top_k_items_descending();
     }
 
     // Restore only the query's own positions to zero (mirrors the scatter at
@@ -201,7 +266,7 @@ pair_of_score_id_vector_t block_budget_query(
             element_size, uint8_t{0});
     }
 
-    return holder.top_k_items_descending();
+    return result;
 }
 
 }  // namespace nsparse::detail

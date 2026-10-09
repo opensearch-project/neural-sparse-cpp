@@ -40,10 +40,12 @@ class TestDiskSeismicSQ(DiskSeismicContract):
     # quantization adds noise, so a tight bound would flake.
     RECALL_FLOOR = 0.75
 
-    def params(self, cut=None, k_prime=None):
+    def params(self, cut=None, k_prime=None, rescore=None):
         cut = self.CUT if cut is None else cut
         k_prime = self.K_PRIME if k_prime is None else k_prime
-        return nsparse.DiskSeismicSQSearchParameters(VMIN, VMAX, cut, k_prime)
+        if rescore is None:
+            return nsparse.DiskSeismicSQSearchParameters(VMIN, VMAX, cut, k_prime)
+        return nsparse.DiskSeismicSQSearchParameters(VMIN, VMAX, cut, k_prime, rescore)
 
     # --- quantization-specific ---
 

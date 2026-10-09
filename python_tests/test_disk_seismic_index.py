@@ -24,7 +24,9 @@ class TestDiskSeismic(DiskSeismicContract):
     # Calibrated against the session corpus; a floor, not a target.
     RECALL_FLOOR = 0.80
 
-    def params(self, cut=None, k_prime=None):
+    def params(self, cut=None, k_prime=None, rescore=None):
         cut = self.CUT if cut is None else cut
         k_prime = self.K_PRIME if k_prime is None else k_prime
-        return nsparse.DiskSeismicSearchParameters(cut, k_prime)
+        if rescore is None:
+            return nsparse.DiskSeismicSearchParameters(cut, k_prime)
+        return nsparse.DiskSeismicSearchParameters(cut, k_prime, rescore)
